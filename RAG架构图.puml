@@ -1,0 +1,83 @@
+@startuml
+title LangGraph RAG 分层架构图
+
+top to bottom direction
+skinparam packageStyle rectangle
+skinparam componentStyle rectangle
+skinparam linetype ortho 
+' 强制图的布局从上往下排列
+' 把 package（层）画成矩形框。
+' 让组件模块变成矩形。
+' 让箭头变成直角线（架构图风格）。
+
+actor User
+
+' ===== Layer 1 =====
+package "API Layer\n对外接口" as API {
+    component "FastAPI\napp/main.py"
+    component "Router\nroutes.py"
+    node api_anchor
+}
+
+' ===== Layer 2 =====
+package "Service Layer\n业务逻辑" as SERVICE {
+    component "RAG Service\nrag_service.py"
+    node service_anchor
+}
+
+' ===== Layer 3 =====
+package "Workflow Layer\nLangGraph流程控制" as WORKFLOW {
+    component "Graph\nrag_graph.py"
+    component "State\nrag_state.py"
+    node workflow_anchor
+}
+
+' ===== Layer 4 =====
+package "RAG Processing Layer\n核心处理节点" as PROCESS {
+    component "Retrieve Node"
+    component "Rerank Node"
+    component "Generate Node"
+    node process_anchor
+}
+
+' ===== Layer 5 =====
+package "Retrieval Layer\n检索系统" as RETRIEVAL {
+    component "Hybrid Retriever"
+    component "Vector Search"
+    component "BM25 Search"
+    node retrieval_anchor
+}
+
+' ===== Layer 6 =====
+package "Model Layer\nAI模型" as MODEL {
+    component "Embedding Model"
+    component "Reranker Model"
+    component "LLM"
+    node model_anchor
+}
+
+' ===== Layer 7 =====
+package "Data Layer\n数据存储" as DATA {
+    component "Chroma Vector Store"
+    database "Vector DB"
+    folder "Documents"
+    node data_anchor
+}
+
+' ===== 主调用链（只连接锚点）=====
+User --> api_anchor
+api_anchor --> service_anchor
+service_anchor --> workflow_anchor
+workflow_anchor --> process_anchor
+process_anchor --> retrieval_anchor
+retrieval_anchor --> model_anchor
+model_anchor --> data_anchor
+
+' ===== 内部逻辑 =====
+"Retrieve Node" --> "Hybrid Retriever"
+"Hybrid Retriever" --> "Vector Search"
+"Hybrid Retriever" --> "BM25 Search"
+"Vector Search" --> "Chroma Vector Store"
+"Chroma Vector Store" --> "Vector DB"
+
+@enduml

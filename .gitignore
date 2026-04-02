@@ -1,0 +1,11 @@
+# 虚拟环境
+venv/
+
+# NLP依赖
+nltk_data/
+
+# 脚本
+*.sh
+
+#数据库
+data/

@@ -1,0 +1,130 @@
+@startuml
+title LangGraph RAG 时序图
+
+actor User
+
+participant "FastAPI\n(app/main.py)" as FastAPI
+participant "API Router\n(routes.py)" as Router
+participant "RAG Service\n(rag_service.py)" as Service
+participant "LangGraph\n(rag_graph.py)" as Graph
+
+participant "Retrieve Node\n(retrieve_node.py)" as Retrieve
+participant "Embedding Model\n(embedding_model.py)" as Embedding
+participant "Chroma VectorStore\n(chroma_store.py)" as Chroma
+participant "Document Loader\n(document_loader.py)" as Loader
+participant "Hybrid Retriever\n(hybrid_retriever.py)" as Hybrid
+
+participant "Rerank Node\n(rerank_node.py)" as RerankNode
+participant "CrossEncoder\n(reranker.py)" as Reranker
+
+participant "Generate Node\n(generate_node.py)" as Generate
+participant "LLM\n(Ollama / DeepSeek)" as LLM
+
+database "Vector DB\n(data/vector_db)" as VectorDB
+collections "Docs\n(data/docs)" as Docs
+
+== 用户请求 ==
+
+User -> FastAPI : POST /ask\n{query}
+FastAPI -> Router : ask(request)
+
+Router -> Service : ask_question(query)
+
+== Service 调用 Graph ==
+
+Service -> Graph : graph.invoke({query})
+
+Graph -> Graph : 初始化 RAGState
+
+note right of Graph
+state = {
+ query,
+ docs,
+ context,
+ answer
+}
+end note
+
+== 执行 retrieve_node ==
+
+Graph -> Retrieve : retrieve_node(state)
+
+Retrieve -> Embedding : get_embedding_model()
+
+Embedding --> Retrieve : SentenceTransformerEmbeddings
+
+Retrieve -> Chroma : load_vector_store(embedding)
+
+Chroma -> VectorDB : 读取向量数据库
+VectorDB --> Chroma : 返回DB实例
+Chroma --> Retrieve : vector_db
+
+Retrieve -> Loader : DirectoryLoader(data/docs)
+
+Loader -> Docs : 读取原始文档
+Docs --> Loader : docs
+Loader --> Retrieve : docs
+
+Retrieve -> Hybrid : create_hybrid_retriever(vector_db, docs)
+
+note right of Hybrid
+创建两个检索器
+1 Vector Retriever
+2 BM25 Retriever
+组合为 EnsembleRetriever
+end note
+
+Hybrid --> Retrieve : hybrid_retriever
+
+Retrieve -> Hybrid : get_relevant_documents(query)
+
+Hybrid -> Chroma : 向量检索
+Chroma -> VectorDB : similarity search
+VectorDB --> Chroma : vector results
+Chroma --> Hybrid : vector docs
+
+Hybrid -> Hybrid : BM25 检索
+Hybrid --> Retrieve : merged docs
+
+Retrieve --> Graph : {docs}
+
+== 执行 rerank_node ==
+
+Graph -> RerankNode : rerank_node(state)
+
+RerankNode -> Reranker : rerank(query, docs)
+
+note right of Reranker
+构建 pairs:
+(query, doc)
+end note
+
+Reranker -> Reranker : CrossEncoder.predict()
+
+Reranker --> RerankNode : ranked docs
+
+RerankNode --> Graph : top5 docs
+
+== 执行 generate_node ==
+
+Graph -> Generate : generate_node(state)
+
+Generate -> Generate : 构建 context\n拼接 docs
+
+Generate -> LLM : 调用 LLM 生成答案
+
+LLM --> Generate : answer
+
+Generate --> Graph : {answer}
+
+== 返回结果 ==
+
+Graph --> Service : result
+
+Service --> Router : answer
+
+Router --> FastAPI : JSON response
+
+FastAPI --> User : 返回答案
+
+@enduml
