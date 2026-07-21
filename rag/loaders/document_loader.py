@@ -1,73 +1,64 @@
-"""
-文档加载模块
-作用：
-从指定目录读取所有文档
-"""
+from pathlib import Path
 
 from langchain_community.document_loaders import (
-    DirectoryLoader,
-    TextLoader,
-    PyPDFLoader,
-    UnstructuredMarkdownLoader,
     Docx2txtLoader,
-    UnstructuredHTMLLoader
+    PyPDFLoader,
+    TextLoader,
+    UnstructuredHTMLLoader,
+    UnstructuredMarkdownLoader,
 )
 
-"""
-def load_documents(doc_path):
 
-    loader = DirectoryLoader(
-        doc_path,
-        glob="**/*.*",   # 读取所有文件
-        loader_cls=UnstructuredFileLoader
+SUPPORTED_EXTENSIONS = {".txt", ".pdf", ".md", ".docx", ".html", ".htm"}
+
+
+def is_supported_document(path):
+    path = Path(path)
+
+    return (
+        path.is_file()
+        and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        and not path.name.startswith("~$")
     )
 
-    docs = loader.load()
 
-    return docs
-"""
+def load_document(file_path):
+    path = Path(file_path)
+    suffix = path.suffix.lower()
 
-# 上面代码也可以使用，可加载所有格式文档。但针对不同格式的文档使用不同的 Loader会更稳定
+    if suffix == ".txt":
+        loader = TextLoader(
+            str(path),
+            encoding="utf-8",
+            autodetect_encoding=True,
+        )
+    elif suffix == ".pdf":
+        loader = PyPDFLoader(str(path))
+    elif suffix == ".md":
+        loader = UnstructuredMarkdownLoader(str(path))
+    elif suffix == ".docx":
+        loader = Docx2txtLoader(str(path))
+    elif suffix in {".html", ".htm"}:
+        loader = UnstructuredHTMLLoader(str(path))
+    else:
+        return []
+
+    try:
+        docs = loader.load()
+    except Exception as e:
+        print("加载失败:", path, e)
+        return []
+
+    return [doc for doc in docs if doc.page_content.strip()]
+
+
 def load_documents(doc_path):
-
-    loaders = [
-        DirectoryLoader(
-            doc_path,
-            glob="**/*.txt",
-            loader_cls=TextLoader,
-                loader_kwargs={
-                    "encoding": "utf-8",
-                    "autodetect_encoding": True
-                }
-        ),
-        DirectoryLoader(
-            doc_path,
-            glob="**/*.pdf",
-            loader_cls=PyPDFLoader
-        ),
-        DirectoryLoader(
-            doc_path,
-            glob="**/*.md",
-            loader_cls=UnstructuredMarkdownLoader
-        ),
-        DirectoryLoader(
-            doc_path,
-            glob="**/*.docx",
-            loader_cls=Docx2txtLoader
-        ),
-                DirectoryLoader(
-            doc_path,
-            glob="**/*.html",
-            loader_cls=UnstructuredHTMLLoader
-        ),
-    ]
-
     docs = []
-    for loader in loaders:
-        try:
-            docs.extend(loader.load())
-        except Exception as e:
-            print("加载失败:", loader, e)
 
-    docs = [doc for doc in docs if doc.page_content.strip()] # 过滤掉内容为空的文档
+    for path in Path(doc_path).rglob("*"):
+        if not is_supported_document(path):
+            continue
+
+        docs.extend(load_document(path))
+
     return docs

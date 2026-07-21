@@ -19,6 +19,6 @@ DOC_DIR = DATA_DIR / "docs"
 
 VECTOR_DB_DIR = DATA_DIR / "vector_db"  # Chroma 存储位置
 
-LLM_MODEL = "deepseek-coder:1.3b" # LLM模型
+LLM_MODEL = "qwen3:4b" # LLM模型
 
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"  # embedding模型
+EMBEDDING_MODEL = "nomic-embed-text-v2-moe"  # embedding模型

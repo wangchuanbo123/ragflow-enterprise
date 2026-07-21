@@ -11,6 +11,7 @@ from datasets import Dataset
 # 本地LLM
 from langchain_community.llms import Ollama
 from ragas.llms import LangchainLLMWrapper
+from app.core.config import LLM_MODEL
 
 # 你的RAG
 from app.services.rag_service import ask_question
@@ -18,7 +19,7 @@ from app.services.rag_service import ask_question
 print("初始化本地评估模型...")
 
 # 本地评估LLM
-local_llm = Ollama(model="deepseek-coder:1.3b")
+local_llm = Ollama(model=LLM_MODEL)
 
 ragas_llm = LangchainLLMWrapper(local_llm)
 

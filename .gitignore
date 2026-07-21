@@ -1,11 +1,34 @@
-# 虚拟环境
-venv/
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
 
-# NLP依赖
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Local config and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data and local indexes
+data/
 nltk_data/
 
-# 脚本
-*.sh
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
 
-#数据库
-data/
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local shell scripts
+*.sh

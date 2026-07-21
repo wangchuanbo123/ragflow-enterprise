@@ -63,13 +63,14 @@ ollama --version
 拉取模型：
 
 ```bash
-ollama pull deepseek-coder:1.3b
+ollama pull qwen3:4b
+ollama pull nomic-embed-text-v2-moe
 ```
 
 测试运行：
 
 ```bash
-ollama run deepseek-coder:1.3b
+ollama run qwen3:4b
 ```
 
 退出：
