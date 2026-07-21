@@ -5,10 +5,9 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_experimental.text_splitter import SemanticChunker
 
 from app.core.config import DOC_DIR, VECTOR_DB_DIR
-from rag.embeddings.embedding_model import get_embedding_model
 from rag.loaders.document_loader import is_supported_document, load_document
+from rag.providers.factory import get_embedding_provider, get_vector_store_provider
 from rag.utils.file_hash import file_hash
-from rag.vectorstore.chroma_store import load_vector_store
 
 
 BATCH_SIZE = 256
@@ -128,9 +127,9 @@ def main():
 
     print("Start building/updating vector database...")
 
-    embedding = get_embedding_model()
+    embedding = get_embedding_provider().get_model()
 
-    db = load_vector_store(
+    db = get_vector_store_provider().load(
         embedding=embedding,
         persist_dir=str(VECTOR_DB_DIR),
     )

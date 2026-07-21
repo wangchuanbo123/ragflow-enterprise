@@ -6,13 +6,20 @@ RAG Service
 API调用入口
 """
 
+from functools import lru_cache
+
 from rag.graph.rag_graph import build_graph
 
-graph = build_graph()
 
-def ask_question(query):
+@lru_cache(maxsize=1)
+def get_graph():
+    return build_graph()
 
-    result = graph.invoke({
+
+def ask_question(query, graph=None):
+
+    active_graph = graph or get_graph()
+    result = active_graph.invoke({
         "query": query
     })
 

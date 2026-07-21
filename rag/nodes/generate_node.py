@@ -3,26 +3,28 @@
 LangGraph Node
 """
 
-from langchain_community.llms import Ollama
 from rag.prompts.prompt_loader import load_prompt
-from app.core.config import LLM_MODEL
-
-llm = Ollama(model=LLM_MODEL)
+from rag.providers.factory import get_llm_provider
+from rag.providers.interfaces import LLMProvider
 
 PROMPT = load_prompt("answer_prompt.txt")
 
+def create_generate_node(llm: LLMProvider):
+    def generate_node(state):
+        query = state["query"]
+        context = state["context"]
+
+        prompt = PROMPT.format(
+            query=query,
+            context=context,
+        )
+
+        return {
+            "answer": llm.generate(prompt),
+        }
+
+    return generate_node
+
+
 def generate_node(state):
-
-    query = state["query"]
-    context = state["context"]
-
-    prompt = PROMPT.format(
-        query=query,
-        context=context
-    )
-
-    answer = llm.invoke(prompt)
-
-    return {
-        "answer": answer
-    }
+    return create_generate_node(get_llm_provider())(state)

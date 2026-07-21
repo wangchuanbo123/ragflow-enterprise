@@ -1,14 +1,18 @@
-"""
-Retrieve Node
-"""
+"""Retrieve node."""
 
-from rag.runtime.runtime import retriever
+from rag.providers.interfaces import Retriever
+
+
+def create_retrieve_node(retriever: Retriever):
+    def retrieve_node(state):
+        return {
+            "docs": retriever.get_relevant_documents(state["query"]),
+        }
+
+    return retrieve_node
+
 
 def retrieve_node(state):
-    query = state["query"]
+    from rag.runtime.runtime import get_runtime
 
-    results = retriever.get_relevant_documents(query)
-
-    return {
-        "docs": results
-    }
+    return create_retrieve_node(get_runtime().retriever)(state)

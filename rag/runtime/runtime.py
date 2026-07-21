@@ -1,31 +1,44 @@
-"""
-RAG Runtime
-系统启动时初始化所有重资源
-"""
+"""Lazy runtime dependency container for the RAG workflow."""
 
-from rag.embeddings.embedding_model import get_embedding_model
-from rag.vectorstore.chroma_store import load_vector_store
-from rag.retrievers.hybrid_retriever import create_hybrid_retriever
+from dataclasses import dataclass
+from functools import lru_cache
+
+from app.core.config import DOC_DIR, VECTOR_DB_DIR
 from rag.loaders.document_loader import load_documents
-
-from app.core.config import VECTOR_DB_DIR, DOC_DIR
-
-
-print("初始化 RAG 系统...")
-
-# 1 embedding
-embedding = get_embedding_model()
-
-# 2 vector db
-vector_db = load_vector_store(
-    embedding=embedding,
-    persist_dir=str(VECTOR_DB_DIR)
+from rag.providers.factory import (
+    get_embedding_provider,
+    get_llm_provider,
+    get_reranker,
+    get_vector_store_provider,
 )
+from rag.providers.interfaces import LLMProvider, Reranker, Retriever
+from rag.retrievers.hybrid_retriever import create_hybrid_retriever
 
-# 3 docs
-docs = load_documents(str(DOC_DIR))
 
-# 4 hybrid retriever
-retriever = create_hybrid_retriever(vector_db, docs)
+@dataclass(frozen=True)
+class RAGRuntime:
+    llm: LLMProvider
+    retriever: Retriever
+    reranker: Reranker
 
-print("RAG 初始化完成")
+
+@lru_cache(maxsize=1)
+def get_runtime() -> RAGRuntime:
+    print("初始化 RAG 系统...")
+
+    embedding = get_embedding_provider().get_model()
+    vector_db = get_vector_store_provider().load(
+        embedding=embedding,
+        persist_dir=str(VECTOR_DB_DIR),
+    )
+    docs = load_documents(str(DOC_DIR))
+    retriever = create_hybrid_retriever(vector_db, docs)
+
+    runtime = RAGRuntime(
+        llm=get_llm_provider(),
+        retriever=retriever,
+        reranker=get_reranker(),
+    )
+
+    print("RAG 初始化完成")
+    return runtime

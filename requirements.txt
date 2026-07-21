@@ -2,6 +2,7 @@ langchain==0.1.20
 langchain-community==0.0.38
 langchain-core==0.1.52
 langchain-experimental==0.0.57
+langchain-openai==0.1.7
 
 langgraph==0.0.32
 
@@ -13,6 +14,7 @@ fastapi==0.110.0
 uvicorn==0.29.0
 pydantic==2.6.4
 python-dotenv==1.0.1
+openai==1.109.1
 
 rank-bm25==0.2.2
 ollama==0.2.1
@@ -27,8 +29,5 @@ ragas==0.1.9
 datasets==2.19.1
 
 xxhash==3.5.0
-
-ragas==0.1.9
-datasets==2.19.1
 
 psutil

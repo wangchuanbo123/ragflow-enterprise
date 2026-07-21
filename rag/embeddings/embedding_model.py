@@ -1,7 +1,4 @@
-from langchain_community.embeddings import OllamaEmbeddings
-
-from app.core.config import EMBEDDING_MODEL
-
-
 def get_embedding_model():
-    return OllamaEmbeddings(model=EMBEDDING_MODEL)
+    from rag.providers.factory import get_embedding_provider
+
+    return get_embedding_provider().get_model()
