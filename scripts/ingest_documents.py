@@ -1,197 +1,185 @@
+"""文档索引管理脚本。
+
+支持命令：
+  --dry-run              查看同步变化但不执行
+  --sync                 增量同步
+  --rebuild --yes        全量影子 collection 重建
+  --list-collections     列出所有 collection
+  --rollback-collection <name> --yes   回滚到指定 collection
+  --cleanup-collection <name> --yes    删除非活动 collection
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
 from pathlib import Path
 
-import nltk
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_experimental.text_splitter import SemanticChunker
-
-from app.core.config import DOC_DIR, VECTOR_DB_DIR
-from rag.loaders.document_loader import is_supported_document, load_document
-from rag.providers.factory import get_embedding_provider, get_vector_store_provider
-from rag.utils.file_hash import file_hash
+from app.core.config import DOC_DIR
+from app.core.database import SessionLocal
 
 
-BATCH_SIZE = 256
-COARSE_CHUNK_SIZE = 300
-COARSE_CHUNK_OVERLAP = 50
-FINAL_CHUNK_SIZE = 300
-FINAL_CHUNK_OVERLAP = 50
+def cmd_dry_run():
+    from rag.indexing.index_manager import IndexManager
+
+    with SessionLocal() as db:
+        mgr = IndexManager(db)
+        result = mgr.sync(DOC_DIR, dry_run=True)
+
+    print("\n=== Dry Run ===")
+    classification = result.get("classification", {})
+    for action in ("added", "modified", "deleted", "unchanged"):
+        items = classification.get(action, [])
+        print(f"{action}: {len(items)}")
+        for item in items[:10]:
+            print(f"  {item['source_path']}")
+
+    if result.get("will_rebuild"):
+        print("\nNote: No active collection, --sync will trigger full rebuild.")
 
 
-def ensure_nltk():
-    resources = [
-        "punkt",
-        "punkt_tab",
-        "stopwords",
-        "wordnet",
-        "averaged_perceptron_tagger",
-        "averaged_perceptron_tagger_eng",
-    ]
+def cmd_sync():
+    from rag.indexing.index_manager import IndexManager
 
-    for resource in resources:
-        try:
-            nltk.download(resource)
-        except Exception as e:
-            print("NLTK download skipped:", resource, e)
+    with SessionLocal() as db:
+        mgr = IndexManager(db)
+        result = mgr.sync(DOC_DIR, dry_run=False)
+
+    print("\n=== Sync Result ===")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def get_existing_hashes(db):
-    existing_hashes = set()
+def cmd_rebuild():
+    from rag.indexing.index_manager import IndexManager
 
-    try:
-        existing = db.get(include=["metadatas"])
-    except Exception as e:
-        print("Read existing vector db failed, maybe first run:", e)
-        return existing_hashes
+    with SessionLocal() as db:
+        mgr = IndexManager(db)
+        result = mgr.rebuild(DOC_DIR, dry_run=False)
 
-    if not existing or "metadatas" not in existing:
-        return existing_hashes
-
-    for metadata in existing["metadatas"]:
-        if not metadata:
-            continue
-
-        hash_value = metadata.get("file_hash")
-        if hash_value:
-            existing_hashes.add(hash_value)
-
-    return existing_hashes
+    print("\n=== Rebuild Result ===")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def scan_supported_files(doc_dir):
-    doc_dir = Path(doc_dir)
+def cmd_list_collections():
+    from rag.indexing.index_manager import IndexManager
 
-    if not doc_dir.exists():
-        print("Document directory does not exist:", doc_dir)
-        return []
+    with SessionLocal() as db:
+        mgr = IndexManager(db)
+        collections = mgr.list_collections()
 
-    all_files = [path for path in doc_dir.rglob("*") if path.is_file()]
-    supported_files = [path for path in all_files if is_supported_document(path)]
-    skipped_count = len(all_files) - len(supported_files)
-
-    print("Scanned files:", len(all_files))
-    print("Supported files:", len(supported_files))
-    print("Skipped files:", skipped_count)
-
-    return sorted(supported_files)
+    print("\n=== Collections ===")
+    for coll in collections:
+        marker = " [ACTIVE]" if coll["is_active"] else ""
+        print(f"  {coll['name']}: {coll['count']} vectors{marker}")
 
 
-def add_documents_in_batches(db, docs):
-    for start in range(0, len(docs), BATCH_SIZE):
-        batch = docs[start:start + BATCH_SIZE]
-        db.add_documents(batch)
-        print(f"Written chunks: {start + len(batch)}/{len(docs)}")
+def cmd_rollback(name: str):
+    from rag.indexing.index_manager import IndexManager
+
+    with SessionLocal() as db:
+        mgr = IndexManager(db)
+        result = mgr.rollback_collection(name)
+
+    print("\n=== Rollback Result ===")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
-def split_documents(docs, embedding):
-    coarse_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        chunk_size=COARSE_CHUNK_SIZE,
-        chunk_overlap=COARSE_CHUNK_OVERLAP,
-    )
-    coarse_docs = coarse_splitter.split_documents(docs)
-    print("Coarse chunks:", len(coarse_docs))
+def cmd_cleanup(name: str):
+    from rag.indexing.index_manager import IndexManager
 
-    if not coarse_docs:
-        return []
+    with SessionLocal() as db:
+        mgr = IndexManager(db)
+        result = mgr.cleanup_collection(name)
 
-    semantic_splitter = SemanticChunker(embedding)
+    print("\n=== Cleanup Result ===")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
-    try:
-        semantic_docs = semantic_splitter.split_documents(coarse_docs)
-    except ValueError as e:
-        if "context length" not in str(e):
-            raise
 
-        print("Semantic split skipped because embedding input exceeded context length.")
-        print("Using coarse chunks instead.")
-        semantic_docs = coarse_docs
+def cmd_graph_only():
+    """对已有 Chunk 构建知识图谱，不重建文档向量。"""
+    from app.services.knowledge_graph_service import GraphBuildService
 
-    print("Semantic chunks:", len(semantic_docs))
+    with SessionLocal() as db:
+        svc = GraphBuildService(db)
+        result = svc.build_graph(only_pending=True)
 
-    if not semantic_docs:
-        return []
+    print("\n=== Graph Build Result ===")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
-    final_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        chunk_size=FINAL_CHUNK_SIZE,
-        chunk_overlap=FINAL_CHUNK_OVERLAP,
-    )
-    final_docs = final_splitter.split_documents(semantic_docs)
 
-    if len(final_docs) != len(semantic_docs):
-        print("Applied final length guard.")
+def cmd_retry_failed():
+    """重试图谱抽取失败的片段。"""
+    from app.services.knowledge_graph_service import GraphBuildService
 
-    return final_docs
+    with SessionLocal() as db:
+        svc = GraphBuildService(db)
+        result = svc.build_graph(only_pending=False, retry_failed=True)
+
+    print("\n=== Graph Retry Result ===")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 def main():
-    ensure_nltk()
+    from app.core.init_db import run_migrations
 
-    print("Start building/updating vector database...")
+    run_migrations()
+    parser = argparse.ArgumentParser(description="文档索引管理")
+    parser.add_argument("--dry-run", action="store_true", help="查看同步变化")
+    parser.add_argument("--sync", action="store_true", help="增量同步")
+    parser.add_argument("--rebuild", action="store_true", help="全量影子重建")
+    parser.add_argument("--graph-only", action="store_true", help="只处理图谱抽取")
+    parser.add_argument("--retry-failed", action="store_true", help="重试失败的图谱抽取")
+    parser.add_argument("--file", type=str, default=None, help="同步单个文件")
+    parser.add_argument("--yes", action="store_true", help="确认执行")
+    parser.add_argument("--list-collections", action="store_true", help="列出 collections")
+    parser.add_argument("--rollback-collection", type=str, default=None)
+    parser.add_argument("--cleanup-collection", type=str, default=None)
+    args = parser.parse_args()
 
-    embedding = get_embedding_provider().get_model()
-
-    db = get_vector_store_provider().load(
-        embedding=embedding,
-        persist_dir=str(VECTOR_DB_DIR),
-    )
-
-    existing_hashes = get_existing_hashes(db)
-    print("Existing indexed files:", len(existing_hashes))
-
-    files = scan_supported_files(DOC_DIR)
-
-    new_files = []
-    for path in files:
-        hash_value = file_hash(path)
-        if hash_value not in existing_hashes:
-            new_files.append((path, hash_value))
-
-    print("New files to index:", len(new_files))
-
-    if not new_files:
-        print("No new files. Index update finished.")
+    if args.list_collections:
+        cmd_list_collections()
         return
 
-    all_docs = []
-
-    for path, hash_value in new_files:
-        print("Loading:", path)
-        docs = load_document(path)
-
-        if not docs:
-            print("No readable content, skipped:", path)
-            continue
-
-        for doc in docs:
-            doc.metadata["file_hash"] = hash_value
-            doc.metadata["source"] = str(path)
-
-        all_docs.extend(docs)
-
-    print("Loaded documents:", len(all_docs))
-
-    if not all_docs:
-        print("No readable documents. Index update stopped.")
+    if args.rollback_collection:
+        if not args.yes:
+            print("Use --yes to confirm rollback.")
+            return
+        cmd_rollback(args.rollback_collection)
         return
 
-    docs = split_documents(all_docs, embedding)
-
-    if not docs:
-        print("No chunks generated. Index update stopped.")
+    if args.cleanup_collection:
+        if not args.yes:
+            print("Use --yes to confirm cleanup.")
+            return
+        cmd_cleanup(args.cleanup_collection)
         return
 
-    avg_chunk_size = sum(len(doc.page_content) for doc in docs) / len(docs)
-    print("Average chunk size:", avg_chunk_size)
+    if args.dry_run:
+        cmd_dry_run()
+        return
 
-    for index, doc in enumerate(docs):
-        doc.metadata["chunk_id"] = index
+    if args.rebuild:
+        if not args.yes:
+            print("Use --yes to confirm rebuild.")
+            return
+        cmd_rebuild()
+        return
 
-    print("Final chunks:", len(docs))
+    if args.sync:
+        cmd_sync()
+        return
 
-    add_documents_in_batches(db, docs)
-    db.persist()
+    if args.graph_only:
+        cmd_graph_only()
+        return
 
-    print("Incremental index completed.")
-    print("Vector db path:", VECTOR_DB_DIR)
+    if args.retry_failed:
+        cmd_retry_failed()
+        return
+
+    # Default: dry-run
+    cmd_dry_run()
 
 
 if __name__ == "__main__":

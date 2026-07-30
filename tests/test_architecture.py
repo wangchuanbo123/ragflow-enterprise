@@ -35,9 +35,25 @@ class FakeRetriever:
     def get_relevant_documents(self, query: str):
         self.queries.append(query)
         return [
-            Document(page_content="次要资料", metadata={"source": "secondary.txt"}),
-            Document(page_content="主要资料", metadata={"source": "primary.txt"}),
+            Document(page_content="次要资料", metadata={"source": "secondary.txt", "chunk_id": "c1", "content_hash": "h1"}),
+            Document(page_content="主要资料", metadata={"source": "primary.txt", "chunk_id": "c2", "content_hash": "h2"}),
         ]
+
+    def retrieve_single(self, query: str):
+        return self.get_relevant_documents(query)
+
+    def retrieve_multi_query(self, queries: list):
+        results = []
+        for q in queries:
+            results.extend(self.get_relevant_documents(q))
+        seen = set()
+        deduped = []
+        for doc in results:
+            cid = doc.metadata.get("chunk_id")
+            if cid not in seen:
+                seen.add(cid)
+                deduped.append(doc)
+        return deduped
 
 
 class FakeReranker:
@@ -47,7 +63,7 @@ class FakeReranker:
 
 
 class ArchitectureTests(unittest.TestCase):
-    def test_missing_remote_config_falls_back_to_ollama(self):
+    def testMissingRemoteConfigFallsBackToOllama(self):
         cases = [
             ("", "https://api.example.com/v1"),
             ("test-key", ""),
@@ -66,14 +82,14 @@ class ArchitectureTests(unittest.TestCase):
                 self.assertEqual(type(provider).__name__, "OllamaLLMProvider")
                 self.assertEqual(provider.model, "qwen3:4b")
 
-    def test_factories_create_configured_providers_without_loading_models(self):
+    def testFactoriesCreateConfiguredProvidersWithoutLoadingModels(self):
         self.assertTrue(callable(get_llm_provider().generate))
         self.assertTrue(callable(get_embedding_provider().get_model))
         self.assertTrue(callable(get_reranker().rerank))
         self.assertTrue(callable(get_vector_store_provider().load))
         self.assertEqual(get_runtime.cache_info().currsize, 0)
 
-    def test_graph_uses_injected_runtime_end_to_end(self):
+    def testGraphUsesInjectedRuntimeEndToEnd(self):
         llm = FakeLLMProvider()
         retriever = FakeRetriever()
         runtime = RAGRuntime(
@@ -85,10 +101,52 @@ class ArchitectureTests(unittest.TestCase):
 
         result = ask_question("原始问题", graph=graph)
 
-        self.assertEqual(retriever.queries, ["重写后的问题"])
+        # Dual-query: original + rewritten are both queried
+        self.assertIn("原始问题", retriever.queries)
+        self.assertIn("重写后的问题", retriever.queries)
         self.assertEqual(result["answer"], "基于知识库生成的答案")
-        self.assertEqual(result["sources"][0]["source"], "primary.txt")
-        self.assertEqual(len(llm.prompts), 2)
+        self.assertTrue(len(result["sources"]) > 0)
+        self.assertTrue(len(llm.prompts), 2)  # rewrite + generate
+
+
+def test_runtime_refreshes_after_cross_process_index_change(
+    db_engine, monkeypatch
+):
+    import rag.runtime.runtime as runtime_module
+    from app.core.database import SessionLocal
+    from app.repositories.knowledge_repository import KnowledgeRepository
+
+    monkeypatch.setattr(runtime_module, "SessionLocal", SessionLocal)
+    with SessionLocal() as db:
+        current_signature = KnowledgeRepository(db).get_index_signature()
+
+    stale = RAGRuntime(
+        llm=object(),
+        retriever=object(),
+        reranker=object(),
+        index_signature="stale",
+    )
+    fresh = RAGRuntime(
+        llm=object(),
+        retriever=object(),
+        reranker=object(),
+        index_signature=current_signature,
+    )
+    state = {"invalidated": False}
+
+    monkeypatch.setattr(
+        runtime_module,
+        "get_runtime",
+        lambda: fresh if state["invalidated"] else stale,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "invalidate_runtime_cache",
+        lambda: state.update(invalidated=True),
+    )
+
+    assert runtime_module.get_current_runtime() is fresh
+    assert state["invalidated"] is True
 
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ langchain-openai==0.1.7
 langgraph==0.0.32
 
 chromadb==0.4.24
+# Chroma 0.4.24 still calls the pre-6.0 positional capture API.
+posthog==5.4.0
 sentence-transformers==2.7.0
 transformers==4.41.2
 
@@ -18,6 +20,7 @@ openai==1.109.1
 
 rank-bm25==0.2.2
 ollama==0.2.1
+jieba==0.42.1
 
 unstructured[all-docs]==0.14.9
 pdfminer.six==20221105
@@ -31,3 +34,10 @@ datasets==2.19.1
 xxhash==3.5.0
 
 psutil
+
+SQLAlchemy==2.0.51
+alembic==1.18.5
+PyJWT==2.13.0
+bcrypt==5.0.0
+pytest==9.1.1
+httpx==0.27.2

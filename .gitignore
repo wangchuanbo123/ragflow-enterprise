@@ -18,6 +18,12 @@ ENV/
 data/
 nltk_data/
 
+# Private evaluation datasets and generated results
+eval/data/
+eval/baselines/
+eval/results/*
+!eval/results/.gitkeep
+
 # Tool caches
 .pytest_cache/
 .mypy_cache/
@@ -29,6 +35,10 @@ nltk_data/
 Thumbs.db
 .idea/
 .vscode/
+
+# Frontend
+web/node_modules/
+web/dist/
 
 # Local shell scripts
 *.sh

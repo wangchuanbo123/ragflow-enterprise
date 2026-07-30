@@ -3,14 +3,21 @@ LangGraph 状态对象
 定义整个 RAG workflow 共享的数据
 """
 
-from typing import TypedDict, List
+from typing import Any, List, TypedDict
+
 from langchain_core.documents import Document
 
 
-class RAGState(TypedDict):
-
+class RAGState(TypedDict, total=False):
+    original_query: str
+    retrieval_query: str
+    retrieval_queries: List[str]
+    retrieval_candidates: List[Document]
     query: str
-    docs: List[Document] # 检索到的相关文档列表，每个文档包含 page_content 和 metadata
-    context: str  # 生成回答的上下文，通常是检索到的相关文档内容的拼接
+    history: List[dict]
+    docs: List[Document]
+    context: str
+    context_json_file: str
     answer: str
     sources: List[dict]
+    timings: dict[str, float]

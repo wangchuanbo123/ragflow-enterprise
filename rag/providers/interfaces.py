@@ -1,4 +1,4 @@
-from typing import Any, List, Protocol, Sequence
+from typing import Any, Iterator, List, Protocol, Sequence
 
 from langchain_core.documents import Document
 
@@ -6,6 +6,9 @@ from langchain_core.documents import Document
 class LLMProvider(Protocol):
     def generate(self, prompt: str) -> str:
         """Generate text for a prompt."""
+
+    def stream(self, prompt: str) -> Iterator[str]:
+        """Yield text chunks for a prompt as a real stream."""
 
     def get_model(self) -> Any:
         """Return the underlying LangChain model when an integration needs it."""
@@ -27,7 +30,7 @@ class Reranker(Protocol):
 
 
 class VectorStoreProvider(Protocol):
-    def load(self, embedding: Any, persist_dir: str) -> Any:
+    def load(self, embedding: Any, persist_dir: str, collection_name: str | None = None) -> Any:
         """Load or create a vector store."""
 
 

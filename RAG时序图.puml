@@ -1,130 +1,84 @@
 @startuml
-title LangGraph RAG 时序图
+title 当前 RAG 在线问答时序
 
-actor User
+skinparam backgroundColor white
+skinparam shadowing false
+skinparam sequenceMessageAlign center
 
-participant "FastAPI\n(app/main.py)" as FastAPI
-participant "API Router\n(routes.py)" as Router
-participant "RAG Service\n(rag_service.py)" as Service
-participant "LangGraph\n(rag_graph.py)" as Graph
+actor "用户" as User
+participant "FastAPI" as API
+participant "ChatService /\nRAGService" as Service
+participant "问答编排\nCompiledGraph / 手工节点流" as Flow
+participant "LLM Provider" as LLM
+participant "HybridGraphRetriever" as Retriever
+database "Chroma + SQLite" as Stores
+participant "Reranker" as Reranker
+participant "ContextBuilder" as Context
 
-participant "Retrieve Node\n(retrieve_node.py)" as Retrieve
-participant "Embedding Model\n(embedding_model.py)" as Embedding
-participant "Chroma VectorStore\n(chroma_store.py)" as Chroma
-participant "Document Loader\n(document_loader.py)" as Loader
-participant "Hybrid Retriever\n(hybrid_retriever.py)" as Hybrid
+User -> API : 提交问题
+API -> API : 登录鉴权
+API -> Service : 获取 RAG 并发许可
 
-participant "Rerank Node\n(rerank_node.py)" as RerankNode
-participant "CrossEncoder\n(reranker.py)" as Reranker
+alt POST /ask
+  API -> Service : ask_question(query)
+  Service -> Flow : compiled_graph.invoke(state)
+else Web 同步或 SSE
+  API -> Service : answer_sync / answer_stream
+  Service -> Flow : 依次调用共享节点函数
+end
 
-participant "Generate Node\n(generate_node.py)" as Generate
-participant "LLM\n(Ollama / DeepSeek)" as LLM
-
-database "Vector DB\n(data/vector_db)" as VectorDB
-collections "Docs\n(data/docs)" as Docs
-
-== 用户请求 ==
-
-User -> FastAPI : POST /ask\n{query}
-FastAPI -> Router : ask(request)
-
-Router -> Service : ask_question(query)
-
-== Service 调用 Graph ==
-
-Service -> Graph : graph.invoke({query})
-
-Graph -> Graph : 初始化 RAGState
-
-note right of Graph
-state = {
- query,
- docs,
- context,
- answer
-}
+note right of Service
+索引状态时间戳变化时，
+自动刷新 Runtime、BM25
+和 Compiled LangGraph。
 end note
 
-== 执行 retrieve_node ==
-
-Graph -> Retrieve : retrieve_node(state)
-
-Retrieve -> Embedding : get_embedding_model()
-
-Embedding --> Retrieve : SentenceTransformerEmbeddings
-
-Retrieve -> Chroma : load_vector_store(embedding)
-
-Chroma -> VectorDB : 读取向量数据库
-VectorDB --> Chroma : 返回DB实例
-Chroma --> Retrieve : vector_db
-
-Retrieve -> Loader : DirectoryLoader(data/docs)
-
-Loader -> Docs : 读取原始文档
-Docs --> Loader : docs
-Loader --> Retrieve : docs
-
-Retrieve -> Hybrid : create_hybrid_retriever(vector_db, docs)
-
-note right of Hybrid
-创建两个检索器
-1 Vector Retriever
-2 BM25 Retriever
-组合为 EnsembleRetriever
+Flow -> LLM : rewrite(original_query)
+LLM --> Flow : rewritten_query
+note right of Flow
+检索通常同时使用
+original_query 与 rewritten_query。
 end note
 
-Hybrid --> Retrieve : hybrid_retriever
+Flow -> Retriever : retrieve_multi_query(queries)
+Retriever -> Stores : Vector + 中文 BM25 + 图谱证据检索
+Stores --> Retriever : 三路候选 Chunk
+Retriever -> Retriever : Weighted RRF 融合并按 chunk_id 去重
+Retriever --> Flow : retrieval candidates
 
-Retrieve -> Hybrid : get_relevant_documents(query)
+Flow -> Reranker : rerank(original_query, candidates)
+Reranker --> Flow : top documents
 
-Hybrid -> Chroma : 向量检索
-Chroma -> VectorDB : similarity search
-VectorDB --> Chroma : vector results
-Chroma --> Hybrid : vector docs
-
-Hybrid -> Hybrid : BM25 检索
-Hybrid --> Retrieve : merged docs
-
-Retrieve --> Graph : {docs}
-
-== 执行 rerank_node ==
-
-Graph -> RerankNode : rerank_node(state)
-
-RerankNode -> Reranker : rerank(query, docs)
-
-note right of Reranker
-构建 pairs:
-(query, doc)
+Flow -> Context : build_context(documents)
+Context -> Context : 去重、来源配额、Token 预算、citation_id
+Context --> Flow : context + sources
+note right of Context
+CONTEXT_JSON_EXPORT_ENABLED=true 时，
+在 generate 前写入 data/debug/contexts/context_*.json。
 end note
 
-Reranker -> Reranker : CrossEncoder.predict()
+alt /ask 或 Web 同步
+  Flow -> LLM : generate(query, context)
+  LLM --> Flow : answer
+  Flow --> Service : answer + sources
+  Service --> API : 保存并返回结果
+  API --> User : 最终响应
+else Web SSE
+  Flow -> LLM : stream_generate(query, context)
+  loop 模型流式分片
+    LLM --> Flow : delta
+    Flow --> Service : delta
+    Service --> API : SSE delta
+    API --> User : SSE delta
+  end
+  Flow --> Service : sources + done
+  Service --> API : 完成事件
+  API --> User : sources + done
+end
 
-Reranker --> RerankNode : ranked docs
-
-RerankNode --> Graph : top5 docs
-
-== 执行 generate_node ==
-
-Graph -> Generate : generate_node(state)
-
-Generate -> Generate : 构建 context\n拼接 docs
-
-Generate -> LLM : 调用 LLM 生成答案
-
-LLM --> Generate : answer
-
-Generate --> Graph : {answer}
-
-== 返回结果 ==
-
-Graph --> Service : result
-
-Service --> Router : answer
-
-Router --> FastAPI : JSON response
-
-FastAPI --> User : 返回答案
+note over Retriever,Context
+graph_facts 当前保存在 Document metadata 中，
+接口尚未单独返回 graph_subgraph。
+end note
 
 @enduml

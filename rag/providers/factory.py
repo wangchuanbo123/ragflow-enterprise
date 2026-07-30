@@ -3,12 +3,16 @@ from functools import lru_cache
 from app.core.config import (
     EMBEDDING_MODEL,
     EMBEDDING_PROVIDER,
+    GRAPH_EXTRACTION_MODEL,
+    GRAPH_EXTRACTION_PROVIDER,
+    GRAPH_STORE_PROVIDER,
     LLM_API_KEY,
     LLM_BASE_URL,
     LLM_MODEL,
     LLM_PROVIDER,
     OLLAMA_BASE_URL,
     OLLAMA_LLM_MODEL,
+    PROVIDER_TIMEOUT_SECONDS,
     RERANK_TOP_K,
     RERANKER_MODEL,
     RERANKER_PROVIDER,
@@ -35,13 +39,21 @@ def create_llm_provider(
     if provider == "ollama":
         from rag.providers.llm import OllamaLLMProvider
 
-        return OllamaLLMProvider(model=ollama_model, base_url=ollama_base_url)
+        return OllamaLLMProvider(
+            model=ollama_model,
+            base_url=ollama_base_url,
+            timeout=PROVIDER_TIMEOUT_SECONDS,
+        )
 
     if provider in {"zhipu", "zai", "glm"}:
         if not api_key.strip() or not base_url.strip():
             from rag.providers.llm import OllamaLLMProvider
 
-            return OllamaLLMProvider(model=ollama_model, base_url=ollama_base_url)
+            return OllamaLLMProvider(
+                model=ollama_model,
+                base_url=ollama_base_url,
+                timeout=PROVIDER_TIMEOUT_SECONDS,
+            )
 
         from rag.providers.llm import ZhipuLLMProvider
 
@@ -49,6 +61,7 @@ def create_llm_provider(
             model=model,
             api_key=api_key,
             base_url=base_url,
+            timeout=PROVIDER_TIMEOUT_SECONDS,
         )
 
     raise ValueError(f"Unsupported LLM provider: {provider}")
@@ -67,6 +80,7 @@ def get_embedding_provider() -> EmbeddingProvider:
         return OllamaEmbeddingProvider(
             model=EMBEDDING_MODEL,
             base_url=OLLAMA_BASE_URL,
+            timeout=PROVIDER_TIMEOUT_SECONDS,
         )
 
     raise ValueError(f"Unsupported embedding provider: {EMBEDDING_PROVIDER}")
@@ -95,3 +109,30 @@ def get_vector_store_provider() -> VectorStoreProvider:
         return ChromaVectorStoreProvider()
 
     raise ValueError(f"Unsupported vector store provider: {VECTOR_STORE_PROVIDER}")
+
+
+def get_graph_store():
+    """获取图谱存储实例（每次返回新的 store，由调用方管理 session）。"""
+    if GRAPH_STORE_PROVIDER == "sqlite":
+        return "sqlite"
+    raise ValueError(f"Unsupported graph store provider: {GRAPH_STORE_PROVIDER}")
+
+
+@lru_cache(maxsize=1)
+def get_graph_extraction_llm_provider() -> LLMProvider:
+    """获取图谱抽取 LLM。"""
+    provider = GRAPH_EXTRACTION_PROVIDER.lower()
+
+    if provider == "current":
+        return get_llm_provider()
+
+    if provider == "ollama":
+        from rag.providers.llm import OllamaLLMProvider
+        return OllamaLLMProvider(
+            model=GRAPH_EXTRACTION_MODEL,
+            base_url=OLLAMA_BASE_URL,
+            timeout=PROVIDER_TIMEOUT_SECONDS,
+        )
+
+    # Fall back to current LLM
+    return get_llm_provider()

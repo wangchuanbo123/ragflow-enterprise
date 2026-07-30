@@ -1,83 +1,71 @@
 @startuml
-title LangGraph RAG 分层架构图
+title 当前 RAG 项目分层架构
 
 top to bottom direction
+skinparam backgroundColor white
 skinparam packageStyle rectangle
 skinparam componentStyle rectangle
-skinparam linetype ortho 
-' 强制图的布局从上往下排列
-' 把 package（层）画成矩形框。
-' 让组件模块变成矩形。
-' 让箭头变成直角线（架构图风格）。
+skinparam linetype ortho
+skinparam shadowing false
+skinparam defaultTextAlignment center
 
-actor User
+actor "用户 / Web 前端" as User
 
-' ===== Layer 1 =====
-package "API Layer\n对外接口" as API {
-    component "FastAPI\napp/main.py"
-    component "Router\nroutes.py"
-    node api_anchor
+component "FastAPI 接口层  app/api\n/ask · /api/v1/chat · /documents\n/index-jobs · /knowledge-graph · /ready" as API
+
+package "应用服务层  app/services" {
+  component "在线问答\nChatService + RAGService" as OnlineService
+  component "文档与图谱任务\nDocumentIndexService + IndexWorker\nGraphBuildService" as OfflineService
+  component "运行状态\nReadinessService" as ReadyService
 }
 
-' ===== Layer 2 =====
-package "Service Layer\n业务逻辑" as SERVICE {
-    component "RAG Service\nrag_service.py"
-    node service_anchor
+package "在线 RAG 主链" {
+  component "问答编排\n/ask：Compiled LangGraph\nWeb：RAGService 手工调用共享节点" as Flow
+  component "rag/nodes 五个节点\nrewrite → retrieve → rerank\n→ build_context → generate" as Nodes
+  component "HybridGraphRetriever\nVector + 中文 BM25 + Knowledge Graph\nWeighted RRF 融合" as Retrieval
 }
 
-' ===== Layer 3 =====
-package "Workflow Layer\nLangGraph流程控制" as WORKFLOW {
-    component "Graph\nrag_graph.py"
-    component "State\nrag_state.py"
-    node workflow_anchor
+package "离线处理主链" {
+  component "IndexManager + Chunker\n文档解析、切片、增量索引" as IndexCore
+  component "GraphExtractor\n实体、关系与证据抽取" as GraphCore
 }
 
-' ===== Layer 4 =====
-package "RAG Processing Layer\n核心处理节点" as PROCESS {
-    component "Retrieve Node"
-    component "Rerank Node"
-    component "Generate Node"
-    node process_anchor
+package "基础设施抽象" {
+  component "Provider 工厂\nLLM · Embedding · Reranker · Vector Store" as Providers
+  component "数据设施\nSQLite：业务、Chunk 元数据、图谱\nChroma：文档向量\ndata/docs：待索引业务文档" as Data
 }
 
-' ===== Layer 5 =====
-package "Retrieval Layer\n检索系统" as RETRIEVAL {
-    component "Hybrid Retriever"
-    component "Vector Search"
-    component "BM25 Search"
-    node retrieval_anchor
-}
+User --> API
+API --> OnlineService : 在线问答
+API --> OfflineService : 文档、索引与图谱任务
+API --> ReadyService : 健康与就绪检查
 
-' ===== Layer 6 =====
-package "Model Layer\nAI模型" as MODEL {
-    component "Embedding Model"
-    component "Reranker Model"
-    component "LLM"
-    node model_anchor
-}
+OnlineService --> Flow
+Flow --> Nodes
+Nodes --> Retrieval : retrieve
+Nodes --> Providers : rewrite / rerank / generate
+Retrieval --> Providers : 向量查询
+Retrieval --> Data : BM25 / 图谱证据 / 向量结果
 
-' ===== Layer 7 =====
-package "Data Layer\n数据存储" as DATA {
-    component "Chroma Vector Store"
-    database "Vector DB"
-    folder "Documents"
-    node data_anchor
-}
+OfflineService --> IndexCore
+OfflineService --> GraphCore
+IndexCore --> Providers : Embedding
+GraphCore --> Providers : LLM 抽取
+IndexCore --> Data : 读文档、写 Chunk 与向量
+GraphCore --> Data : 写实体、关系与证据
+ReadyService --> Data
 
-' ===== 主调用链（只连接锚点）=====
-User --> api_anchor
-api_anchor --> service_anchor
-service_anchor --> workflow_anchor
-workflow_anchor --> process_anchor
-process_anchor --> retrieval_anchor
-retrieval_anchor --> model_anchor
-model_anchor --> data_anchor
+note right of Flow
+当前是“共享节点、两种编排入口”：
+只有 /ask 调用 compiled_graph.invoke()；
+Web 同步与 SSE 由 RAGService 依次调用节点函数。
+所有入口共用登录鉴权、并发限制、
+Provider 超时和索引版本缓存刷新。
+end note
 
-' ===== 内部逻辑 =====
-"Retrieve Node" --> "Hybrid Retriever"
-"Hybrid Retriever" --> "Vector Search"
-"Hybrid Retriever" --> "BM25 Search"
-"Vector Search" --> "Chroma Vector Store"
-"Chroma Vector Store" --> "Vector DB"
+note right of Retrieval
+知识图谱目前是 retrieve 内部的检索通道，
+不是独立 LangGraph 节点。
+end note
 
 @enduml

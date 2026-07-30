@@ -6,12 +6,12 @@ from rag.nodes.rewrite_node import create_rewrite_node
 from rag.nodes.retrieve_node import create_retrieve_node
 from rag.nodes.rerank_node import create_rerank_node
 from rag.nodes.generate_node import create_generate_node
-from rag.runtime.runtime import RAGRuntime, get_runtime
+from rag.runtime.runtime import RAGRuntime, get_current_runtime
 
 
 def build_graph(runtime: RAGRuntime | None = None):
 
-    runtime = runtime or get_runtime()
+    runtime = runtime or get_current_runtime()
 
     workflow = StateGraph(RAGState) 
 

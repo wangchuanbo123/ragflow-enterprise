@@ -1,4 +1,5 @@
 from functools import cached_property
+from typing import Iterator
 
 from langchain_community.llms import Ollama
 from langchain_openai import ChatOpenAI
@@ -11,11 +12,13 @@ class ZhipuLLMProvider:
         api_key: str,
         base_url: str,
         temperature: float = 0,
+        timeout: float = 120,
     ):
         self.model = model
         self.api_key = api_key
         self.base_url = base_url
         self.temperature = temperature
+        self.timeout = timeout
 
     @cached_property
     def _model(self):
@@ -30,7 +33,7 @@ class ZhipuLLMProvider:
             base_url=self.base_url,
             temperature=self.temperature,
             max_retries=2,
-            timeout=120,
+            timeout=self.timeout,
         )
 
     def get_model(self):
@@ -41,18 +44,35 @@ class ZhipuLLMProvider:
         content = getattr(response, "content", response)
         return str(content)
 
+    def stream(self, prompt: str) -> Iterator[str]:
+        for chunk in self._model.stream(prompt):
+            content = getattr(chunk, "content", chunk)
+            if content:
+                yield str(content)
+
 
 class OllamaLLMProvider:
-    def __init__(self, model: str, base_url: str):
+    def __init__(self, model: str, base_url: str, timeout: float = 120):
         self.model = model
         self.base_url = base_url
+        self.timeout = timeout
 
     @cached_property
     def _model(self):
-        return Ollama(model=self.model, base_url=self.base_url)
+        return Ollama(
+            model=self.model,
+            base_url=self.base_url,
+            timeout=self.timeout,
+        )
 
     def get_model(self):
         return self._model
 
     def generate(self, prompt: str) -> str:
         return str(self._model.invoke(prompt))
+
+    def stream(self, prompt: str) -> Iterator[str]:
+        for chunk in self._model.stream(prompt):
+            content = getattr(chunk, "content", chunk)
+            if content:
+                yield str(content)

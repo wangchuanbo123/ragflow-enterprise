@@ -1,29 +1,21 @@
 """
 Context 构建节点
-作用：
-把检索到的 docs 拼接成 context
+调用 ContextBuilder 构建上下文与引用。
 """
 
+from rag.context.context_builder import build_context
+from rag.context.context_exporter import export_context_snapshot
+
+
 def context_node(state):
-    docs = state["docs"]
+    docs = state.get("docs") or []
+    context, sources = build_context(docs)
 
-    context_parts = []
-    sources = []
-
-    for doc in docs:
-        content = doc.page_content
-        source = doc.metadata.get("source", "unknown")
-
-        context_parts.append(content)
-
-        sources.append({
-            "source": source,
-            "preview": content[:200]
-        })
-
-    context = "\n\n".join(context_parts)
-
-    return {
+    result = {
         "context": context,
-        "sources": sources
+        "sources": sources,
     }
+    snapshot = export_context_snapshot({**state, **result})
+    if snapshot is not None:
+        result["context_json_file"] = str(snapshot)
+    return result
