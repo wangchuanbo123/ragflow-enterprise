@@ -1,0 +1,361 @@
+@startuml EnterpriseRAG_Complete_Architecture
+title Enterprise RAG 当前完整架构（基于实际代码）
+
+top to bottom direction
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam roundcorner 10
+skinparam linetype ortho
+skinparam packageStyle rectangle
+skinparam componentStyle rectangle
+skinparam defaultTextAlignment center
+skinparam ArrowColor #64748B
+skinparam packageBorderColor #94A3B8
+skinparam packageBackgroundColor #F8FAFC
+skinparam componentBorderColor #64748B
+skinparam componentBackgroundColor #FFFFFF
+skinparam databaseBorderColor #64748B
+skinparam databaseBackgroundColor #FFF7ED
+skinparam noteBorderColor #F59E0B
+skinparam noteBackgroundColor #FFFBEB
+
+legend right
+  |= 颜色 |= 含义 |
+  |<#E8F0FE>| 用户入口 / API |
+  |<#E8F5E9>| 应用服务 / RAG 核心 |
+  |<#FFF3E0>| 数据与外部依赖 |
+  |<#FDECEC>| 当前缺失或未完整落地 |
+endlegend
+
+actor "普通用户" as EndUser
+actor "管理员" as Admin
+actor "运维 / 开发人员" as Operator
+actor "第三方 API 客户端" as ApiClient
+
+package "表现层  web/（Vue 3 + TypeScript + Vite）" as WEB #E8F0FE {
+  component "App.vue\n启动、恢复登录态\n登录页 / 聊天页切换" as WebApp
+  component "LoginView\n用户名密码登录" as LoginView
+  component "ChatView\n聊天主布局、用户信息、退出" as ChatView
+  component "ConversationSidebar\n新建 / 选择 / 重命名 / 删除会话" as Sidebar
+  component "MessageList\n历史消息、流式文本、引用来源、输入框" as MessageList
+  component "useAuth\n共享用户状态、登录 / 退出 / 恢复" as UseAuth
+  component "useConversations\n会话列表、消息状态、SSE 增量拼接" as UseConv
+  component "api/client.ts\nFetch + HttpOnly Cookie\nPOST SSE 流手工解析" as WebClient
+
+  WebApp --> LoginView
+  WebApp --> ChatView
+  LoginView --> UseAuth
+  ChatView --> UseAuth
+  ChatView --> Sidebar
+  ChatView --> MessageList
+  Sidebar --> UseConv
+  MessageList --> UseConv
+  UseAuth --> WebClient
+  UseConv --> WebClient
+}
+
+package "接入层  app/main.py + app/api/" as API #E8F0FE {
+  component "FastAPI 应用入口\nLifespan 启停\n静态托管 web/dist" as FastAPIApp
+  component "横切中间件\nX-Request-ID\nCORS（携带 Cookie）\n统一异常响应" as Middleware
+
+  package "HTTP 路由" as ROUTES {
+    component "兼容问答\nPOST /ask\n登录后同步调用 LangGraph" as AskAPI
+    component "认证\nPOST /api/v1/auth/login\nPOST /logout\nGET /me" as AuthAPI
+    component "会话 CRUD\nPOST / GET / PATCH / DELETE\n/api/v1/conversations" as ConvAPI
+    component "消息问答\nPOST .../messages（同步）\nPOST .../messages/stream（SSE）" as MessageAPI
+    component "文档管理\nGET 列表 / 详情\nPOST 上传\nDELETE 删除\nPOST reindex" as DocAPI
+    component "索引任务\nPOST /index-jobs/sync\nGET 任务列表 / 详情" as JobAPI
+    component "知识图谱查询\n统计 / 实体搜索 / 实体详情\n1~2 跳邻居" as KgAPI
+    component "运行探针\nGET /health\nGET /ready" as HealthAPI
+  }
+
+  FastAPIApp --> Middleware
+  Middleware --> AskAPI
+  Middleware --> AuthAPI
+  Middleware --> ConvAPI
+  Middleware --> MessageAPI
+  Middleware --> DocAPI
+  Middleware --> JobAPI
+  Middleware --> KgAPI
+  Middleware --> HealthAPI
+}
+
+package "应用服务层  app/services/" as SERVICES #E8F5E9 {
+  component "AuthService\n校验 bcrypt 密码\n签发 / 清除 JWT Cookie" as AuthService
+  component "ChatService\n校验会话归属\n保存用户/助手消息\n同步回答与 SSE 事件" as ChatService
+  component "RAGService\nprepare_context()\ngenerate() / stream_generate()\nask_question()" as RAGService
+  component "RAGConcurrency\n进程内 BoundedSemaphore\n排队超时 -> 429" as RAGConcurrency
+  component "DocumentIndexService\n上传校验、内容去重\n创建 sync/file/delete 任务" as DocumentService
+  component "IndexWorker\n单进程后台线程\n领取并执行持久化任务\n启动恢复 stale running 任务" as IndexWorker
+  component "GraphBuildService\n批量图谱抽取\n断点状态、失败重试\nSchema 变更后重抽取" as GraphBuildService
+  component "ReadinessService\n检查 SQLite、Chroma ID 集\nOllama 模型、Worker 线程\n结果短时缓存" as ReadinessService
+}
+
+package "数据访问层  app/repositories/" as REPOS #E8F5E9 {
+  component "UserRepository\n按 ID / 用户名读取、创建" as UserRepo
+  component "ConversationRepository\n按 user_id 隔离会话\nMessageRepository 持久化消息" as ConvRepo
+  component "KnowledgeRepository\n文档、Chunk、活动索引指针\n跨进程 index signature" as KnowledgeRepo
+  component "IndexJobRepository\n任务/条目、原子领取\n进度更新、遗留任务恢复" as JobRepo
+  component "KnowledgeGraphRepository\n实体、别名、关系、证据查询" as KGRepo
+}
+
+package "在线 RAG 运行时  rag/" as ONLINE #E8F5E9 {
+  component "RAGRuntime（懒加载 + 缓存）\nLLM + Retriever + Reranker\n检测 index signature 后刷新" as Runtime
+
+  package "两种编排入口" as ORCHESTRATION {
+    component "Compiled LangGraph\n仅 /ask 调用 invoke()" as CompiledGraph
+    component "Service 手工编排\nWeb 同步 + SSE 调用\n共享相同节点函数" as ManualFlow
+  }
+
+  package "RAG 节点流水线" as NODES {
+    component "1. rewrite\n原问题 + 最近历史\n生成改写问题\n失败退化为原问题" as RewriteNode
+    component "2. retrieve\n原问题 + 改写问题\n多查询候选召回" as RetrieveNode
+    component "3. rerank\n始终使用原问题\nBGE 失败则按融合分降级" as RerankNode
+    component "4. build_context\nChunk/内容去重\n每来源配额 + Token 预算\n稳定引用编号" as ContextNode
+    component "5. generate\n原问题 + 历史 + 上下文\n同步或真实流式生成" as GenerateNode
+
+    RewriteNode --> RetrieveNode
+    RetrieveNode --> RerankNode
+    RerankNode --> ContextNode
+    ContextNode --> GenerateNode
+  }
+
+  package "三路混合检索" as RETRIEVAL {
+    component "Vector Channel\nChroma 相似度检索\nOllama Query Embedding" as VectorChannel
+    component "BM25 Channel\nSQLite Chunk 构建内存索引\njieba 中文分词" as BM25Channel
+    component "Graph Channel\n实体名/别名匹配\n1~2 跳 BFS\n关系 evidence 回链 Chunk" as GraphChannel
+    component "Weighted RRF\n按 chunk_id 去重\n合并命中通道、graph_facts\n截取候选集" as RRF
+
+    VectorChannel --> RRF
+    BM25Channel --> RRF
+    GraphChannel --> RRF
+  }
+
+  component "ContextExporter（可选）\n导出最终 LLM 上下文、来源\n与 graph_facts 到 JSON" as ContextExporter
+
+  CompiledGraph --> RewriteNode
+  ManualFlow --> RewriteNode
+  RetrieveNode --> VectorChannel
+  RetrieveNode --> BM25Channel
+  RetrieveNode --> GraphChannel
+  RRF --> RerankNode
+  ContextNode ..> ContextExporter
+  Runtime --> CompiledGraph
+  Runtime --> ManualFlow
+}
+
+package "离线文档索引  rag/indexing + rag/loaders" as INDEXING #E8F5E9 {
+  component "IndexManager.classify_files\nadded / modified / deleted / unchanged\n校验内容 Hash、Schema、Embedding" as Classifier
+  component "DocumentLoader\nTXT / PDF / Markdown / DOCX / HTML\n过滤空内容" as Loader
+  component "Chunker\n递归切片（默认）/ 语义切片（可选）\n重叠、短尾合并、批内去重\n确定性 chunk_id + token_count" as Chunker
+  component "Embedding 批处理\n按 INGEST_BATCH_SIZE\n失败清理本批新向量" as BatchEmbedding
+  component "增量索引\n先写新向量和 SQLite\n再清理旧向量\n失败保留旧可用索引" as IncrementalIndex
+  component "全量影子重建\n新 documents_build_* Collection\n校验向量数量和完整 ID 集\nSQLite 事务切换活动指针" as ShadowRebuild
+  component "Collection 管理\n列表、兼容性回滚\n清理非活动 Collection" as CollectionMgmt
+  component "缓存失效\nRuntime / CompiledGraph / BM25\nReadiness Cache" as CacheInvalidation
+
+  Classifier --> Loader
+  Loader --> Chunker
+  Chunker --> BatchEmbedding
+  BatchEmbedding --> IncrementalIndex
+  BatchEmbedding --> ShadowRebuild
+  IncrementalIndex --> CacheInvalidation
+  ShadowRebuild --> CacheInvalidation
+  CollectionMgmt --> CacheInvalidation
+}
+
+package "知识图谱构建  rag/knowledge_graph" as KGCORE #E8F5E9 {
+  component "GraphExtractor\n多个 Chunk 合并一次 LLM 请求\nJSON 清洗与修复重试" as GraphExtractor
+  component "Schema Validator\n实体类型/关系谓词白名单\nlocal_id、自环、原文 evidence 校验\n低置信度关系过滤" as GraphValidator
+  component "Normalizer\nUnicode NFKC\n名称 / 别名归一化" as Normalizer
+  component "SqliteGraphStore\n实体/别名/提及/关系/evidence Upsert\n按 Chunk 替换、孤儿清理" as GraphStore
+  component "KnowledgeGraphRetriever\n实体匹配 -> 图遍历 -> evidence\n映射原始 knowledge_chunks" as GraphRetriever
+
+  GraphExtractor --> GraphValidator
+  GraphValidator --> Normalizer
+  Normalizer --> GraphStore
+  GraphStore --> GraphRetriever
+}
+
+package "Provider 抽象层  rag/providers" as PROVIDERS #E8F5E9 {
+  component "Provider Factory\n按 .env 选择实现\n实例级 LRU 缓存" as ProviderFactory
+  component "LLMProvider\ngenerate / stream\nZhipu/OpenAI 兼容 API\n或 Ollama 回退" as LLMProvider
+  component "EmbeddingProvider\nOllama /api/embed\nquery: / passage: 指令" as EmbeddingProvider
+  component "Reranker\nBAAI/bge-reranker-base\n或 Passthrough" as RerankerProvider
+  component "VectorStoreProvider\nLangChain Chroma Adapter" as VectorProvider
+  component "GraphStoreProvider\n当前仅 SQLite" as GraphStoreProvider
+
+  ProviderFactory --> LLMProvider
+  ProviderFactory --> EmbeddingProvider
+  ProviderFactory --> RerankerProvider
+  ProviderFactory --> VectorProvider
+  ProviderFactory --> GraphStoreProvider
+}
+
+package "配置、安全与运维" as CROSS #E8F5E9 {
+  component "app/core/config.py\n.env 配置、路径与参数校验\n缺失 JWT/初始密码时本地生成" as Config
+  component "app/core/security.py\nbcrypt + HS256 JWT\nHttpOnly / SameSite Cookie" as Security
+  component "Alembic Migrations\n应用启动自动升级数据库" as Alembic
+  component "Logging + Request ID\n标准输出日志" as Logging
+  component "CLI scripts/ingest_documents.py\ndry-run / sync / rebuild\ngraph-only / retry-failed\ncollection 管理" as IngestCLI
+  component "评估 scripts/evaluate_rag.py\nretrieval / full / compare\nRecall、MRR、nDCG、答案关键词、耗时" as EvalCLI
+}
+
+package "持久化数据" as DATA #FFF3E0 {
+  folder "data/docs/\n原始知识文档" as DocsDir
+  database "SQLite  data/app.db\n\n业务：users / conversations / messages\n索引：knowledge_documents / knowledge_chunks\n状态：knowledge_index_state\n任务：index_jobs / index_job_items\n图谱：kg_entities / kg_aliases\nkg_entity_mentions / kg_relations\nkg_relation_evidence" as SQLite
+  database "Chroma  data/vector_db/\n活动 documents_build_* Collection\n非活动备份 Collection\nChunk 向量 + metadata" as Chroma
+  folder "data/debug/contexts/\n可选调试快照（默认关闭）" as DebugContexts
+  folder "eval/\n30 题 tuning / holdout\n基线与评估结果" as EvalData
+}
+
+cloud "外部 / 本地模型依赖" as EXTERNAL #FFF3E0 {
+  component "智谱 / OpenAI 兼容 API\n默认模型 glm-5.2\n问答、改写、图谱抽取" as CloudLLM
+  component "Ollama 服务\nqwen3:4b（LLM 回退）\nnomic-embed-text-v2-moe（Embedding）" as Ollama
+  component "本地 Hugging Face 缓存\nBAAI/bge-reranker-base" as HFModel
+}
+
+package "当前缺失 / 未完整产品化" as MISSING #FDECEC {
+  component "用户与企业权限\n无注册、用户 CRUD、改密/重置\n无 SSO/LDAP/OIDC/MFA\n无租户、知识库/文档级 ACL" as MissingIAM #FDECEC
+  component "知识库管理后台\n前端无文档、索引任务、健康状态\n知识图谱管理与可视化页面\n无多知识库/工作区" as MissingAdmin #FDECEC
+  component "RAG 高级能力\n无文档/metadata 权限过滤\n无独立 text_context + graph_subgraph\n无实体向量、Agent/工具调用、模型路由" as MissingRAG #FDECEC
+  component "交互完整性\n无停止生成、服务端取消、消息编辑\n重新生成/真正重试、Markdown 渲染\n历史会话接口不返回引用详情" as MissingUX #FDECEC
+  component "生产工程\n无分布式任务队列与横向扩展方案\n无 Metrics/Tracing/Audit、阶段耗时落盘\n无容器/K8s/CI 配置、备份恢复流程" as MissingOps #FDECEC
+  component "验收缺口\nholdout final 尚未生成\n缺少前端/E2E/性能/安全测试\n本机图谱表当前为空" as MissingAcceptance #FDECEC
+}
+
+' ======================== 入口调用 ========================
+EndUser --> WebApp : 浏览器使用
+Admin --> WebApp : 聊天入口
+Admin --> DocAPI : 管理员 API
+ApiClient --> AskAPI
+ApiClient --> MessageAPI
+Operator --> IngestCLI
+Operator --> EvalCLI
+WebClient --> AuthAPI : 登录态
+WebClient --> ConvAPI
+WebClient --> MessageAPI : POST + SSE
+
+' ======================== API 到服务 ========================
+AuthAPI --> AuthService
+ConvAPI --> ConvRepo
+MessageAPI --> ChatService
+AskAPI --> RAGService
+DocAPI --> DocumentService
+JobAPI --> DocumentService
+KgAPI --> KGRepo
+KgAPI --> GraphStore
+HealthAPI --> ReadinessService
+
+' ======================== 应用服务协作 ========================
+AuthService --> UserRepo
+AuthService --> Security
+ChatService --> ConvRepo
+ChatService --> RAGConcurrency
+RAGConcurrency --> RAGService
+RAGService --> Runtime
+RAGService --> ManualFlow : Web 同步 / SSE
+RAGService --> CompiledGraph : /ask
+DocumentService --> JobRepo
+DocumentService --> KnowledgeRepo
+DocumentService --> DocsDir
+IndexWorker --> JobRepo
+IndexWorker --> Classifier
+IndexWorker --> IncrementalIndex
+IndexWorker --> ShadowRebuild
+GraphBuildService --> GraphExtractor
+GraphBuildService --> GraphStore
+ReadinessService --> SQLite
+ReadinessService --> Chroma
+ReadinessService --> Ollama
+ReadinessService --> IndexWorker
+
+' ======================== Repository 到数据库 ========================
+UserRepo --> SQLite
+ConvRepo --> SQLite
+KnowledgeRepo --> SQLite
+JobRepo --> SQLite
+KGRepo --> SQLite
+
+' ======================== 在线检索与 Provider ========================
+RewriteNode --> LLMProvider
+GenerateNode --> LLMProvider
+VectorChannel --> VectorProvider
+VectorChannel --> EmbeddingProvider
+BM25Channel --> SQLite
+GraphChannel --> GraphRetriever
+GraphRetriever --> SQLite
+RerankNode --> RerankerProvider
+ContextExporter --> DebugContexts
+
+' ======================== 离线索引与图谱 ========================
+IngestCLI --> Classifier
+IngestCLI --> CollectionMgmt
+IngestCLI --> GraphBuildService
+Classifier --> DocsDir
+BatchEmbedding --> EmbeddingProvider
+IncrementalIndex --> SQLite
+IncrementalIndex --> Chroma
+ShadowRebuild --> SQLite
+ShadowRebuild --> Chroma
+CollectionMgmt --> Chroma
+GraphExtractor --> LLMProvider
+GraphStore --> SQLite
+EvalCLI --> Runtime
+EvalCLI --> EvalData
+
+' ======================== 具体外部实现 ========================
+LLMProvider --> CloudLLM : 配置完整时
+LLMProvider --> Ollama : 本地模式 / 云端配置缺失时
+EmbeddingProvider --> Ollama
+RerankerProvider --> HFModel
+VectorProvider --> Chroma
+GraphStoreProvider --> SQLite
+Loader --> DocsDir
+
+' ======================== 启停和横切 ========================
+FastAPIApp --> Alembic : 启动迁移
+Alembic --> SQLite
+FastAPIApp --> IndexWorker : 启动 / 优雅停止
+FastAPIApp --> Config
+Middleware --> Logging
+AuthService --> Config
+ProviderFactory --> Config
+Runtime --> ProviderFactory
+IndexWorker --> CacheInvalidation
+
+note right of ORCHESTRATION
+  <b>重要现状：两套编排共存</b>
+  /ask 执行编译后的 LangGraph；
+  Web 同步和 SSE 由 RAGService 手工依次调用相同节点。
+  两条链能力接近，但存在后续演进分叉风险。
+end note
+
+note right of GraphChannel
+  图谱不是独立 LangGraph 节点，
+  而是 retrieve 内部的第三条召回通道。
+  图谱事实合并进 Document.metadata.graph_facts，
+  最终与正文一起进入单一 context 字符串。
+end note
+
+note right of ShadowRebuild
+  全量重建先写影子 Collection；
+  只有向量数量和完整 Chunk ID 集校验通过后，
+  才在 SQLite 事务中替换 Chunk 并切换活动指针。
+  旧 Collection 默认保留，但 SQLite 只保留当前 Chunk。
+end note
+
+note left of SQLite
+  当前本机数据（2026-08-06）：
+  27 个 ready 文档，3880 个 Chunk；
+  活动 Chroma 也为 3880，ID 集一致。
+  图谱实体/关系/evidence 表均为 0；
+  仍有 3448 pending、6 processing 的图谱 Chunk 状态。
+end note
+
+note bottom of MISSING
+  红色区域不是已经部署的组件，
+  而是从现有代码、API、前端与验收数据中确认的能力边界。
+end note
+
+@enduml
