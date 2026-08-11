@@ -61,6 +61,10 @@ def client(db_engine, monkeypatch):
                 )
             )
             db.commit()
+        admin = db.query(User).filter(User.username == INITIAL_ADMIN_USERNAME).one()
+        from app.repositories.knowledge_base_repository import KnowledgeBaseRepository
+
+        KnowledgeBaseRepository(db).ensure_default(admin.id)
 
     from fastapi.testclient import TestClient
 

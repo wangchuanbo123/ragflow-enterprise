@@ -40,29 +40,40 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from app.bootstrap.container import get_provider_container
     from app.core.init_db import init_app
     from app.core.logger import setup_logging
 
     setup_logging()
-
-    # Recover stale index jobs
-    try:
-        from app.core.database import SessionLocal
-        from app.repositories.index_job_repository import IndexJobRepository
-        with SessionLocal() as db:
-            recovered = IndexJobRepository(db).recover_stale_jobs()
-            if recovered:
-                import logging
-                logging.getLogger(__name__).info("Recovered %d stale index jobs", recovered)
-    except Exception:
-        pass
+    # Validate the selected profile and construct all phase-one providers before
+    # accepting traffic. Unsupported enterprise adapters fail fast here.
+    container = get_provider_container()
 
     init_app()
+    # Migrations must run before lease columns are queried during an upgrade.
+    try:
+        from app.repositories.index_job_repository import IndexJobRepository
+        with container.metadata.session() as db:
+            recovered = IndexJobRepository(
+                db,
+                knowledge_base_id=None,
+            ).recover_expired_leases()
+            if recovered:
+                import logging
+                logging.getLogger(__name__).info(
+                    "Recovered %d expired index job leases",
+                    recovered,
+                )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Index job lease recovery failed")
     try:
         yield
     finally:
         from app.services.index_worker import stop_worker
+        from app.services.connector_scheduler import stop_connector_scheduler
 
+        stop_connector_scheduler()
         stop_worker()
 
 

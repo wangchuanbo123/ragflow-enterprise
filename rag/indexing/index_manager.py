@@ -26,11 +26,15 @@ from app.core.config import (
     EMBEDDING_PROVIDER,
     INDEX_SCHEMA_VERSION,
     INGEST_BATCH_SIZE,
-    VECTOR_DB_DIR,
+)
+from app.core.knowledge_bases import (
+    DEFAULT_KNOWLEDGE_BASE_ID,
+    object_prefix_for_knowledge_base,
 )
 from app.repositories.knowledge_repository import KnowledgeRepository
 from rag.indexing.chunker import split_documents
 from rag.loaders.document_loader import is_supported_document, load_document
+from rag.providers.interfaces import VectorIndexRef
 from rag.utils.file_hash import file_hash
 
 logger = logging.getLogger(__name__)
@@ -47,12 +51,14 @@ class PreparedDocument:
     chunk_records: list[Any]
 
 
-def _corpus_fingerprint(doc_dir: Path) -> str:
+def _corpus_fingerprint(doc_dir: Path, include_path=None) -> str:
     files = sorted([p for p in doc_dir.rglob("*") if is_supported_document(p)])
     hasher = hashlib.sha256()
     for f in files:
         h = file_hash(f)
         rel = f.relative_to(doc_dir).as_posix()
+        if include_path is not None and not include_path(rel):
+            continue
         hasher.update(f"{rel}:{h}".encode())
     return hasher.hexdigest()[:16]
 
@@ -62,11 +68,22 @@ def _embedding_fingerprint() -> str:
 
 
 class IndexManager:
-    def __init__(self, db, embedding=None):
+    def __init__(
+        self,
+        db,
+        embedding=None,
+        vector_provider=None,
+        knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    ):
         self.db = db
-        self.repo = KnowledgeRepository(db)
+        self.knowledge_base_id = knowledge_base_id
+        self.repo = KnowledgeRepository(db, knowledge_base_id)
         self._embedding = embedding
-        self._chroma_client = None
+        if vector_provider is None:
+            from app.bootstrap.container import get_provider_container
+
+            vector_provider = get_provider_container().vector_store
+        self.vector_provider = vector_provider
 
     @property
     def embedding(self):
@@ -75,24 +92,51 @@ class IndexManager:
             self._embedding = get_embedding_provider().get_model()
         return self._embedding
 
-    @property
-    def chroma_client(self):
-        if self._chroma_client is None:
-            import chromadb
-            self._chroma_client = chromadb.PersistentClient(path=str(VECTOR_DB_DIR))
-        return self._chroma_client
+    def _index_ref(self, collection_name: str) -> VectorIndexRef:
+        return VectorIndexRef(
+            name=collection_name,
+            knowledge_base_id=self.knowledge_base_id,
+        )
 
-    def _make_chroma_store(self, collection_name: str):
-        from rag.providers.factory import get_vector_store_provider
-        return get_vector_store_provider().load(
+    def _open_vector_store(self, collection_name: str):
+        return self.vector_provider.open(
             embedding=self.embedding,
-            persist_dir=str(VECTOR_DB_DIR),
-            collection_name=collection_name,
+            index_ref=self._index_ref(collection_name),
         )
 
     def _active_collection(self) -> str | None:
         state = self.repo.get_index_state()
         return state.active_collection_name
+
+    def ensure_active_collection(self, job_id: str) -> str:
+        """Create an empty active collection for first-upload workflows."""
+        active = self._active_collection()
+        if active:
+            return active
+        collection_name = self._build_collection_name(job_id)
+        self._open_vector_store(collection_name)
+        state = self.repo.get_index_state()
+        state.active_collection_name = collection_name
+        state.index_schema_version = INDEX_SCHEMA_VERSION
+        state.embedding_fingerprint = _embedding_fingerprint()
+        state.corpus_fingerprint = ""
+        state.updated_at = datetime.now(timezone.utc)
+        self.db.commit()
+        return collection_name
+
+    def _belongs_to_knowledge_base(self, source_path: str) -> bool:
+        if "/.versions/" in f"/{source_path}":
+            return False
+        prefix = object_prefix_for_knowledge_base(self.knowledge_base_id)
+        if prefix:
+            return source_path.startswith(f"{prefix}/")
+        return not source_path.startswith("knowledge-bases/")
+
+    def _build_collection_name(self, job_id: str) -> str:
+        if self.knowledge_base_id == DEFAULT_KNOWLEDGE_BASE_ID:
+            return f"documents_build_{job_id}"
+        compact_kb_id = self.knowledge_base_id.replace("-", "")[:12]
+        return f"documents_{compact_kb_id}_build_{job_id}"
 
     # --- Sync classification ---
 
@@ -111,6 +155,8 @@ class IndexManager:
             if not is_supported_document(path):
                 continue
             rel = path.relative_to(doc_dir).as_posix()
+            if not self._belongs_to_knowledge_base(rel):
+                continue
             files_on_disk[rel] = path
 
         emb_fp = _embedding_fingerprint()
@@ -255,6 +301,7 @@ class IndexManager:
         ):
             metadata = dict(chunk_doc.metadata)
             metadata.update({
+                "knowledge_base_id": self.knowledge_base_id,
                 "document_id": document_id,
                 "file_hash": file_hash_val,
                 "source": source_path,
@@ -263,6 +310,7 @@ class IndexManager:
             chunk_doc.metadata = metadata
             chunk_records.append(KnowledgeChunk(
                 id=metadata["chunk_id"],
+                knowledge_base_id=self.knowledge_base_id,
                 document_id=document_id,
                 file_hash=file_hash_val,
                 chunk_index=metadata["chunk_index"],
@@ -295,14 +343,14 @@ class IndexManager:
         *,
         preserve_ids: set[str] | None = None,
     ) -> None:
-        chroma_store = self._make_chroma_store(collection_name)
+        vector_store = self._open_vector_store(collection_name)
         written_ids: set[str] = set()
         preserve_ids = preserve_ids or set()
         try:
             for start in range(0, len(prepared.vector_documents), INGEST_BATCH_SIZE):
                 batch = prepared.vector_documents[start:start + INGEST_BATCH_SIZE]
                 ids = [chunk.metadata["chunk_id"] for chunk in batch]
-                chroma_store.add_documents(batch, ids=ids)
+                vector_store.add_documents(batch, ids=ids)
                 written_ids.update(ids)
         except Exception as write_error:
             cleanup_ids = written_ids - preserve_ids
@@ -321,18 +369,31 @@ class IndexManager:
         from sqlalchemy import delete
 
         from app.models.knowledge_chunk import KnowledgeChunk
+        from app.models.document_management import DocumentVersion
         from app.models.knowledge_document import KnowledgeDocument
 
         doc = self.repo.get_by_source_path(prepared.source_path)
         if doc is None:
             doc = KnowledgeDocument(
                 id=prepared.document_id,
+                knowledge_base_id=self.knowledge_base_id,
                 source_path=prepared.source_path,
                 original_filename=prepared.original_filename,
                 file_hash=prepared.file_hash,
                 file_size=prepared.file_size,
             )
             self.db.add(doc)
+            self.db.add(
+                DocumentVersion(
+                    knowledge_base_id=self.knowledge_base_id,
+                    document_id=prepared.document_id,
+                    version_no=1,
+                    object_key=prepared.source_path,
+                    file_hash=prepared.file_hash,
+                    file_size=prepared.file_size,
+                    status="active",
+                )
+            )
         elif doc.id != prepared.document_id:
             raise ValueError(
                 f"Document ID changed while indexing {prepared.source_path}"
@@ -351,6 +412,7 @@ class IndexManager:
 
         self.db.execute(
             delete(KnowledgeChunk).where(
+                KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
                 KnowledgeChunk.document_id == prepared.document_id
             )
         )
@@ -375,6 +437,7 @@ class IndexManager:
         if doc is None:
             doc = KnowledgeDocument(
                 id=document_id,
+                knowledge_base_id=self.knowledge_base_id,
                 source_path=source_path,
                 original_filename=file_path.name,
                 file_hash=file_hash_val,
@@ -398,8 +461,10 @@ class IndexManager:
         last_error: Exception | None = None
         for attempt in range(1, max_attempts + 1):
             try:
-                collection = self.chroma_client.get_collection(collection_name)
-                collection.delete(ids=sorted(chunk_ids))
+                self.vector_provider.delete_vectors(
+                    self._index_ref(collection_name),
+                    ids=sorted(chunk_ids),
+                )
                 return
             except Exception as exc:
                 last_error = exc
@@ -422,12 +487,10 @@ class IndexManager:
         collection_name: str,
         document_id: str,
     ) -> set[str]:
-        collection = self.chroma_client.get_collection(collection_name)
-        result = collection.get(
+        return self.vector_provider.list_ids(
+            self._index_ref(collection_name),
             where={"document_id": document_id},
-            include=[],
         )
-        return set(result.get("ids") or [])
 
     def delete_document(self, source_path: str, collection_name: str | None = None) -> bool:
         """删除文档及其所有片段和向量。"""
@@ -449,8 +512,10 @@ class IndexManager:
         return True
 
     def _delete_doc_from_collection(self, document_id: str, collection_name: str) -> None:
-        coll = self.chroma_client.get_collection(collection_name)
-        coll.delete(where={"document_id": document_id})
+        self.vector_provider.delete_vectors(
+            self._index_ref(collection_name),
+            where={"document_id": document_id},
+        )
 
     # --- Shadow collection rebuild ---
 
@@ -462,7 +527,7 @@ class IndexManager:
     ) -> dict:
         """安全全量重建，任一文件失败都不切换活动索引。"""
         job_id = job_id or str(uuid.uuid4())[:8]
-        build_collection = f"documents_build_{job_id}"
+        build_collection = self._build_collection_name(job_id)
         classification = self.classify_files(doc_dir)
         rebuild_items = [
             item
@@ -527,9 +592,9 @@ class IndexManager:
                 "errors": errors[:20],
             }
 
-        collection = self.chroma_client.get_collection(build_collection)
-        vector_count = collection.count()
-        actual_chunk_ids = set(collection.get(include=[])["ids"])
+        build_ref = self._index_ref(build_collection)
+        vector_count = self.vector_provider.count(build_ref)
+        actual_chunk_ids = self.vector_provider.list_ids(build_ref)
         validation_errors: list[str] = []
 
         if vector_count != len(expected_chunk_ids):
@@ -565,7 +630,10 @@ class IndexManager:
                     item["source_path"] for item in classification["deleted"]
                 },
                 build_collection=build_collection,
-                corpus_fingerprint=_corpus_fingerprint(doc_dir),
+                corpus_fingerprint=_corpus_fingerprint(
+                    doc_dir,
+                    self._belongs_to_knowledge_base,
+                ),
             )
         except Exception as exc:
             self.db.rollback()
@@ -577,7 +645,7 @@ class IndexManager:
                 "documents_indexed": 0,
                 "documents_failed": len(prepared_documents),
                 "total_chunks": 0,
-                "errors": [f"SQLite commit failed: {exc}"],
+                "errors": [f"Metadata commit failed: {exc}"],
             }
 
         logger.info(
@@ -600,16 +668,16 @@ class IndexManager:
         if collection_name == active:
             raise ValueError(f"Refusing to reset active collection: {collection_name}")
         try:
-            self.chroma_client.delete_collection(collection_name)
+            self.vector_provider.delete_index(self._index_ref(collection_name))
         except Exception:
             pass
-        self._make_chroma_store(collection_name)
+        self._open_vector_store(collection_name)
 
     def _discard_build_collection(self, collection_name: str) -> None:
         if collection_name == self._active_collection():
             return
         try:
-            self.chroma_client.delete_collection(collection_name)
+            self.vector_provider.delete_index(self._index_ref(collection_name))
         except Exception as exc:
             logger.warning(
                 "Failed to discard incomplete collection %s: %s",
@@ -628,6 +696,7 @@ class IndexManager:
         from sqlalchemy import delete, func, select
 
         from app.models.knowledge_chunk import KnowledgeChunk
+        from app.models.document_management import DocumentVersion
         from app.models.knowledge_document import KnowledgeDocument
 
         state = self.repo.get_index_state()
@@ -636,19 +705,35 @@ class IndexManager:
             doc.source_path: doc for doc in self.repo.list_documents()
         }
 
-        self.db.execute(delete(KnowledgeChunk))
+        self.db.execute(
+            delete(KnowledgeChunk).where(
+                KnowledgeChunk.knowledge_base_id == self.knowledge_base_id
+            )
+        )
 
         for prepared in prepared_documents:
             doc = existing_by_source.get(prepared.source_path)
             if doc is None:
                 doc = KnowledgeDocument(
                     id=prepared.document_id,
+                    knowledge_base_id=self.knowledge_base_id,
                     source_path=prepared.source_path,
                     original_filename=prepared.original_filename,
                     file_hash=prepared.file_hash,
                     file_size=prepared.file_size,
                 )
                 self.db.add(doc)
+                self.db.add(
+                    DocumentVersion(
+                        knowledge_base_id=self.knowledge_base_id,
+                        document_id=prepared.document_id,
+                        version_no=1,
+                        object_key=prepared.source_path,
+                        file_hash=prepared.file_hash,
+                        file_size=prepared.file_size,
+                        status="active",
+                    )
+                )
             elif doc.id != prepared.document_id:
                 raise ValueError(
                     f"Document ID changed during rebuild: {prepared.source_path}"
@@ -690,6 +775,10 @@ class IndexManager:
                 KnowledgeChunk.document_id == KnowledgeDocument.id,
             )
             .where(KnowledgeDocument.status == "ready")
+            .where(
+                KnowledgeDocument.knowledge_base_id == self.knowledge_base_id,
+                KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+            )
         ) or 0
         if persisted_count != staged_count:
             raise ValueError(
@@ -759,30 +848,26 @@ class IndexManager:
     # --- Collection management ---
 
     def list_collections(self) -> list[dict]:
-        collections = self.chroma_client.list_collections()
+        indexes = self.vector_provider.list_indexes()
         active = self._active_collection()
         result = []
-        for coll in collections:
-            name = coll.name if hasattr(coll, "name") else str(coll)
-            try:
-                count = coll.count() if hasattr(coll, "count") else 0
-            except Exception:
-                count = 0
+        for index in indexes:
+            name = index.ref.name
             result.append({
                 "name": name,
-                "count": count,
+                "count": index.count,
                 "is_active": name == active,
             })
         return result
 
     def rollback_collection(self, collection_name: str) -> dict:
         """切换活动 collection 指针到已有 collection。"""
+        index_ref = self._index_ref(collection_name)
         try:
-            coll = self.chroma_client.get_collection(collection_name)
+            vector_ids = self.vector_provider.list_ids(index_ref)
         except Exception:
             return {"status": "error", "message": f"Collection {collection_name} not found"}
 
-        vector_ids = set(coll.get(include=[])["ids"])
         chunk_ids = {
             chunk.id for chunk in self.repo.list_all_active_chunks()
         }
@@ -801,7 +886,7 @@ class IndexManager:
         return {
             "status": "completed",
             "active_collection": collection_name,
-            "vector_count": coll.count(),
+            "vector_count": self.vector_provider.count(index_ref),
         }
 
     def cleanup_collection(self, collection_name: str) -> dict:
@@ -811,7 +896,7 @@ class IndexManager:
             return {"status": "error", "message": "Cannot delete active collection"}
 
         try:
-            self.chroma_client.delete_collection(collection_name)
+            self.vector_provider.delete_index(self._index_ref(collection_name))
         except Exception as exc:
             return {"status": "error", "message": str(exc)}
 

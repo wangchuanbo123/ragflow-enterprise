@@ -26,7 +26,13 @@ def create_message(
     current_user: User = Depends(get_current_user),
 ):
     """同步问答接口，用于测试和第三方接入。"""
-    result = chat_service.answer_sync(db, conversation_id, current_user.id, payload.content)
+    result = chat_service.answer_sync(
+        db,
+        conversation_id,
+        current_user.id,
+        payload.content,
+        payload.retrieval,
+    )
     return MessageAnswer(
         user_message=chat_service._to_message_out(result["user_message"]),
         assistant_message=chat_service._to_message_out(result["assistant_message"]),
@@ -41,7 +47,13 @@ def stream_message(
     current_user: User = Depends(get_current_user),
 ):
     """SSE 流式问答接口，Web 默认调用。"""
-    events = chat_service.answer_stream(db, conversation_id, current_user.id, payload.content)
+    events = chat_service.answer_stream(
+        db,
+        conversation_id,
+        current_user.id,
+        payload.content,
+        payload.retrieval,
+    )
 
     def event_stream():
         for evt in events:

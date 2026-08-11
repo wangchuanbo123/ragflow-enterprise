@@ -41,3 +41,13 @@ PyJWT==2.13.0
 bcrypt==5.0.0
 pytest==9.1.1
 httpx==0.27.2
+
+# Enterprise infrastructure adapters (loaded only when selected by APP_PROFILE)
+boto3>=1.34,<2
+celery[redis]>=5.3,<6
+redis>=5,<7
+psycopg[binary]>=3.1,<4
+
+# Optional multi-language code parsing. Python parsing still uses stdlib ast.
+tree-sitter>=0.23,<0.26
+tree-sitter-language-pack>=0.7,<1

@@ -7,12 +7,21 @@ from sqlalchemy import DateTime, ForeignKey, String, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
+from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 
 
 class Conversation(Base):
     __tablename__ = "conversations"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    knowledge_base_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        default=DEFAULT_KNOWLEDGE_BASE_ID,
+        server_default=DEFAULT_KNOWLEDGE_BASE_ID,
+        index=True,
+        nullable=False,
+    )
     user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False
     )

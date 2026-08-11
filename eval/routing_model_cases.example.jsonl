@@ -1,0 +1,4 @@
+{"id":"text-1","query":"员工报销流程需要哪些材料？","expected":["text"]}
+{"id":"graph-1","query":"订单模块依赖哪些系统，它们的上下游路径是什么？","expected":["text","graph"]}
+{"id":"code-1","query":"create_order 函数被哪些方法调用？","expected":["text","code"]}
+{"id":"mixed-1","query":"从源码调用关系说明支付模块为什么依赖风控系统","expected":["text","graph","code"]}

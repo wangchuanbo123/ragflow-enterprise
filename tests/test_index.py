@@ -74,15 +74,45 @@ class FakeChromaStore:
             self.collection.records[chunk_id] = doc
 
 
+class FakeVectorProvider:
+    def __init__(self, client=None, *, fail=False):
+        self.client = client or FakeChromaClient()
+        self.fail = fail
+
+    def open(self, embedding, index_ref):
+        del embedding
+        collection = self.client.get_or_create_collection(index_ref.name)
+        return FakeChromaStore(collection, fail=self.fail)
+
+    def list_indexes(self):
+        from rag.providers.interfaces import VectorIndexInfo, VectorIndexRef
+
+        return [
+            VectorIndexInfo(VectorIndexRef(name=name), collection.count())
+            for name, collection in self.client.collections.items()
+        ]
+
+    def delete_index(self, index_ref):
+        self.client.delete_collection(index_ref.name)
+
+    def count(self, index_ref):
+        return self.client.get_collection(index_ref.name).count()
+
+    def list_ids(self, index_ref, where=None):
+        result = self.client.get_collection(index_ref.name).get(
+            include=[],
+            where=where,
+        )
+        return set(result["ids"])
+
+    def delete_vectors(self, index_ref, *, ids=None, where=None):
+        self.client.get_collection(index_ref.name).delete(ids=ids, where=where)
+
+
 def _attach_fake_chroma(manager, monkeypatch, *, fail=False):
+    del monkeypatch
     client = FakeChromaClient()
-    manager._chroma_client = client
-
-    def make_store(collection_name):
-        collection = client.get_or_create_collection(collection_name)
-        return FakeChromaStore(collection, fail=fail)
-
-    monkeypatch.setattr(manager, "_make_chroma_store", make_store)
+    manager.vector_provider = FakeVectorProvider(client, fail=fail)
     return client
 
 
@@ -396,13 +426,15 @@ def test_upload_job_keeps_preallocated_document_id(
     db_engine, tmp_path, monkeypatch
 ):
     from app.core.database import SessionLocal
-    from app.services import document_index_service
+    from app.adapters.local import InlineTaskQueue, LocalObjectStore
     from app.services.document_index_service import DocumentIndexService
 
-    monkeypatch.setattr(document_index_service, "DOC_DIR", tmp_path)
-
     with SessionLocal() as db:
-        service = DocumentIndexService(db)
+        service = DocumentIndexService(
+            db,
+            object_store=LocalObjectStore(tmp_path),
+            task_queue=InlineTaskQueue(),
+        )
         job, document_id = service.create_upload_job(
             "manual.txt",
             b"uploaded content",
@@ -476,7 +508,7 @@ def test_partial_vector_batch_is_cleaned_up(db_engine, monkeypatch):
     with SessionLocal() as db:
         manager = IndexManager(db, embedding=object())
         client = FakeChromaClient()
-        manager._chroma_client = client
+        manager.vector_provider = FakeVectorProvider(client)
         collection = client.get_or_create_collection("active")
 
         class FailSecondBatchStore:
@@ -494,7 +526,7 @@ def test_partial_vector_batch_is_cleaned_up(db_engine, monkeypatch):
         monkeypatch.setattr(index_module, "INGEST_BATCH_SIZE", 1)
         monkeypatch.setattr(
             manager,
-            "_make_chroma_store",
+            "_open_vector_store",
             lambda collection_name: store,
         )
         prepared = PreparedDocument(
@@ -579,26 +611,28 @@ def test_upload_rejects_unsupported_type_and_reuses_duplicate_path(
     import hashlib
 
     from app.core.database import SessionLocal
+    from app.adapters.local import InlineTaskQueue, LocalObjectStore
     from app.models.knowledge_document import KnowledgeDocument
-    from app.services import document_index_service
     from app.services.document_index_service import DocumentIndexService
     from rag.errors import DocumentValidationError
 
-    monkeypatch.setattr(document_index_service, "DOC_DIR", tmp_path)
-
     with SessionLocal() as db:
-        service = DocumentIndexService(db)
+        service = DocumentIndexService(
+            db,
+            object_store=LocalObjectStore(tmp_path),
+            task_queue=InlineTaskQueue(),
+        )
         with pytest.raises(DocumentValidationError, match="Unsupported"):
             service.register_upload("payload.exe", b"payload")
 
-        first_id, first_path = service.register_upload(
+        first_id, first_ref = service.register_upload(
             "contract.docx",
             b"same-content",
         )
         document = KnowledgeDocument(
             id=first_id,
-            source_path=first_path.relative_to(tmp_path).as_posix(),
-            original_filename=first_path.name,
+            source_path=first_ref.key,
+            original_filename=Path(first_ref.key).name,
             file_hash=hashlib.sha256(b"same-content").hexdigest(),
             file_size=len(b"same-content"),
             status="ready",
@@ -608,14 +642,14 @@ def test_upload_rejects_unsupported_type_and_reuses_duplicate_path(
         db.add(document)
         db.commit()
 
-        duplicate_id, duplicate_path = service.register_upload(
+        duplicate_id, duplicate_ref = service.register_upload(
             "renamed.docx",
             b"same-content",
         )
 
         assert duplicate_id == first_id
-        assert duplicate_path == first_path
-        assert not (first_path.parent / "renamed.docx").exists()
+        assert duplicate_ref == first_ref
+        assert not (tmp_path / Path(first_ref.key).parent / "renamed.docx").exists()
 
 
 def test_failed_stale_vector_cleanup_is_retryable(

@@ -40,8 +40,8 @@ async function select(id: string): Promise<void> {
   }
 }
 
-async function create(): Promise<void> {
-  const conv = await api.createConversation('新会话')
+async function create(knowledgeBaseId?: string): Promise<void> {
+  const conv = await api.createConversation('新会话', knowledgeBaseId)
   conversations.value.unshift(conv)
   await select(conv.id)
 }
@@ -95,6 +95,9 @@ async function send(content: string): Promise<void> {
         },
         onDelta: (chunk) => {
           assistantMsg.content += chunk
+        },
+        onRoute: (route) => {
+          assistantMsg.route = route
         },
         onSources: (sources) => {
           assistantMsg.sources = sources

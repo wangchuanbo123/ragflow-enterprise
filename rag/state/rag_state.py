@@ -3,7 +3,8 @@ LangGraph 状态对象
 定义整个 RAG workflow 共享的数据
 """
 
-from typing import Any, List, TypedDict
+import operator
+from typing import Annotated, Any, List, TypedDict
 
 from langchain_core.documents import Document
 
@@ -21,3 +22,15 @@ class RAGState(TypedDict, total=False):
     answer: str
     sources: List[dict]
     timings: dict[str, float]
+    retrieval_options: dict
+    route: dict
+    allowed_document_ids: set[str] | None
+    text_docs: List[Document]
+    graph_docs: List[Document]
+    code_docs: List[Document]
+    text_channel_result: dict
+    graph_channel_result: dict
+    code_channel_result: dict
+    channel_results: dict[str, dict]
+    parallel_markers: Annotated[List[str], operator.add]
+    generation_mode: str

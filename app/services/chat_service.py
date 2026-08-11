@@ -1,177 +1,212 @@
-"""
-聊天服务
+"""Conversation persistence around the unified RAG application service."""
 
-负责：
-- 校验会话归属
-- 保存用户消息
-- 创建 streaming 状态的助手消息
-- 调用 RAG 两个阶段（prepare_context -> generate/stream_generate）
-- 成功后保存完整内容、来源和 completed 状态
-- 失败标记为 failed
-
-SSE 事件通过生成器产出，供路由层包装为 text/event-stream。
-"""
+from __future__ import annotations
 
 from collections.abc import Iterator
-from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
 
 from app.api.errors import bad_request, not_found
 from app.core.config import MAX_HISTORY_MESSAGES
+from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 from app.models.conversation import Conversation
 from app.models.message import Message
-from app.repositories.conversation_repository import ConversationRepository, MessageRepository
-from app.services.rag_service import prepare_context, stream_generate
+from app.repositories.conversation_repository import (
+    ConversationRepository,
+    MessageRepository,
+)
+
+
+def _runtime_for_knowledge_base(knowledge_base_id: str):
+    """Resolve through the module so runtime/test overrides stay observable."""
+    from app.services import rag_service
+
+    if knowledge_base_id == DEFAULT_KNOWLEDGE_BASE_ID:
+        return rag_service.active_runtime()
+    return rag_service.active_runtime(knowledge_base_id)
 
 
 def _ensure_conversation(db: Session, conversation_id: str, user_id: str) -> Conversation:
-    repo = ConversationRepository(db)
-    conv = repo.get_for_user(conversation_id, user_id)
-    if not conv:
+    conversation = ConversationRepository(db).get_for_user(conversation_id, user_id)
+    if not conversation:
         raise not_found("会话不存在")
-    return conv
+    return conversation
 
 
 def _load_history(db: Session, conversation_id: str, user_id: str) -> list[dict]:
-    rows = MessageRepository(db).list_for_conversation(conversation_id, user_id, MAX_HISTORY_MESSAGES)
-    return [{"role": r.role, "content": r.content} for r in rows]
+    rows = MessageRepository(db).list_for_conversation(
+        conversation_id,
+        user_id,
+        MAX_HISTORY_MESSAGES,
+    )
+    return [{"role": row.role, "content": row.content} for row in rows]
 
 
 def _to_message_out(message: Message):
-    """把 ORM 消息转为可序列化字典。"""
     from app.schemas.message import MessageOut, SourceRef
+    from app.schemas.rag import RouteDecisionOut
 
+    route = message.routing_json or None
     return MessageOut(
         id=message.id,
+        knowledge_base_id=message.knowledge_base_id,
         conversation_id=message.conversation_id,
         role=message.role,
         content=message.content,
         status=message.status,
-        sources=[SourceRef(**s) for s in (message.sources_json or [])],
+        sources=[SourceRef(**source) for source in (message.sources_json or [])],
+        route=RouteDecisionOut(**route) if route else None,
         error_message=message.error_message,
         created_at=message.created_at,
     )
 
 
 def answer_sync(
-    db: Session, conversation_id: str, user_id: str, content: str
+    db: Session,
+    conversation_id: str,
+    user_id: str,
+    content: str,
+    retrieval_options=None,
 ) -> dict:
-    """同步问答：保存用户消息，生成完整答案并持久化助手消息。"""
-    conv = _ensure_conversation(db, conversation_id, user_id)
-
+    """Persist a synchronous answer produced by the compiled LangGraph."""
+    conversation = _ensure_conversation(db, conversation_id, user_id)
     content = (content or "").strip()
     if not content:
         raise bad_request("消息内容不能为空")
 
-    conv_repo = ConversationRepository(db)
-    msg_repo = MessageRepository(db)
-
-    user_message = Message(conversation_id=conv.id, role="user", content=content, status="completed")
-    msg_repo.add(user_message)
-    conv_repo.touch(conv)
-
-    history = _load_history(db, conv.id, user_id)
-    # history 此时包含刚保存的用户消息
-    try:
-        from app.services.rag_concurrency import rag_concurrency
-
-        with rag_concurrency():
-            prepared = prepare_context(content, history)
-            from app.services.rag_service import generate
-
-            answer = generate(content, prepared["context"], history)
-    except Exception as exc:  # noqa: BLE001
-        assistant = Message(
-            conversation_id=conv.id,
-            role="assistant",
-            content="",
-            status="failed",
-            error_message=str(exc)[:1000],
+    conversation_repo = ConversationRepository(db)
+    message_repo = MessageRepository(db)
+    user_message = message_repo.add(
+        Message(
+            conversation_id=conversation.id,
+            knowledge_base_id=conversation.knowledge_base_id,
+            role="user",
+            content=content,
+            status="completed",
         )
-        msg_repo.add(assistant)
-        conv_repo.touch(conv)
+    )
+    conversation_repo.touch(conversation)
+    history = _load_history(db, conversation.id, user_id)
+
+    try:
+        from app.services import rag_service
+
+        result = rag_service.ask(
+            content,
+            history,
+            _runtime_for_knowledge_base(conversation.knowledge_base_id),
+            conversation.knowledge_base_id,
+            retrieval_options,
+        )
+    except Exception as exc:  # noqa: BLE001
+        message_repo.add(
+            Message(
+                conversation_id=conversation.id,
+                knowledge_base_id=conversation.knowledge_base_id,
+                role="assistant",
+                content="",
+                status="failed",
+                error_message=str(exc)[:1000],
+            )
+        )
+        conversation_repo.touch(conversation)
         raise
 
-    assistant = Message(
-        conversation_id=conv.id,
-        role="assistant",
-        content=answer,
-        status="completed",
-        sources_json=prepared["sources"],
+    assistant_message = message_repo.add(
+        Message(
+            conversation_id=conversation.id,
+            knowledge_base_id=conversation.knowledge_base_id,
+            role="assistant",
+            content=result["answer"],
+            status="completed",
+            sources_json=result["sources"],
+            routing_json=result["route"],
+        )
     )
-    msg_repo.add(assistant)
-    conv_repo.touch(conv)
-
-    return {"user_message": user_message, "assistant_message": assistant}
+    conversation_repo.touch(conversation)
+    return {
+        "user_message": user_message,
+        "assistant_message": assistant_message,
+    }
 
 
 def answer_stream(
-    db: Session, conversation_id: str, user_id: str, content: str
+    db: Session,
+    conversation_id: str,
+    user_id: str,
+    content: str,
+    retrieval_options=None,
 ) -> Iterator[dict]:
-    """流式问答：产出 SSE 事件字典序列。
-
-    事件结构：
-      {"event": "message", "data": {"message_id": ...}}
-      {"event": "delta", "data": {"content": ...}}
-      {"event": "sources", "data": {"sources": [...]}}
-      {"event": "done", "data": {"message_id": ..., "status": "completed"}}
-      {"event": "error", "data": {"code": ..., "message": ...}}
-    """
-    conv = _ensure_conversation(db, conversation_id, user_id)
-
+    """Persist and expose message, route, delta, sources, done/error SSE events."""
+    conversation = _ensure_conversation(db, conversation_id, user_id)
     content = (content or "").strip()
     if not content:
         raise bad_request("消息内容不能为空")
 
-    conv_repo = ConversationRepository(db)
-    msg_repo = MessageRepository(db)
-
-    user_message = Message(conversation_id=conv.id, role="user", content=content, status="completed")
-    msg_repo.add(user_message)
-    conv_repo.touch(conv)
-
-    history = _load_history(db, conv.id, user_id)
-
-    assistant = Message(
-        conversation_id=conv.id,
-        role="assistant", content="", status="streaming"
+    conversation_repo = ConversationRepository(db)
+    message_repo = MessageRepository(db)
+    message_repo.add(
+        Message(
+            conversation_id=conversation.id,
+            knowledge_base_id=conversation.knowledge_base_id,
+            role="user",
+            content=content,
+            status="completed",
+        )
     )
-    msg_repo.add(assistant)
-
+    conversation_repo.touch(conversation)
+    history = _load_history(db, conversation.id, user_id)
+    assistant = message_repo.add(
+        Message(
+            conversation_id=conversation.id,
+            knowledge_base_id=conversation.knowledge_base_id,
+            role="assistant",
+            content="",
+            status="streaming",
+        )
+    )
     yield {"event": "message", "data": {"message_id": assistant.id}}
 
+    collected: list[str] = []
+    sources: list[dict] = []
+    route: dict = {}
     try:
-        from app.services.rag_concurrency import rag_concurrency
+        from app.services import rag_service
 
-        with rag_concurrency():
-            prepared = prepare_context(content, history)
-            sources = prepared["sources"]
+        events = rag_service.stream(
+            content,
+            history,
+            _runtime_for_knowledge_base(conversation.knowledge_base_id),
+            conversation.knowledge_base_id,
+            retrieval_options,
+        )
+        for event in events:
+            if event["event"] == "delta":
+                collected.append(event["data"]["content"])
+            elif event["event"] == "sources":
+                sources = event["data"]["sources"]
+            elif event["event"] == "route":
+                route = event["data"]["route"]
+            yield event
 
-            collected: list[str] = []
-            for chunk in stream_generate(content, prepared["context"], history):
-                collected.append(chunk)
-                yield {"event": "delta", "data": {"content": chunk}}
-
-        full = "".join(collected)
-        msg_repo.update(
+        message_repo.update(
             assistant,
-            content=full,
+            content="".join(collected),
             status="completed",
             sources_json=sources,
+            routing_json=route,
             error_message=None,
         )
-        conv_repo.touch(conv)
-
-        yield {"event": "sources", "data": {"sources": sources}}
+        conversation_repo.touch(conversation)
         yield {
             "event": "done",
             "data": {"message_id": assistant.id, "status": "completed"},
         }
     except Exception as exc:  # noqa: BLE001
-        msg_repo.update(
+        message_repo.update(
             assistant,
             status="failed",
+            routing_json=route,
             error_message=str(exc)[:1000],
         )
         yield {

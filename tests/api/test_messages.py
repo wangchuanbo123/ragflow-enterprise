@@ -36,6 +36,7 @@ def test_sync_message(client, monkeypatch):
     assert body["assistant_message"]["content"] == "完整答案。"
     assert body["assistant_message"]["status"] == "completed"
     assert body["assistant_message"]["sources"][0]["source"] == "primary.txt"
+    assert body["assistant_message"]["route"]["selected_channels"] == ["text"]
 
     # 刷新后历史仍存在
     detail = client.get(f"/api/v1/conversations/{cid}").json()
@@ -74,6 +75,7 @@ def test_stream_message_real_streaming(client, monkeypatch):
 
     event_names = [e["event"] for e in events]
     assert "message" in event_names
+    assert "route" in event_names
     assert "delta" in event_names
     assert "sources" in event_names
     assert "done" in event_names
@@ -90,6 +92,7 @@ def test_stream_message_real_streaming(client, monkeypatch):
     assistant = [m for m in detail["messages"] if m["role"] == "assistant"][0]
     assert assistant["content"] == "ABC"
     assert assistant["status"] == "completed"
+    assert assistant["route"]["selected_channels"] == ["text"]
 
 
 def test_stream_marks_failed_on_error(client, monkeypatch):

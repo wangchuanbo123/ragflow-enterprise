@@ -3,19 +3,34 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, String, Text, UniqueConstraint, func
+from sqlalchemy import DateTime, Float, ForeignKey, Index, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.types import JSON
 
 from app.core.database import Base
+from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 
 
 class KgEntity(Base):
     __tablename__ = "kg_entities"
     __table_args__ = (
-        UniqueConstraint("entity_type", "normalized_name", name="uq_kg_entity_type_norm"),
+        UniqueConstraint(
+            "knowledge_base_id",
+            "entity_type",
+            "normalized_name",
+            name="uq_kg_entity_type_norm",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    knowledge_base_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        default=DEFAULT_KNOWLEDGE_BASE_ID,
+        server_default=DEFAULT_KNOWLEDGE_BASE_ID,
+        index=True,
+        nullable=False,
+    )
     entity_type: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
     canonical_name: Mapped[str] = mapped_column(String(255), nullable=False)
     normalized_name: Mapped[str] = mapped_column(String(255), index=True, nullable=False)
@@ -29,10 +44,23 @@ class KgEntity(Base):
 class KgAlias(Base):
     __tablename__ = "kg_aliases"
     __table_args__ = (
-        UniqueConstraint("entity_id", "normalized_alias", name="uq_kg_alias_entity_norm"),
+        UniqueConstraint(
+            "knowledge_base_id",
+            "entity_id",
+            "normalized_alias",
+            name="uq_kg_alias_entity_norm",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    knowledge_base_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        default=DEFAULT_KNOWLEDGE_BASE_ID,
+        server_default=DEFAULT_KNOWLEDGE_BASE_ID,
+        index=True,
+        nullable=False,
+    )
     entity_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("kg_entities.id", ondelete="CASCADE"), index=True, nullable=False
     )
@@ -43,10 +71,23 @@ class KgAlias(Base):
 class KgEntityMention(Base):
     __tablename__ = "kg_entity_mentions"
     __table_args__ = (
-        UniqueConstraint("entity_id", "chunk_id", name="uq_kg_mention_entity_chunk"),
+        UniqueConstraint(
+            "knowledge_base_id",
+            "entity_id",
+            "chunk_id",
+            name="uq_kg_mention_entity_chunk",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    knowledge_base_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        default=DEFAULT_KNOWLEDGE_BASE_ID,
+        server_default=DEFAULT_KNOWLEDGE_BASE_ID,
+        index=True,
+        nullable=False,
+    )
     entity_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("kg_entities.id", ondelete="CASCADE"), index=True, nullable=False
     )
@@ -63,10 +104,24 @@ class KgEntityMention(Base):
 class KgRelation(Base):
     __tablename__ = "kg_relations"
     __table_args__ = (
-        UniqueConstraint("subject_entity_id", "predicate", "object_entity_id", name="uq_kg_relation_triple"),
+        UniqueConstraint(
+            "knowledge_base_id",
+            "subject_entity_id",
+            "predicate",
+            "object_entity_id",
+            name="uq_kg_relation_triple",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    knowledge_base_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        default=DEFAULT_KNOWLEDGE_BASE_ID,
+        server_default=DEFAULT_KNOWLEDGE_BASE_ID,
+        index=True,
+        nullable=False,
+    )
     subject_entity_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("kg_entities.id"), index=True, nullable=False
     )
@@ -85,10 +140,24 @@ class KgRelation(Base):
 class KgRelationEvidence(Base):
     __tablename__ = "kg_relation_evidence"
     __table_args__ = (
-        UniqueConstraint("relation_id", "chunk_id", "quote_hash", name="uq_kg_evidence_rel_chunk_quote"),
+        UniqueConstraint(
+            "knowledge_base_id",
+            "relation_id",
+            "chunk_id",
+            "quote_hash",
+            name="uq_kg_evidence_rel_chunk_quote",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    knowledge_base_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        default=DEFAULT_KNOWLEDGE_BASE_ID,
+        server_default=DEFAULT_KNOWLEDGE_BASE_ID,
+        index=True,
+        nullable=False,
+    )
     relation_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("kg_relations.id", ondelete="CASCADE"), index=True, nullable=False
     )
@@ -101,3 +170,45 @@ class KgRelationEvidence(Base):
     quote: Mapped[str] = mapped_column(Text, nullable=False)
     quote_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+
+
+class KgGraphCorrection(Base):
+    """Auditable overlay that never mutates the machine-generated base graph."""
+
+    __tablename__ = "kg_graph_corrections"
+    __table_args__ = (
+        Index("ix_kg_graph_corrections_kb_status", "knowledge_base_id", "status"),
+        Index("ix_kg_graph_corrections_target", "target_type", "target_id"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    knowledge_base_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+    target_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    target_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    payload_json: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    reason: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    conflict_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    reverted_by: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        server_default=func.now(),
+    )
+    reverted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    checked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

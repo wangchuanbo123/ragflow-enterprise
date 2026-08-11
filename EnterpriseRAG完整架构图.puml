@@ -1,5 +1,5 @@
 @startuml EnterpriseRAG_Complete_Architecture
-title Enterprise RAG 当前完整架构（基于实际代码）
+title Enterprise RAG 当前完整架构（2026-08-11，基于实际代码）
 
 top to bottom direction
 skinparam backgroundColor #FFFFFF
@@ -21,341 +21,361 @@ skinparam noteBackgroundColor #FFFBEB
 
 legend right
   |= 颜色 |= 含义 |
-  |<#E8F0FE>| 用户入口 / API |
-  |<#E8F5E9>| 应用服务 / RAG 核心 |
-  |<#FFF3E0>| 数据与外部依赖 |
-  |<#FDECEC>| 当前缺失或未完整落地 |
+  |<#E8F0FE>| 用户入口与 API |
+  |<#E8F5E9>| 应用服务与 RAG 核心 |
+  |<#F3E8FF>| Provider 抽象与任务执行 |
+  |<#FFF3E0>| 存储、模型与外部系统 |
+  |<#FDECEC>| 尚待企业实机验收或可选 Adapter |
 endlegend
 
-actor "普通用户" as EndUser
-actor "管理员" as Admin
-actor "运维 / 开发人员" as Operator
-actor "第三方 API 客户端" as ApiClient
+actor "知识库用户" as User
+actor "知识库管理员\nowner / editor" as KBAdmin
+actor "平台管理员" as PlatformAdmin
+actor "运维 / 开发" as Operator
+actor "API 客户端" as ApiClient
 
-package "表现层  web/（Vue 3 + TypeScript + Vite）" as WEB #E8F0FE {
-  component "App.vue\n启动、恢复登录态\n登录页 / 聊天页切换" as WebApp
-  component "LoginView\n用户名密码登录" as LoginView
-  component "ChatView\n聊天主布局、用户信息、退出" as ChatView
-  component "ConversationSidebar\n新建 / 选择 / 重命名 / 删除会话" as Sidebar
-  component "MessageList\n历史消息、流式文本、引用来源、输入框" as MessageList
-  component "useAuth\n共享用户状态、登录 / 退出 / 恢复" as UseAuth
-  component "useConversations\n会话列表、消息状态、SSE 增量拼接" as UseConv
-  component "api/client.ts\nFetch + HttpOnly Cookie\nPOST SSE 流手工解析" as WebClient
+package "Web 工作台  web/src（Vue 3 + TypeScript + Vite）" as WEB #E8F0FE {
+  component "LoginView\n登录与 Cookie 会话" as WebLogin
+  component "WorkspaceView\n知识库切换与九个工作区" as Workspace
+  component "ChatView\n同步 / SSE 问答\n路由结果与来源展示" as WebChat
+  component "DocumentsView\n批量上传/删除/重建、Chunk\n标签统计、版本、文档子图" as WebDocs
+  component "SourcesView\n成员、本地/Git/S3 数据源\n周期、删除策略、代码索引" as WebSources
+  component "JobsView\n任务进度、事件\n取消与失败项重试" as WebJobs
+  component "GraphView\n实体搜索、按需展开\nEvidence 与人工校正" as WebGraph
+  component "GraphManagementView\nSchema、质量、复核、合并/拆分\n实体向量与社区层级" as WebGraphAdmin
+  component "CodeGraphView\n快照、符号、源码行号\n调用图与依赖图" as WebCode
+  component "RetrievalDebugView\n路由理由、通道状态\n上下文预览" as WebDebug
+  component "ReadinessView\nProvider、模型、索引和 Worker 状态" as WebReady
+  component "api/client.ts\nFetch + HttpOnly Cookie\nJSON 与 SSE 事件解析" as WebClient
 
-  WebApp --> LoginView
-  WebApp --> ChatView
-  LoginView --> UseAuth
-  ChatView --> UseAuth
-  ChatView --> Sidebar
-  ChatView --> MessageList
-  Sidebar --> UseConv
-  MessageList --> UseConv
-  UseAuth --> WebClient
-  UseConv --> WebClient
+  WebLogin --> WebClient
+  Workspace --> WebChat
+  Workspace --> WebDocs
+  Workspace --> WebSources
+  Workspace --> WebJobs
+  Workspace --> WebGraph
+  Workspace --> WebGraphAdmin
+  Workspace --> WebCode
+  Workspace --> WebDebug
+  Workspace --> WebReady
+  WebChat --> WebClient
+  WebDocs --> WebClient
+  WebSources --> WebClient
+  WebJobs --> WebClient
+  WebGraph --> WebClient
+  WebGraphAdmin --> WebClient
+  WebCode --> WebClient
+  WebDebug --> WebClient
+  WebReady --> WebClient
 }
 
-package "接入层  app/main.py + app/api/" as API #E8F0FE {
-  component "FastAPI 应用入口\nLifespan 启停\n静态托管 web/dist" as FastAPIApp
-  component "横切中间件\nX-Request-ID\nCORS（携带 Cookie）\n统一异常响应" as Middleware
+package "接入与安全层  app/main.py + app/api" as API #E8F0FE {
+  component "FastAPI Lifespan\nProvider 校验、Alembic、初始管理员\n默认知识库、Worker/Scheduler 启停" as FastAPIApp
+  component "横切能力\nJWT HttpOnly Cookie、CORS\nX-Request-ID、统一异常" as CrossCut
 
-  package "HTTP 路由" as ROUTES {
-    component "兼容问答\nPOST /ask\n登录后同步调用 LangGraph" as AskAPI
-    component "认证\nPOST /api/v1/auth/login\nPOST /logout\nGET /me" as AuthAPI
-    component "会话 CRUD\nPOST / GET / PATCH / DELETE\n/api/v1/conversations" as ConvAPI
-    component "消息问答\nPOST .../messages（同步）\nPOST .../messages/stream（SSE）" as MessageAPI
-    component "文档管理\nGET 列表 / 详情\nPOST 上传\nDELETE 删除\nPOST reindex" as DocAPI
-    component "索引任务\nPOST /index-jobs/sync\nGET 任务列表 / 详情" as JobAPI
-    component "知识图谱查询\n统计 / 实体搜索 / 实体详情\n1~2 跳邻居" as KgAPI
-    component "运行探针\nGET /health\nGET /ready" as HealthAPI
+  package "API 资源" as ROUTES {
+    component "认证与会话\n/auth · /conversations\n/messages · messages/stream" as AuthRoutes
+    component "知识库与成员\n/knowledge-bases\nowner/editor/viewer 权限" as KBRoutes
+    component "文档管理\ndocuments · batch-upload · chunks\nversions · folders · tags · batch" as DocumentRoutes
+    component "数据源与任务\nsources/check/sync\nindex-jobs/events/cancel/retry" as JobRoutes
+    component "统一问答\n/ask · {kb}/ask\nretrieval/debug" as AskRoutes
+    component "知识图谱查询与治理\n实体/文档子图、校正、Schema\n质量、复核、合并、社区、向量" as GraphRoutes
+    component "代码图谱\nstats · snapshots · index\nsymbols · subgraph" as CodeRoutes
+    component "运行探针\n/health · /ready" as HealthRoutes
   }
 
-  FastAPIApp --> Middleware
-  Middleware --> AskAPI
-  Middleware --> AuthAPI
-  Middleware --> ConvAPI
-  Middleware --> MessageAPI
-  Middleware --> DocAPI
-  Middleware --> JobAPI
-  Middleware --> KgAPI
-  Middleware --> HealthAPI
+  FastAPIApp --> CrossCut
+  CrossCut --> AuthRoutes
+  CrossCut --> KBRoutes
+  CrossCut --> DocumentRoutes
+  CrossCut --> JobRoutes
+  CrossCut --> AskRoutes
+  CrossCut --> GraphRoutes
+  CrossCut --> CodeRoutes
+  CrossCut --> HealthRoutes
 }
 
-package "应用服务层  app/services/" as SERVICES #E8F5E9 {
-  component "AuthService\n校验 bcrypt 密码\n签发 / 清除 JWT Cookie" as AuthService
-  component "ChatService\n校验会话归属\n保存用户/助手消息\n同步回答与 SSE 事件" as ChatService
-  component "RAGService\nprepare_context()\ngenerate() / stream_generate()\nask_question()" as RAGService
-  component "RAGConcurrency\n进程内 BoundedSemaphore\n排队超时 -> 429" as RAGConcurrency
-  component "DocumentIndexService\n上传校验、内容去重\n创建 sync/file/delete 任务" as DocumentService
-  component "IndexWorker\n单进程后台线程\n领取并执行持久化任务\n启动恢复 stale running 任务" as IndexWorker
-  component "GraphBuildService\n批量图谱抽取\n断点状态、失败重试\nSchema 变更后重抽取" as GraphBuildService
-  component "ReadinessService\n检查 SQLite、Chroma ID 集\nOllama 模型、Worker 线程\n结果短时缓存" as ReadinessService
+package "应用服务层  app/services" as SERVICES #E8F5E9 {
+  component "AuthService / ChatService\n认证、会话归属、消息持久化\n同步回答与 SSE 事件" as ChatServices
+  component "RAGService + RAGConcurrency\n统一 compiled LangGraph\n并发许可、Runtime/Graph 缓存" as RAGService
+  component "DocumentIndexService\n上传校验、版本、任务与条目\n批量、增量、影子重建" as DocumentService
+  component "DataSourceService\n本地/Git/S3 收集与游标\n删除/重命名策略、凭据引用" as SourceService
+  component "ConnectorScheduler\nlocal 定时器 / Celery Beat\n提交到期 connector_sync" as ConnectorScheduler
+  component "IndexWorker\n任务领取、租约心跳、取消/重试\n统一执行全部离线 Job" as IndexWorker
+  component "GraphBuildService\n中断状态恢复、并行抽取\n缓存、校验、顺序持久化" as GraphBuild
+  component "GraphGovernanceService\nSchema Registry、质量门禁、复核\n合并/拆分、社区层级" as GraphGovernance
+  component "EntityVectorService\n实体描述向量影子索引\n语义检索与合并候选过滤" as EntityVector
+  component "CodeIndexService\n并行解析、关系解析\n版本化快照与原子激活" as CodeIndex
+  component "ReadinessService\n基础设施、模型 Profile\n活动索引与本地 Worker" as Readiness
 }
 
-package "数据访问层  app/repositories/" as REPOS #E8F5E9 {
-  component "UserRepository\n按 ID / 用户名读取、创建" as UserRepo
-  component "ConversationRepository\n按 user_id 隔离会话\nMessageRepository 持久化消息" as ConvRepo
-  component "KnowledgeRepository\n文档、Chunk、活动索引指针\n跨进程 index signature" as KnowledgeRepo
-  component "IndexJobRepository\n任务/条目、原子领取\n进度更新、遗留任务恢复" as JobRepo
-  component "KnowledgeGraphRepository\n实体、别名、关系、证据查询" as KGRepo
+package "统一在线 RAG  rag/graph + rag/nodes" as ONLINE #E8F5E9 {
+  component "RAGRuntime（每知识库缓存）\nanswer/rewrite/router 模型\n文本/图/代码 Retriever + Reranker" as Runtime
+  component "rewrite\n原问题 + 历史 → 多检索问题\n失败回退原问题" as Rewrite
+  component "route_request\n显式选择 → 规则 → 可选 LLM\n解析文档/标签/目录/metadata 范围" as Route
+  component "text_retrieve\nChroma Vector + 中文 BM25\n多查询 Weighted RRF" as TextRetrieve
+  component "graph_retrieve\n词法 + 实体向量种子\n1~2 跳关系与 Evidence 回链" as GraphRetrieve
+  component "code_retrieve\n活动快照符号搜索\n源码片段、调用/依赖事实" as CodeRetrieve
+  component "fuse\n条件通道 Fan-in\n加权 RRF、chunk_id 去重\n记录通道状态与耗时" as Fuse
+  component "rerank\n原问题 BGE / HTTP / Passthrough\n失败保留融合排序" as Rerank
+  component "build_context\n内容去重、来源配额\nToken 预算、稳定引用" as Context
+  component "generate\n回答模型同步生成\nSSE 在相同上下文后流式生成" as Generate
+
+  Runtime --> Rewrite
+  Rewrite --> Route
+  Route --> TextRetrieve
+  Route --> GraphRetrieve
+  Route --> CodeRetrieve
+  TextRetrieve --> Fuse
+  GraphRetrieve --> Fuse
+  CodeRetrieve --> Fuse
+  Fuse --> Rerank
+  Rerank --> Context
+  Context --> Generate : 同步
 }
 
-package "在线 RAG 运行时  rag/" as ONLINE #E8F5E9 {
-  component "RAGRuntime（懒加载 + 缓存）\nLLM + Retriever + Reranker\n检测 index signature 后刷新" as Runtime
+package "离线处理核心  rag/indexing + rag/knowledge_graph + rag/code_graph" as OFFLINE #E8F5E9 {
+  component "DocumentLoader\nTXT / PDF / Markdown / DOCX / HTML" as Loader
+  component "Chunker\n递归/语义切片、重叠、短尾合并\n确定性 chunk_id 与 token_count" as Chunker
+  component "IndexManager\n内容 Hash 分类、批量 Embedding\n增量索引、影子 Collection、回滚" as IndexManager
+  component "GraphExtractor\n活动 Schema Prompt\n并行 LLM JSON 抽取与重试" as Extractor
+  component "图谱质量管道\n实体标准化、关系字典、Evidence\n置信度、去重、去幻觉门禁" as GraphQualityPipeline
+  component "CodeParser\nPython AST；非 Python Tree-sitter 检查\n规则 emitter 提取事实；临时 AST 不落库" as CodeParser
+  component "Symbol Resolver\nfile/class/function/method\ncontains/imports/calls/extends" as SymbolResolver
 
-  package "两种编排入口" as ORCHESTRATION {
-    component "Compiled LangGraph\n仅 /ask 调用 invoke()" as CompiledGraph
-    component "Service 手工编排\nWeb 同步 + SSE 调用\n共享相同节点函数" as ManualFlow
-  }
-
-  package "RAG 节点流水线" as NODES {
-    component "1. rewrite\n原问题 + 最近历史\n生成改写问题\n失败退化为原问题" as RewriteNode
-    component "2. retrieve\n原问题 + 改写问题\n多查询候选召回" as RetrieveNode
-    component "3. rerank\n始终使用原问题\nBGE 失败则按融合分降级" as RerankNode
-    component "4. build_context\nChunk/内容去重\n每来源配额 + Token 预算\n稳定引用编号" as ContextNode
-    component "5. generate\n原问题 + 历史 + 上下文\n同步或真实流式生成" as GenerateNode
-
-    RewriteNode --> RetrieveNode
-    RetrieveNode --> RerankNode
-    RerankNode --> ContextNode
-    ContextNode --> GenerateNode
-  }
-
-  package "三路混合检索" as RETRIEVAL {
-    component "Vector Channel\nChroma 相似度检索\nOllama Query Embedding" as VectorChannel
-    component "BM25 Channel\nSQLite Chunk 构建内存索引\njieba 中文分词" as BM25Channel
-    component "Graph Channel\n实体名/别名匹配\n1~2 跳 BFS\n关系 evidence 回链 Chunk" as GraphChannel
-    component "Weighted RRF\n按 chunk_id 去重\n合并命中通道、graph_facts\n截取候选集" as RRF
-
-    VectorChannel --> RRF
-    BM25Channel --> RRF
-    GraphChannel --> RRF
-  }
-
-  component "ContextExporter（可选）\n导出最终 LLM 上下文、来源\n与 graph_facts 到 JSON" as ContextExporter
-
-  CompiledGraph --> RewriteNode
-  ManualFlow --> RewriteNode
-  RetrieveNode --> VectorChannel
-  RetrieveNode --> BM25Channel
-  RetrieveNode --> GraphChannel
-  RRF --> RerankNode
-  ContextNode ..> ContextExporter
-  Runtime --> CompiledGraph
-  Runtime --> ManualFlow
-}
-
-package "离线文档索引  rag/indexing + rag/loaders" as INDEXING #E8F5E9 {
-  component "IndexManager.classify_files\nadded / modified / deleted / unchanged\n校验内容 Hash、Schema、Embedding" as Classifier
-  component "DocumentLoader\nTXT / PDF / Markdown / DOCX / HTML\n过滤空内容" as Loader
-  component "Chunker\n递归切片（默认）/ 语义切片（可选）\n重叠、短尾合并、批内去重\n确定性 chunk_id + token_count" as Chunker
-  component "Embedding 批处理\n按 INGEST_BATCH_SIZE\n失败清理本批新向量" as BatchEmbedding
-  component "增量索引\n先写新向量和 SQLite\n再清理旧向量\n失败保留旧可用索引" as IncrementalIndex
-  component "全量影子重建\n新 documents_build_* Collection\n校验向量数量和完整 ID 集\nSQLite 事务切换活动指针" as ShadowRebuild
-  component "Collection 管理\n列表、兼容性回滚\n清理非活动 Collection" as CollectionMgmt
-  component "缓存失效\nRuntime / CompiledGraph / BM25\nReadiness Cache" as CacheInvalidation
-
-  Classifier --> Loader
   Loader --> Chunker
-  Chunker --> BatchEmbedding
-  BatchEmbedding --> IncrementalIndex
-  BatchEmbedding --> ShadowRebuild
-  IncrementalIndex --> CacheInvalidation
-  ShadowRebuild --> CacheInvalidation
-  CollectionMgmt --> CacheInvalidation
+  Chunker --> IndexManager
+  Extractor --> GraphQualityPipeline
+  CodeParser --> SymbolResolver
 }
 
-package "知识图谱构建  rag/knowledge_graph" as KGCORE #E8F5E9 {
-  component "GraphExtractor\n多个 Chunk 合并一次 LLM 请求\nJSON 清洗与修复重试" as GraphExtractor
-  component "Schema Validator\n实体类型/关系谓词白名单\nlocal_id、自环、原文 evidence 校验\n低置信度关系过滤" as GraphValidator
-  component "Normalizer\nUnicode NFKC\n名称 / 别名归一化" as Normalizer
-  component "SqliteGraphStore\n实体/别名/提及/关系/evidence Upsert\n按 Chunk 替换、孤儿清理" as GraphStore
-  component "KnowledgeGraphRetriever\n实体匹配 -> 图遍历 -> evidence\n映射原始 knowledge_chunks" as GraphRetriever
-
-  GraphExtractor --> GraphValidator
-  GraphValidator --> Normalizer
-  Normalizer --> GraphStore
-  GraphStore --> GraphRetriever
+package "Repository 与隔离边界  app/repositories + ORM" as REPOS #E8F5E9 {
+  component "KnowledgeBaseRepository\n知识库、成员和数据源" as KBRepo
+  component "KnowledgeRepository\n文档、Chunk、活动索引指针\n跨进程 index signature" as KnowledgeRepo
+  component "DocumentManagementRepository\n目录、标签、版本" as DocMgmtRepo
+  component "IndexJobRepository\n任务/条目/事件、原子领取\n租约、心跳和恢复" as JobRepo
+  component "KnowledgeGraphRepository\n实体、别名、关系、Evidence\n校正与治理记录" as KGRepo
+  component "CodeGraphRepository\n快照、文件、符号和关系" as CodeRepo
+  component "Conversation/User Repository\n用户、会话和消息" as UserRepo
 }
 
-package "Provider 抽象层  rag/providers" as PROVIDERS #E8F5E9 {
-  component "Provider Factory\n按 .env 选择实现\n实例级 LRU 缓存" as ProviderFactory
-  component "LLMProvider\ngenerate / stream\nZhipu/OpenAI 兼容 API\n或 Ollama 回退" as LLMProvider
-  component "EmbeddingProvider\nOllama /api/embed\nquery: / passage: 指令" as EmbeddingProvider
-  component "Reranker\nBAAI/bge-reranker-base\n或 Passthrough" as RerankerProvider
-  component "VectorStoreProvider\nLangChain Chroma Adapter" as VectorProvider
-  component "GraphStoreProvider\n当前仅 SQLite" as GraphStoreProvider
+package "Provider 抽象层" as PROVIDERS #F3E8FF {
+  component "Model Profiles\nanswer · rewrite · router · extraction\n按用途独立身份与能力校验" as ModelProfiles
+  component "LLMProvider\nOllama / Zhipu / OpenAI-compatible" as LLMProvider
+  component "EmbeddingProvider\nOllama / OpenAI-compatible" as EmbeddingProvider
+  component "Reranker\nBGE / HTTP / Passthrough" as RerankerProvider
+  component "VectorStoreProvider\nChroma Embedded / Chroma HTTP\n按知识库 + 索引版本寻址" as VectorProvider
+  component "GraphStoreProvider\nSQLAlchemy 逻辑图 Store\nlocal SQLite / enterprise PostgreSQL" as GraphProvider
+  component "MetadataSessionProvider\nSQLAlchemy Session" as MetadataProvider
+  component "ObjectStoreProvider\nLocal / S3-compatible MinIO" as ObjectProvider
+  component "TaskQueueProvider\nInline / Celery" as QueueProvider
+  component "CacheProvider\nMemory / Redis Cache\n失效消息 publish" as CacheProvider
 
-  ProviderFactory --> LLMProvider
-  ProviderFactory --> EmbeddingProvider
-  ProviderFactory --> RerankerProvider
-  ProviderFactory --> VectorProvider
-  ProviderFactory --> GraphStoreProvider
+  ModelProfiles --> LLMProvider
+  ModelProfiles --> EmbeddingProvider
+  ModelProfiles --> RerankerProvider
 }
 
-package "配置、安全与运维" as CROSS #E8F5E9 {
-  component "app/core/config.py\n.env 配置、路径与参数校验\n缺失 JWT/初始密码时本地生成" as Config
-  component "app/core/security.py\nbcrypt + HS256 JWT\nHttpOnly / SameSite Cookie" as Security
-  component "Alembic Migrations\n应用启动自动升级数据库" as Alembic
-  component "Logging + Request ID\n标准输出日志" as Logging
-  component "CLI scripts/ingest_documents.py\ndry-run / sync / rebuild\ngraph-only / retry-failed\ncollection 管理" as IngestCLI
-  component "评估 scripts/evaluate_rag.py\nretrieval / full / compare\nRecall、MRR、nDCG、答案关键词、耗时" as EvalCLI
+package "持久化任务与执行" as TASKS #F3E8FF {
+  component "index_jobs / items / events\n任务事实源与审计进度" as PersistedJobs
+  queue "Inline 唤醒\nlocal" as InlineQueue
+  queue "Celery rag.index\nenterprise" as CeleryQueue
+  component "Celery Worker\nacks_late、prefetch=1\n可横向增加副本" as CeleryWorker
+  component "Celery Beat\n租约 Reconcile\n到期连接器调度" as CeleryBeat
 }
 
-package "持久化数据" as DATA #FFF3E0 {
-  folder "data/docs/\n原始知识文档" as DocsDir
-  database "SQLite  data/app.db\n\n业务：users / conversations / messages\n索引：knowledge_documents / knowledge_chunks\n状态：knowledge_index_state\n任务：index_jobs / index_job_items\n图谱：kg_entities / kg_aliases\nkg_entity_mentions / kg_relations\nkg_relation_evidence" as SQLite
-  database "Chroma  data/vector_db/\n活动 documents_build_* Collection\n非活动备份 Collection\nChunk 向量 + metadata" as Chroma
-  folder "data/debug/contexts/\n可选调试快照（默认关闭）" as DebugContexts
-  folder "eval/\n30 题 tuning / holdout\n基线与评估结果" as EvalData
+package "数据与基础设施" as DATA #FFF3E0 {
+  database "SQLAlchemy Metadata + Logical Graph\n\n用户/会话/消息\n知识库/成员/数据源\n文档/Chunk/版本/目录/标签\n任务/条目/事件/索引状态\n实体/关系/Evidence/校正\nSchema/缓存/质量/复核/合并/社区\n代码快照/文件/符号/关系" as SQLData
+  database "Chroma Vector Store\n\n每知识库文档向量 Collection\n每知识库实体向量 Collection\n活动/影子索引状态由 SQL 保存" as Chroma
+  folder "Object Store\n原始文档与代码源副本" as Objects
+  component "BM25 内存索引\n由当前知识库活动 Chunk 构建" as BM25
 }
 
-cloud "外部 / 本地模型依赖" as EXTERNAL #FFF3E0 {
-  component "智谱 / OpenAI 兼容 API\n默认模型 glm-5.2\n问答、改写、图谱抽取" as CloudLLM
-  component "Ollama 服务\nqwen3:4b（LLM 回退）\nnomic-embed-text-v2-moe（Embedding）" as Ollama
-  component "本地 Hugging Face 缓存\nBAAI/bge-reranker-base" as HFModel
+package "Profile 具体映射" as PROFILES #FFF3E0 {
+  component "local\nSQLite · Embedded Chroma\ndata/docs · Inline Worker\nMemory Cache · 本地 Scheduler" as LocalProfile
+  component "enterprise\nPostgreSQL · Chroma HTTP\nMinIO · Celery/Redis\nRedis Cache · Celery Beat" as EnterpriseProfile
 }
 
-package "当前缺失 / 未完整产品化" as MISSING #FDECEC {
-  component "用户与企业权限\n无注册、用户 CRUD、改密/重置\n无 SSO/LDAP/OIDC/MFA\n无租户、知识库/文档级 ACL" as MissingIAM #FDECEC
-  component "知识库管理后台\n前端无文档、索引任务、健康状态\n知识图谱管理与可视化页面\n无多知识库/工作区" as MissingAdmin #FDECEC
-  component "RAG 高级能力\n无文档/metadata 权限过滤\n无独立 text_context + graph_subgraph\n无实体向量、Agent/工具调用、模型路由" as MissingRAG #FDECEC
-  component "交互完整性\n无停止生成、服务端取消、消息编辑\n重新生成/真正重试、Markdown 渲染\n历史会话接口不返回引用详情" as MissingUX #FDECEC
-  component "生产工程\n无分布式任务队列与横向扩展方案\n无 Metrics/Tracing/Audit、阶段耗时落盘\n无容器/K8s/CI 配置、备份恢复流程" as MissingOps #FDECEC
-  component "验收缺口\nholdout final 尚未生成\n缺少前端/E2E/性能/安全测试\n本机图谱表当前为空" as MissingAcceptance #FDECEC
+cloud "模型端点" as MODELS #FFF3E0 {
+  component "Ollama\n本地 LLM / Embedding" as Ollama
+  component "OpenAI-compatible Gateway\n回答、改写、路由、抽取、Embedding" as ModelGateway
+  component "本地 BGE / HTTP Reranker" as ExternalReranker
 }
 
-' ======================== 入口调用 ========================
-EndUser --> WebApp : 浏览器使用
-Admin --> WebApp : 聊天入口
-Admin --> DocAPI : 管理员 API
-ApiClient --> AskAPI
-ApiClient --> MessageAPI
-Operator --> IngestCLI
-Operator --> EvalCLI
-WebClient --> AuthAPI : 登录态
-WebClient --> ConvAPI
-WebClient --> MessageAPI : POST + SSE
+cloud "知识数据来源" as CONNECTORS #FFF3E0 {
+  component "浏览器批量上传" as UploadSource
+  folder "允许根目录内的本地目录" as LocalSource
+  component "Git Repository\nHTTPS / SSH、分支和 revision" as GitSource
+  component "S3 / MinIO Prefix\n分页 Object 列表" as S3Source
+  component "env:// / file:// Secret\n数据库只保存引用" as SecretSource
+}
 
-' ======================== API 到服务 ========================
-AuthAPI --> AuthService
-ConvAPI --> ConvRepo
-MessageAPI --> ChatService
-AskAPI --> RAGService
-DocAPI --> DocumentService
-JobAPI --> DocumentService
-KgAPI --> KGRepo
-KgAPI --> GraphStore
-HealthAPI --> ReadinessService
+package "尚待实机验收 / 可选扩展" as PENDING #FDECEC {
+  component "企业空环境启动、真实 Provider 联调\n多 Worker、性能、故障与备份恢复" as PendingAcceptance
+  component "真实 Git/S3 凭据、全量实体向量\n3880 Chunk 图谱重抽取、浏览器 E2E" as PendingData
+  component "未实现 Adapter\nNeo4j、pgvector、其他厂商存储" as PendingAdapters
+  component "生产运维增强\nMetrics、Tracing、集中告警、容量规划" as PendingOps
+}
 
-' ======================== 应用服务协作 ========================
-AuthService --> UserRepo
-AuthService --> Security
-ChatService --> ConvRepo
-ChatService --> RAGConcurrency
-RAGConcurrency --> RAGService
+' 用户入口
+User --> WebLogin
+User --> Workspace
+KBAdmin --> Workspace
+PlatformAdmin --> Workspace
+ApiClient --> FastAPIApp
+Operator --> FastAPIApp : 健康 / 运维 API
+WebClient --> FastAPIApp : JSON / SSE
+
+' API 到服务
+AuthRoutes --> ChatServices
+KBRoutes --> KBRepo
+DocumentRoutes --> DocumentService
+DocumentRoutes --> DocMgmtRepo
+JobRoutes --> SourceService
+JobRoutes --> JobRepo
+AskRoutes --> RAGService
+GraphRoutes --> GraphGovernance
+GraphRoutes --> EntityVector
+CodeRoutes --> CodeIndex
+HealthRoutes --> Readiness
+
+' 应用服务协作
+ChatServices --> UserRepo
+ChatServices --> RAGService
 RAGService --> Runtime
-RAGService --> ManualFlow : Web 同步 / SSE
-RAGService --> CompiledGraph : /ask
+DocumentService --> ObjectProvider
 DocumentService --> JobRepo
-DocumentService --> KnowledgeRepo
-DocumentService --> DocsDir
+SourceService --> DocumentService
+SourceService --> CodeIndex
+SourceService --> SecretSource
+ConnectorScheduler --> SourceService
 IndexWorker --> JobRepo
-IndexWorker --> Classifier
-IndexWorker --> IncrementalIndex
-IndexWorker --> ShadowRebuild
-GraphBuildService --> GraphExtractor
-GraphBuildService --> GraphStore
-ReadinessService --> SQLite
-ReadinessService --> Chroma
-ReadinessService --> Ollama
-ReadinessService --> IndexWorker
+IndexWorker --> IndexManager
+IndexWorker --> SourceService
+IndexWorker --> GraphBuild
+IndexWorker --> EntityVector
+IndexWorker --> CodeIndex
+GraphBuild --> Extractor
+GraphBuild --> GraphQualityPipeline
+GraphBuild --> GraphProvider
+GraphGovernance --> KGRepo
+EntityVector --> VectorProvider
+CodeIndex --> CodeParser
+CodeIndex --> SymbolResolver
+CodeIndex --> CodeRepo
+CodeIndex --> ObjectProvider
+Readiness --> MetadataProvider
+Readiness --> VectorProvider
+Readiness --> ObjectProvider
+Readiness --> QueueProvider
+Readiness --> CacheProvider
+Readiness --> ModelProfiles
 
-' ======================== Repository 到数据库 ========================
-UserRepo --> SQLite
-ConvRepo --> SQLite
-KnowledgeRepo --> SQLite
-JobRepo --> SQLite
-KGRepo --> SQLite
+' 在线检索与模型
+Rewrite --> LLMProvider
+Route --> LLMProvider : 可选 router
+TextRetrieve --> VectorProvider
+TextRetrieve --> EmbeddingProvider
+TextRetrieve --> BM25
+GraphRetrieve --> GraphProvider
+GraphRetrieve --> VectorProvider : 实体向量
+CodeRetrieve --> CodeRepo
+Rerank --> RerankerProvider
+Generate --> LLMProvider
 
-' ======================== 在线检索与 Provider ========================
-RewriteNode --> LLMProvider
-GenerateNode --> LLMProvider
-VectorChannel --> VectorProvider
-VectorChannel --> EmbeddingProvider
-BM25Channel --> SQLite
-GraphChannel --> GraphRetriever
-GraphRetriever --> SQLite
-RerankNode --> RerankerProvider
-ContextExporter --> DebugContexts
-
-' ======================== 离线索引与图谱 ========================
-IngestCLI --> Classifier
-IngestCLI --> CollectionMgmt
-IngestCLI --> GraphBuildService
-Classifier --> DocsDir
-BatchEmbedding --> EmbeddingProvider
-IncrementalIndex --> SQLite
-IncrementalIndex --> Chroma
-ShadowRebuild --> SQLite
-ShadowRebuild --> Chroma
-CollectionMgmt --> Chroma
-GraphExtractor --> LLMProvider
-GraphStore --> SQLite
-EvalCLI --> Runtime
-EvalCLI --> EvalData
-
-' ======================== 具体外部实现 ========================
-LLMProvider --> CloudLLM : 配置完整时
-LLMProvider --> Ollama : 本地模式 / 云端配置缺失时
-EmbeddingProvider --> Ollama
-RerankerProvider --> HFModel
+' 离线与持久化
+IndexManager --> EmbeddingProvider
+IndexManager --> VectorProvider
+IndexManager --> KnowledgeRepo
+IndexManager --> Objects
+Extractor --> LLMProvider
+GraphQualityPipeline --> KGRepo
+KBRepo --> MetadataProvider
+KnowledgeRepo --> MetadataProvider
+DocMgmtRepo --> MetadataProvider
+JobRepo --> PersistedJobs
+KGRepo --> MetadataProvider
+CodeRepo --> MetadataProvider
+UserRepo --> MetadataProvider
+MetadataProvider --> SQLData
+GraphProvider --> SQLData
 VectorProvider --> Chroma
-GraphStoreProvider --> SQLite
-Loader --> DocsDir
+ObjectProvider --> Objects
+KnowledgeRepo --> BM25
 
-' ======================== 启停和横切 ========================
-FastAPIApp --> Alembic : 启动迁移
-Alembic --> SQLite
-FastAPIApp --> IndexWorker : 启动 / 优雅停止
-FastAPIApp --> Config
-Middleware --> Logging
-AuthService --> Config
-ProviderFactory --> Config
-Runtime --> ProviderFactory
-IndexWorker --> CacheInvalidation
+' 队列
+DocumentService --> QueueProvider
+GraphGovernance --> QueueProvider
+EntityVector --> QueueProvider
+CodeIndex --> QueueProvider
+QueueProvider --> InlineQueue : local
+QueueProvider --> CeleryQueue : enterprise
+InlineQueue --> IndexWorker
+CeleryQueue --> CeleryWorker
+CeleryWorker --> IndexWorker : 调用同一处理器
+CeleryBeat --> CeleryQueue
+PersistedJobs --> IndexWorker : claim + lease
 
-note right of ORCHESTRATION
-  <b>重要现状：两套编排共存</b>
-  /ask 执行编译后的 LangGraph；
-  Web 同步和 SSE 由 RAGService 手工依次调用相同节点。
-  两条链能力接近，但存在后续演进分叉风险。
+' Profile 与具体实现
+LocalProfile --> MetadataProvider
+LocalProfile --> VectorProvider
+LocalProfile --> ObjectProvider
+LocalProfile --> QueueProvider
+LocalProfile --> CacheProvider
+EnterpriseProfile --> MetadataProvider
+EnterpriseProfile --> VectorProvider
+EnterpriseProfile --> ObjectProvider
+EnterpriseProfile --> QueueProvider
+EnterpriseProfile --> CacheProvider
+EnterpriseProfile --> CeleryWorker
+EnterpriseProfile --> CeleryBeat
+LLMProvider --> Ollama
+LLMProvider --> ModelGateway
+EmbeddingProvider --> Ollama
+EmbeddingProvider --> ModelGateway
+RerankerProvider --> ExternalReranker
+
+' 数据来源
+UploadSource --> DocumentRoutes
+LocalSource --> SourceService
+GitSource --> SourceService
+S3Source --> SourceService
+
+note right of ONLINE
+  <b>统一编排事实</b>
+  /ask、知识库 /ask 和 Web 同步均执行 compiled LangGraph。
+  SSE 也用同一 Graph 完成 rewrite 到 build_context，
+  随后使用同一 Runtime 做真正的模型流式输出。
 end note
 
-note right of GraphChannel
-  图谱不是独立 LangGraph 节点，
-  而是 retrieve 内部的第三条召回通道。
-  图谱事实合并进 Document.metadata.graph_facts，
-  最终与正文一起进入单一 context 字符串。
+note right of Route
+  三个检索节点在 LangGraph 中独立存在并 Fan-out/Fan-in。
+  route 决定执行或跳过；任一通道异常只记录该通道 error，
+  其余通道仍可融合并继续回答。
 end note
 
-note right of ShadowRebuild
-  全量重建先写影子 Collection；
-  只有向量数量和完整 Chunk ID 集校验通过后，
-  才在 SQLite 事务中替换 Chunk 并切换活动指针。
-  旧 Collection 默认保留，但 SQLite 只保留当前 Chunk。
+note left of SQLData
+  所有核心查询都带 knowledge_base_id。
+  local 的 SQLite 与 enterprise 的 PostgreSQL
+  使用同一 ORM 模型和 Repository 约束。
 end note
 
-note left of SQLite
-  当前本机数据（2026-08-06）：
-  27 个 ready 文档，3880 个 Chunk；
-  活动 Chroma 也为 3880，ID 集一致。
-  图谱实体/关系/evidence 表均为 0；
-  仍有 3448 pending、6 processing 的图谱 Chunk 状态。
+note right of Chroma
+  向量本体继续存入 Chroma，而不是 PostgreSQL。
+  SQL 只保存活动 Collection、Embedding 指纹、
+  图版本和实体向量索引状态。
 end note
 
-note bottom of MISSING
-  红色区域不是已经部署的组件，
-  而是从现有代码、API、前端与验收数据中确认的能力边界。
+note right of CacheProvider
+  Redis Adapter 当前实现缓存读写和失效消息 publish；
+  API 端尚无订阅消费者。文档索引主要依靠 SQL
+  index_signature 检测刷新；跨进程代码快照需额外刷新或重启。
+end note
+
+note bottom of PENDING
+  红色区域不是缺失的核心业务页面或流程；
+  它表示尚未在真实企业环境完成的验收，
+  以及必须新增 Adapter 才能启用的可选产品。
 end note
 
 @enduml

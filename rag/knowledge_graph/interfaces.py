@@ -19,13 +19,21 @@ class GraphStore(Protocol):
         ...
 
     def get_neighbors(
-        self, entity_ids: list[str], max_hops: int, limit: int
+        self,
+        entity_ids: list[str],
+        max_hops: int,
+        limit: int,
+        offset: int = 0,
     ) -> list[dict]:
-        """获取实体邻居关系。"""
+        """获取稳定分页的实体邻居关系。"""
         ...
 
     def get_relation_evidence(self, relation_ids: list[str]) -> list[dict]:
         """获取关系的原文证据。"""
+        ...
+
+    def get_document_subgraph(self, document_id: str, limit: int) -> dict:
+        """Return the evidence-backed subgraph originating from one document."""
         ...
 
     def cleanup_orphans(self) -> None:

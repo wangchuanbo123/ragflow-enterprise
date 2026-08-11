@@ -329,3 +329,51 @@ def test_graph_build_reextracts_old_schema_and_filters_low_confidence(
         assert result["succeeded"] == 1
         assert result["graph_stats"]["relations"] == 0
         assert chunk.graph_schema_version == GRAPH_SCHEMA_VERSION
+
+
+def test_graph_build_recovers_interrupted_processing_chunk(db_engine):
+    from app.core.database import SessionLocal
+    from app.models.knowledge_chunk import KnowledgeChunk
+    from app.models.knowledge_document import KnowledgeDocument
+    from app.services.knowledge_graph_service import GraphBuildService
+    from rag.knowledge_graph.schemas import ChunkExtraction
+
+    class EmptyExtractor:
+        def extract_batch(self, chunks):
+            return [
+                ChunkExtraction(chunk_id=chunk["chunk_id"], entities=[], relations=[])
+                for chunk in chunks
+            ]
+
+    with SessionLocal() as db:
+        doc = KnowledgeDocument(
+            source_path="interrupted.txt",
+            original_filename="interrupted.txt",
+            file_hash="hash",
+            file_size=10,
+            status="ready",
+            embedding_provider="ollama",
+            embedding_model="test",
+        )
+        db.add(doc)
+        db.commit()
+        chunk = KnowledgeChunk(
+            id="interrupted-chunk",
+            document_id=doc.id,
+            file_hash="hash",
+            chunk_index=0,
+            content="No graph facts",
+            content_hash="content-hash",
+            token_count=3,
+            graph_status="processing",
+        )
+        db.add(chunk)
+        db.commit()
+
+        result = GraphBuildService(db, extractor=EmptyExtractor()).build_graph()
+
+        db.refresh(chunk)
+        assert result["recovered_processing"] == 1
+        assert result["succeeded"] == 1
+        assert chunk.graph_status == "completed"
+        assert chunk.graph_error is None

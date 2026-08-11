@@ -1,0 +1,295 @@
+"""Knowledge-base metadata and membership repository."""
+
+from __future__ import annotations
+
+import re
+
+from datetime import datetime
+
+from sqlalchemy import delete, or_, select
+from sqlalchemy.orm import Session
+
+from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
+from app.models.knowledge_base import (
+    KnowledgeBase,
+    KnowledgeBaseMember,
+    KnowledgeDataSource,
+)
+from app.models.user import User
+
+_SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
+
+
+class KnowledgeBaseRepository:
+    def __init__(self, db: Session):
+        self.db = db
+
+    def ensure_default(self, owner_id: str | None = None) -> KnowledgeBase:
+        knowledge_base = self.db.get(KnowledgeBase, DEFAULT_KNOWLEDGE_BASE_ID)
+        if knowledge_base is None:
+            knowledge_base = KnowledgeBase.default()
+            knowledge_base.owner_id = owner_id
+            self.db.add(knowledge_base)
+            self.db.flush()
+        elif owner_id and knowledge_base.owner_id is None:
+            knowledge_base.owner_id = owner_id
+        if owner_id and self.member_role(DEFAULT_KNOWLEDGE_BASE_ID, owner_id) is None:
+            self.db.add(
+                KnowledgeBaseMember(
+                    knowledge_base_id=DEFAULT_KNOWLEDGE_BASE_ID,
+                    user_id=owner_id,
+                    role="owner",
+                )
+            )
+        self.db.commit()
+        self.db.refresh(knowledge_base)
+        return knowledge_base
+
+    def get(self, knowledge_base_id: str) -> KnowledgeBase | None:
+        return self.db.scalar(
+            select(KnowledgeBase).where(
+                KnowledgeBase.id == knowledge_base_id,
+                KnowledgeBase.is_active.is_(True),
+            )
+        )
+
+    def list_for_user(self, user_id: str, *, is_admin: bool = False) -> list[KnowledgeBase]:
+        stmt = select(KnowledgeBase).where(KnowledgeBase.is_active.is_(True))
+        if not is_admin:
+            stmt = (
+                stmt.join(
+                    KnowledgeBaseMember,
+                    KnowledgeBaseMember.knowledge_base_id == KnowledgeBase.id,
+                )
+                .where(KnowledgeBaseMember.user_id == user_id)
+            )
+        return list(self.db.scalars(stmt.order_by(KnowledgeBase.created_at, KnowledgeBase.name)))
+
+    def member_role(self, knowledge_base_id: str, user_id: str) -> str | None:
+        return self.db.scalar(
+            select(KnowledgeBaseMember.role).where(
+                KnowledgeBaseMember.knowledge_base_id == knowledge_base_id,
+                KnowledgeBaseMember.user_id == user_id,
+            )
+        )
+
+    def can_read(self, knowledge_base_id: str, user_id: str, *, is_admin: bool = False) -> bool:
+        if is_admin:
+            return self.get(knowledge_base_id) is not None
+        return self.member_role(knowledge_base_id, user_id) is not None
+
+    def can_edit(self, knowledge_base_id: str, user_id: str, *, is_admin: bool = False) -> bool:
+        if is_admin:
+            return self.get(knowledge_base_id) is not None
+        return self.member_role(knowledge_base_id, user_id) in {"owner", "editor"}
+
+    def create(self, *, name: str, slug: str, owner_id: str) -> KnowledgeBase:
+        normalized_slug = slug.strip().lower()
+        if not _SLUG_PATTERN.fullmatch(normalized_slug):
+            raise ValueError(
+                "Knowledge-base slug must contain 3-64 lowercase letters, digits, or hyphens"
+            )
+        duplicate = self.db.scalar(
+            select(KnowledgeBase.id).where(
+                or_(KnowledgeBase.slug == normalized_slug, KnowledgeBase.name == name.strip())
+            )
+        )
+        if duplicate:
+            raise ValueError("Knowledge-base name or slug already exists")
+
+        knowledge_base = KnowledgeBase(
+            name=name.strip(),
+            slug=normalized_slug,
+            owner_id=owner_id,
+            is_default=False,
+            is_active=True,
+        )
+        self.db.add(knowledge_base)
+        self.db.flush()
+        self.db.add(
+            KnowledgeBaseMember(
+                knowledge_base_id=knowledge_base.id,
+                user_id=owner_id,
+                role="owner",
+            )
+        )
+        self.db.commit()
+        self.db.refresh(knowledge_base)
+        return knowledge_base
+
+    def list_members(self, knowledge_base_id: str) -> list[dict]:
+        rows = self.db.execute(
+            select(KnowledgeBaseMember, User).join(
+                User,
+                User.id == KnowledgeBaseMember.user_id,
+            ).where(KnowledgeBaseMember.knowledge_base_id == knowledge_base_id)
+        ).all()
+        return [
+            {
+                "id": member.id,
+                "user_id": user.id,
+                "username": user.username,
+                "display_name": user.display_name,
+                "role": member.role,
+                "created_at": member.created_at,
+            }
+            for member, user in rows
+        ]
+
+    def upsert_member(
+        self,
+        knowledge_base_id: str,
+        username: str,
+        role: str,
+    ) -> dict:
+        user = self.db.scalar(
+            select(User).where(
+                User.username == username.strip(),
+                User.is_active.is_(True),
+            )
+        )
+        if user is None:
+            raise ValueError("用户不存在或已停用")
+        member = self.db.scalar(
+            select(KnowledgeBaseMember).where(
+                KnowledgeBaseMember.knowledge_base_id == knowledge_base_id,
+                KnowledgeBaseMember.user_id == user.id,
+            )
+        )
+        if member is not None and member.role == "owner":
+            raise ValueError("不能通过成员接口修改知识库所有者")
+        if member is None:
+            member = KnowledgeBaseMember(
+                knowledge_base_id=knowledge_base_id,
+                user_id=user.id,
+                role=role,
+            )
+            self.db.add(member)
+        else:
+            member.role = role
+        self.db.commit()
+        self.db.refresh(member)
+        return {
+            "id": member.id,
+            "user_id": user.id,
+            "username": user.username,
+            "display_name": user.display_name,
+            "role": member.role,
+            "created_at": member.created_at,
+        }
+
+    def remove_member(self, knowledge_base_id: str, user_id: str) -> bool:
+        member = self.db.scalar(
+            select(KnowledgeBaseMember).where(
+                KnowledgeBaseMember.knowledge_base_id == knowledge_base_id,
+                KnowledgeBaseMember.user_id == user_id,
+            )
+        )
+        if member is None:
+            return False
+        if member.role == "owner":
+            raise ValueError("不能移除知识库所有者")
+        self.db.delete(member)
+        self.db.commit()
+        return True
+
+    def list_data_sources(self, knowledge_base_id: str) -> list[KnowledgeDataSource]:
+        return list(self.db.scalars(
+            select(KnowledgeDataSource)
+            .where(KnowledgeDataSource.knowledge_base_id == knowledge_base_id)
+            .order_by(KnowledgeDataSource.created_at.desc())
+        ))
+
+    def get_data_source(
+        self,
+        knowledge_base_id: str,
+        source_id: str,
+    ) -> KnowledgeDataSource | None:
+        return self.db.scalar(
+            select(KnowledgeDataSource).where(
+                KnowledgeDataSource.id == source_id,
+                KnowledgeDataSource.knowledge_base_id == knowledge_base_id,
+            )
+        )
+
+    def create_data_source(
+        self,
+        knowledge_base_id: str,
+        *,
+        source_type: str,
+        name: str,
+        connection_ref: str | None,
+        config: dict,
+        sync_interval_minutes: int | None = None,
+        deletion_policy: str = "ignore",
+    ) -> KnowledgeDataSource:
+        duplicate = self.db.scalar(
+            select(KnowledgeDataSource.id).where(
+                KnowledgeDataSource.knowledge_base_id == knowledge_base_id,
+                KnowledgeDataSource.name == name.strip(),
+            )
+        )
+        if duplicate:
+            raise ValueError("数据源名称已存在")
+        source = KnowledgeDataSource(
+            knowledge_base_id=knowledge_base_id,
+            source_type=source_type,
+            name=name.strip(),
+            connection_ref=connection_ref,
+            config_json=config,
+            status="active",
+            sync_interval_minutes=sync_interval_minutes,
+            deletion_policy=deletion_policy,
+        )
+        self.db.add(source)
+        self.db.commit()
+        self.db.refresh(source)
+        return source
+
+    def list_due_data_sources(self, now: datetime, limit: int = 100) -> list[KnowledgeDataSource]:
+        return list(self.db.scalars(
+            select(KnowledgeDataSource)
+            .where(
+                KnowledgeDataSource.status == "active",
+                KnowledgeDataSource.sync_interval_minutes.is_not(None),
+                or_(
+                    KnowledgeDataSource.next_sync_at.is_(None),
+                    KnowledgeDataSource.next_sync_at <= now,
+                ),
+            )
+            .order_by(KnowledgeDataSource.next_sync_at, KnowledgeDataSource.created_at)
+            .limit(limit)
+        ))
+
+    def update_data_source(
+        self,
+        knowledge_base_id: str,
+        source_id: str,
+        **changes,
+    ) -> KnowledgeDataSource | None:
+        source = self.get_data_source(knowledge_base_id, source_id)
+        if source is None:
+            return None
+        for key, value in changes.items():
+            if key == "config":
+                source.config_json = value
+            elif key == "connection_ref":
+                source.connection_ref = value
+            elif key == "sync_interval_minutes":
+                source.sync_interval_minutes = value
+                source.next_sync_at = None
+            elif value is not None:
+                setattr(source, key, value.strip() if key == "name" else value)
+        self.db.commit()
+        self.db.refresh(source)
+        return source
+
+    def delete_data_source(self, knowledge_base_id: str, source_id: str) -> bool:
+        result = self.db.execute(
+            delete(KnowledgeDataSource).where(
+                KnowledgeDataSource.id == source_id,
+                KnowledgeDataSource.knowledge_base_id == knowledge_base_id,
+            )
+        )
+        self.db.commit()
+        return bool(result.rowcount)

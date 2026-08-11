@@ -60,6 +60,11 @@ function toggleSources(e: Event): void {
             回答生成失败：{{ m.error_message || '请重试' }}
           </div>
 
+          <div v-if="m.route" class="route-note" :title="m.route.reasons.join('；')">
+            检索：{{ m.route.selected_channels.map((item) => ({ text: '文档', graph: '图谱', code: '代码' }[item])).join(' + ') }}
+            <span>置信度 {{ Math.round(m.route.confidence * 100) }}%</span>
+          </div>
+
           <div v-if="m.sources && m.sources.length" class="sources">
             <button class="sources-toggle" @click="toggleSources">▸ 引用来源</button>
             <div class="sources-body" style="display: none">
@@ -152,6 +157,8 @@ function toggleSources(e: Event): void {
   color: #d33;
   font-size: 13px;
 }
+.route-note { display: flex; gap: 8px; margin-top: 8px; color: #53657e; font-size: 11px; }
+.route-note span { color: #8b98aa; }
 .sources {
   margin-top: 8px;
   font-size: 12px;

@@ -4,6 +4,8 @@ from typing import Iterator
 from langchain_community.llms import Ollama
 from langchain_openai import ChatOpenAI
 
+from rag.providers.interfaces import ProviderHealth, ProviderIdentity
+
 
 class ZhipuLLMProvider:
     def __init__(
@@ -39,6 +41,22 @@ class ZhipuLLMProvider:
     def get_model(self):
         return self._model
 
+    def identity(self) -> ProviderIdentity:
+        return ProviderIdentity(
+            kind="llm",
+            provider="zhipu_openai_compatible",
+            model=self.model,
+            capabilities=("generate", "stream", "structured_output"),
+        )
+
+    def health(self) -> ProviderHealth:
+        if not self.api_key or not self.base_url:
+            return ProviderHealth.fail("API key and base URL are required")
+        return ProviderHealth.ok(
+            provider=self.identity().provider,
+            model=self.model,
+        )
+
     def generate(self, prompt: str) -> str:
         response = self._model.invoke(prompt)
         content = getattr(response, "content", response)
@@ -68,6 +86,21 @@ class OllamaLLMProvider:
     def get_model(self):
         return self._model
 
+    def identity(self) -> ProviderIdentity:
+        return ProviderIdentity(
+            kind="llm",
+            provider="ollama",
+            model=self.model,
+            capabilities=("generate", "stream"),
+        )
+
+    def health(self) -> ProviderHealth:
+        return ProviderHealth.ok(
+            provider=self.identity().provider,
+            model=self.model,
+            endpoint=self.base_url,
+        )
+
     def generate(self, prompt: str) -> str:
         return str(self._model.invoke(prompt))
 
@@ -76,3 +109,15 @@ class OllamaLLMProvider:
             content = getattr(chunk, "content", chunk)
             if content:
                 yield str(content)
+
+
+class OpenAICompatibleLLMProvider(ZhipuLLMProvider):
+    """Generic OpenAI-compatible chat endpoint (vLLM, gateways, or vendors)."""
+
+    def identity(self) -> ProviderIdentity:
+        return ProviderIdentity(
+            kind="llm",
+            provider="openai_compatible",
+            model=self.model,
+            capabilities=("generate", "stream", "structured_output"),
+        )

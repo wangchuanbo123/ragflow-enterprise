@@ -2,6 +2,8 @@ from functools import cached_property
 
 import httpx
 
+from rag.providers.interfaces import ProviderHealth, ProviderIdentity
+
 
 class OllamaBatchEmbeddings:
     """LangChain-compatible Ollama embeddings using the batch API."""
@@ -66,3 +68,61 @@ class OllamaEmbeddingProvider:
 
     def get_model(self):
         return self._model
+
+    def identity(self) -> ProviderIdentity:
+        return ProviderIdentity(
+            kind="embedding",
+            provider="ollama",
+            model=self.model,
+            capabilities=("documents", "query", "batch"),
+        )
+
+    def health(self) -> ProviderHealth:
+        return ProviderHealth.ok(
+            provider=self.identity().provider,
+            model=self.model,
+            endpoint=self.base_url,
+        )
+
+
+class OpenAICompatibleEmbeddingProvider:
+    """Embedding adapter for OpenAI-compatible enterprise endpoints."""
+
+    def __init__(self, model: str, api_key: str, base_url: str, timeout: float = 120):
+        self.model = model
+        self.api_key = api_key
+        self.base_url = base_url
+        self.timeout = timeout
+
+    @cached_property
+    def _model(self):
+        if not self.api_key or not self.base_url:
+            raise RuntimeError("Embedding API key and base URL are required")
+        from langchain_openai import OpenAIEmbeddings
+
+        return OpenAIEmbeddings(
+            model=self.model,
+            api_key=self.api_key,
+            base_url=self.base_url,
+            request_timeout=self.timeout,
+            max_retries=2,
+        )
+
+    def get_model(self):
+        return self._model
+
+    def identity(self) -> ProviderIdentity:
+        return ProviderIdentity(
+            kind="embedding",
+            provider="openai_compatible",
+            model=self.model,
+            capabilities=("documents", "query", "batch"),
+        )
+
+    def health(self) -> ProviderHealth:
+        if not self.api_key or not self.base_url:
+            return ProviderHealth.fail("Embedding API key and base URL are required")
+        return ProviderHealth.ok(
+            provider=self.identity().provider,
+            model=self.model,
+        )

@@ -3,6 +3,7 @@ import unittest
 from langchain_core.documents import Document
 
 from app.services.rag_service import ask_question
+from app.bootstrap.container import validate_provider_configuration
 from rag.graph.rag_graph import build_graph
 from rag.providers.factory import (
     create_llm_provider,
@@ -86,8 +87,47 @@ class ArchitectureTests(unittest.TestCase):
         self.assertTrue(callable(get_llm_provider().generate))
         self.assertTrue(callable(get_embedding_provider().get_model))
         self.assertTrue(callable(get_reranker().rerank))
-        self.assertTrue(callable(get_vector_store_provider().load))
+        vector_provider = get_vector_store_provider()
+        self.assertTrue(callable(vector_provider.open))
+        self.assertTrue(callable(vector_provider.health))
+        self.assertEqual(
+            vector_provider.identity().provider,
+            "chroma_embedded",
+        )
         self.assertEqual(get_runtime.cache_info().currsize, 0)
+
+    def testEnterpriseProfileDisablesImplicitOllamaFallback(self):
+        with self.assertRaisesRegex(ValueError, "implicit Ollama fallback"):
+            create_llm_provider(
+                provider="zhipu",
+                model="glm-test",
+                api_key="",
+                base_url="https://api.example.com/v1",
+                ollama_model="qwen3:4b",
+                ollama_base_url="http://localhost:11434",
+                allow_ollama_fallback=False,
+            )
+
+    def testEnterpriseProfileRejectsLocalOnlyAdapters(self):
+        with self.assertRaisesRegex(ValueError, "local-only providers"):
+            validate_provider_configuration(
+                profile="enterprise",
+                metadata_store="sqlite",
+                vector_store="chroma_embedded",
+                object_store="local",
+                task_queue="inline",
+                cache="memory",
+            )
+
+    def testEnterpriseProfileAcceptsImplementedRemoteAdapters(self):
+        validate_provider_configuration(
+            profile="enterprise",
+            metadata_store="postgresql",
+            vector_store="chroma_http",
+            object_store="s3",
+            task_queue="celery",
+            cache="redis",
+        )
 
     def testGraphUsesInjectedRuntimeEndToEnd(self):
         llm = FakeLLMProvider()

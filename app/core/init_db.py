@@ -43,7 +43,13 @@ def init_app() -> None:
     run_migrations()
     with SessionLocal() as db:
         ensure_initial_admin(db)
+        admin = db.query(User).filter(User.role == "admin").order_by(User.created_at).first()
+        from app.repositories.knowledge_base_repository import KnowledgeBaseRepository
+
+        KnowledgeBaseRepository(db).ensure_default(admin.id if admin else None)
 
     # Start index worker
     from app.services.index_worker import start_worker
     start_worker()
+    from app.services.connector_scheduler import start_connector_scheduler
+    start_connector_scheduler()

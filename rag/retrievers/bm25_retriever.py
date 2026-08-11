@@ -15,6 +15,7 @@ from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
 
 from app.core.database import SessionLocal
+from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 from app.repositories.knowledge_repository import KnowledgeRepository
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,11 @@ class ChunkBM25Retriever:
     - 没有活动 Chunk 时返回空结果
     """
 
-    def __init__(self):
+    def __init__(
+        self,
+        knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    ):
+        self.knowledge_base_id = knowledge_base_id
         self._docs: list[Document] = []
         self._tokenized: list[list[str]] = []
         self._bm25: BM25Okapi | None = None
@@ -54,7 +59,7 @@ class ChunkBM25Retriever:
                 db = SessionLocal()
                 own_session = True
             try:
-                repo = KnowledgeRepository(db)
+                repo = KnowledgeRepository(db, self.knowledge_base_id)
                 chunks = repo.list_all_active_chunks()
 
                 self._docs = []
@@ -65,8 +70,13 @@ class ChunkBM25Retriever:
                         page_content=chunk.content,
                         metadata={
                             "chunk_id": chunk.id,
+                            "knowledge_base_id": self.knowledge_base_id,
                             "document_id": chunk.document_id,
-                            "source": _get_source_path(db, chunk.document_id),
+                            "source": _get_source_path(
+                                db,
+                                chunk.document_id,
+                                self.knowledge_base_id,
+                            ),
                             "file_hash": chunk.file_hash,
                             "chunk_index": chunk.chunk_index,
                             "page": chunk.page,
@@ -105,9 +115,16 @@ class ChunkBM25Retriever:
         if not self._built:
             self.build(db)
 
-    def get_relevant_documents(self, query: str, top_k: int = 8) -> list[Document]:
+    def get_relevant_documents(
+        self,
+        query: str,
+        top_k: int = 8,
+        allowed_document_ids: set[str] | None = None,
+    ) -> list[Document]:
         self.ensure_built()
         if self._bm25 is None or not self._docs:
+            return []
+        if allowed_document_ids is not None and not allowed_document_ids:
             return []
 
         tokens = _tokenize(query)
@@ -118,12 +135,19 @@ class ChunkBM25Retriever:
         ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
 
         results: list[Document] = []
-        for idx, score in ranked[:top_k]:
+        for idx, score in ranked:
             if score <= 0:
                 break
             doc = self._docs[idx]
+            if (
+                allowed_document_ids is not None
+                and doc.metadata.get("document_id") not in allowed_document_ids
+            ):
+                continue
             doc.metadata["bm25_score"] = float(score)
             results.append(doc)
+            if len(results) >= top_k:
+                break
 
         return results
 
@@ -132,22 +156,35 @@ class ChunkBM25Retriever:
         return len(self._docs)
 
 
-def _get_source_path(db, document_id: str) -> str:
+def _get_source_path(db, document_id: str, knowledge_base_id: str) -> str:
     from app.models.knowledge_document import KnowledgeDocument
-    doc = db.get(KnowledgeDocument, document_id)
+    from sqlalchemy import select
+
+    doc = db.scalar(
+        select(KnowledgeDocument).where(
+            KnowledgeDocument.id == document_id,
+            KnowledgeDocument.knowledge_base_id == knowledge_base_id,
+        )
+    )
     return doc.source_path if doc else "unknown"
 
 
-_global_bm25: ChunkBM25Retriever | None = None
+_bm25_by_knowledge_base: dict[str, ChunkBM25Retriever] = {}
 
 
-def get_bm25_retriever() -> ChunkBM25Retriever:
-    global _global_bm25
-    if _global_bm25 is None:
-        _global_bm25 = ChunkBM25Retriever()
-    return _global_bm25
+def get_bm25_retriever(
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+) -> ChunkBM25Retriever:
+    if knowledge_base_id not in _bm25_by_knowledge_base:
+        _bm25_by_knowledge_base[knowledge_base_id] = ChunkBM25Retriever(
+            knowledge_base_id
+        )
+    return _bm25_by_knowledge_base[knowledge_base_id]
 
 
-def invalidate_bm25() -> None:
-    retriever = get_bm25_retriever()
-    retriever.invalidate()
+def invalidate_bm25(knowledge_base_id: str | None = None) -> None:
+    if knowledge_base_id is None:
+        for retriever in _bm25_by_knowledge_base.values():
+            retriever.invalidate()
+        return
+    get_bm25_retriever(knowledge_base_id).invalidate()

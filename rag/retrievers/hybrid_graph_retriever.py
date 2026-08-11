@@ -22,6 +22,7 @@ from app.core.config import (
     VECTOR_RETRIEVAL_WEIGHT,
     VECTOR_SEARCH_K,
 )
+from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 from rag.retrievers.bm25_retriever import get_bm25_retriever
 from rag.retrievers.hybrid_retriever import weighted_rrf_fusion
 
@@ -41,6 +42,7 @@ class HybridGraphRetriever:
         graph_weight: float | None = None,
         rrf_k: int = RRF_K,
         candidate_k: int = RETRIEVAL_CANDIDATE_K,
+        knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
     ):
         self.vector_store = vector_store
         self.vector_k = vector_k
@@ -66,6 +68,7 @@ class HybridGraphRetriever:
 
         self.rrf_k = rrf_k
         self.candidate_k = candidate_k
+        self.knowledge_base_id = knowledge_base_id
 
     def get_relevant_documents(self, query: str) -> list[Document]:
         return self.retrieve_single(query)
@@ -129,7 +132,9 @@ class HybridGraphRetriever:
 
     def _bm25_search(self, query: str) -> list[Document]:
         try:
-            return get_bm25_retriever().get_relevant_documents(query, top_k=self.bm25_k)
+            return get_bm25_retriever(
+                self.knowledge_base_id
+            ).get_relevant_documents(query, top_k=self.bm25_k)
         except Exception as exc:
             logger.warning("BM25 retrieval failed: %s", exc)
             return []
@@ -137,7 +142,9 @@ class HybridGraphRetriever:
     def _graph_search(self, query: str) -> list[Document]:
         try:
             from rag.knowledge_graph.retriever import get_graph_retriever
-            return get_graph_retriever().get_relevant_documents(query, top_k=self.vector_k)
+            return get_graph_retriever(
+                self.knowledge_base_id
+            ).get_relevant_documents(query, top_k=self.vector_k)
         except Exception as exc:
             logger.warning("Graph retrieval failed: %s", exc)
             return []
@@ -149,10 +156,12 @@ def create_hybrid_retriever(
     vector_k: int = VECTOR_SEARCH_K,
     bm25_k: int = BM25_SEARCH_K,
     vector_weight: float = HYBRID_VECTOR_WEIGHT,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
 ):
     """工厂函数。"""
     return HybridGraphRetriever(
         vector_store=vector_store,
         vector_k=vector_k,
         bm25_k=bm25_k,
+        knowledge_base_id=knowledge_base_id,
     )

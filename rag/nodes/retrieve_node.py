@@ -29,7 +29,19 @@ def create_retrieve_node(retriever: Retriever):
         if not unique_queries:
             return {"docs": [], "retrieval_candidates": []}
 
-        if isinstance(retriever, (HybridRRFRetriever, HybridGraphRetriever)):
+        allowed_document_ids = state.get("allowed_document_ids")
+        if isinstance(retriever, HybridRRFRetriever):
+            if len(unique_queries) > 1:
+                docs = retriever.retrieve_multi_query(
+                    unique_queries,
+                    allowed_document_ids=allowed_document_ids,
+                )
+            else:
+                docs = retriever.retrieve_single(
+                    unique_queries[0],
+                    allowed_document_ids=allowed_document_ids,
+                )
+        elif isinstance(retriever, HybridGraphRetriever):
             if len(unique_queries) > 1:
                 docs = retriever.retrieve_multi_query(unique_queries)
             else:

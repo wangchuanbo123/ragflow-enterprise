@@ -18,8 +18,8 @@ from app.core.config import (
     KNOWLEDGE_GRAPH_ENABLED,
 )
 from app.core.database import SessionLocal
+from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 from rag.knowledge_graph.normalizer import normalize_name
-from rag.knowledge_graph.sqlite_store import SqliteGraphStore
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +32,20 @@ class KnowledgeGraphRetriever:
     3. 映射回原始 chunk
     """
 
-    def __init__(self, db=None):
+    def __init__(
+        self,
+        db=None,
+        knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    ):
         self._db = db
+        self._owns_db = False
+        self.knowledge_base_id = knowledge_base_id
 
     @property
     def db(self):
         if self._db is None:
             self._db = SessionLocal()
+            self._owns_db = True
         return self._db
 
     def get_relevant_documents(self, query: str, top_k: int = 8) -> list[Document]:
@@ -52,10 +59,56 @@ class KnowledgeGraphRetriever:
             return []
 
     def _retrieve(self, query: str, top_k: int) -> list[Document]:
-        store = SqliteGraphStore(self.db)
+        from app.bootstrap.container import get_provider_container
+
+        store = get_provider_container().graph_store(
+            self.db,
+            self.knowledge_base_id,
+        )
 
         # Step 1: seed entity matching
         entities = store.search_entities(query, limit=GRAPH_ENTITY_SEARCH_K)
+        try:
+            from app.core.config import GRAPH_ENTITY_VECTOR_ENABLED
+            from app.services.entity_vector_service import EntityVectorService
+
+            semantic = (
+                EntityVectorService(self.db, self.knowledge_base_id).semantic_search(
+                    query, GRAPH_ENTITY_SEARCH_K
+                )
+                if GRAPH_ENTITY_VECTOR_ENABLED else []
+            )
+            by_id = {entity["id"]: entity for entity in entities}
+            for item in semantic:
+                entity_id = item.get("entity_id")
+                if not entity_id:
+                    continue
+                if entity_id in by_id:
+                    by_id[entity_id]["match_score"] = max(
+                        float(by_id[entity_id].get("match_score", 0)),
+                        float(item.get("match_score", 0)),
+                    )
+                else:
+                    from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
+
+                    model = KnowledgeGraphRepository(
+                        self.db, self.knowledge_base_id
+                    ).get_entity(entity_id)
+                    if model:
+                        by_id[entity_id] = {
+                            "id": model.id,
+                            "entity_type": model.entity_type,
+                            "canonical_name": model.canonical_name,
+                            "normalized_name": model.normalized_name,
+                            "description": model.description,
+                            "aliases": [],
+                            "match_score": float(item.get("match_score", 0)),
+                        }
+            entities = sorted(
+                by_id.values(), key=lambda item: float(item.get("match_score", 0)), reverse=True
+            )[:GRAPH_ENTITY_SEARCH_K]
+        except Exception as exc:
+            logger.debug("Semantic entity retrieval unavailable: %s", exc)
         if not entities:
             return []
 
@@ -102,7 +155,10 @@ class KnowledgeGraphRetriever:
         from sqlalchemy import select
 
         chunks = list(self.db.scalars(
-            select(KnowledgeChunk).where(KnowledgeChunk.id.in_(list(chunk_facts.keys())))
+            select(KnowledgeChunk).where(
+                KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+                KnowledgeChunk.id.in_(list(chunk_facts.keys())),
+            )
         ))
 
         # Build documents
@@ -119,8 +175,13 @@ class KnowledgeGraphRetriever:
                 page_content=chunk.content,
                 metadata={
                     "chunk_id": chunk.id,
+                    "knowledge_base_id": self.knowledge_base_id,
                     "document_id": chunk.document_id,
-                    "source": _get_source_path(self.db, chunk.document_id),
+                    "source": _get_source_path(
+                        self.db,
+                        chunk.document_id,
+                        self.knowledge_base_id,
+                    ),
                     "file_hash": chunk.file_hash,
                     "chunk_index": chunk.chunk_index,
                     "page": chunk.page,
@@ -136,17 +197,43 @@ class KnowledgeGraphRetriever:
         return results
 
 
-def _get_source_path(db, document_id: str) -> str:
+def _get_source_path(db, document_id: str, knowledge_base_id: str) -> str:
     from app.models.knowledge_document import KnowledgeDocument
-    doc = db.get(KnowledgeDocument, document_id)
+    from sqlalchemy import select
+
+    doc = db.scalar(
+        select(KnowledgeDocument).where(
+            KnowledgeDocument.id == document_id,
+            KnowledgeDocument.knowledge_base_id == knowledge_base_id,
+        )
+    )
     return doc.source_path if doc else "unknown"
 
 
-_global_retriever: KnowledgeGraphRetriever | None = None
+_retrievers_by_knowledge_base: dict[str, KnowledgeGraphRetriever] = {}
 
 
-def get_graph_retriever() -> KnowledgeGraphRetriever:
-    global _global_retriever
-    if _global_retriever is None:
-        _global_retriever = KnowledgeGraphRetriever()
-    return _global_retriever
+def get_graph_retriever(
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+) -> KnowledgeGraphRetriever:
+    if knowledge_base_id not in _retrievers_by_knowledge_base:
+        _retrievers_by_knowledge_base[knowledge_base_id] = KnowledgeGraphRetriever(
+            knowledge_base_id=knowledge_base_id
+        )
+    return _retrievers_by_knowledge_base[knowledge_base_id]
+
+
+def invalidate_graph_retrievers(knowledge_base_id: str | None = None) -> None:
+    targets = (
+        list(_retrievers_by_knowledge_base)
+        if knowledge_base_id is None
+        else [knowledge_base_id]
+    )
+    for target in targets:
+        retriever = _retrievers_by_knowledge_base.pop(target, None)
+        if (
+            retriever is not None
+            and retriever._db is not None
+            and retriever._owns_db
+        ):
+            retriever._db.close()

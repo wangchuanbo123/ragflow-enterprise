@@ -1,12 +1,14 @@
 <script setup lang="ts">
-import { onMounted } from 'vue'
-import { useAuth } from '../composables/useAuth'
+import { computed, onMounted, watch } from 'vue'
 import { useConversations } from '../composables/useConversations'
 import ConversationSidebar from './ConversationSidebar.vue'
 import MessageList from './MessageList.vue'
 
-const { user, logout } = useAuth()
+const props = defineProps<{ knowledgeBaseId: string }>()
 const conv = useConversations()
+const visibleConversations = computed(() =>
+  conv.conversations.value.filter((item) => item.knowledge_base_id === props.knowledgeBaseId),
+)
 
 onMounted(() => {
   conv.loadList()
@@ -15,16 +17,28 @@ onMounted(() => {
 function onSend(content: string): void {
   void conv.send(content)
 }
+
+function onCreate(): void {
+  void conv.create(props.knowledgeBaseId)
+}
+
+watch(() => props.knowledgeBaseId, () => {
+  const active = conv.conversations.value.find((item) => item.id === conv.activeId.value)
+  if (active?.knowledge_base_id !== props.knowledgeBaseId) {
+    conv.activeId.value = null
+    conv.resetDetail()
+  }
+})
 </script>
 
 <template>
   <div class="chat-layout">
     <ConversationSidebar
-      :conversations="conv.conversations.value"
+      :conversations="visibleConversations"
       :active-id="conv.activeId.value"
       :loading="conv.loadingList.value"
       @select="conv.select"
-      @create="conv.create"
+      @create="onCreate"
       @rename="conv.rename"
       @delete="conv.remove"
     />
@@ -34,10 +48,7 @@ function onSend(content: string): void {
         <span class="topbar-title">
           {{ conv.activeId.value ? '当前会话' : '企业知识库助手' }}
         </span>
-        <div class="topbar-right">
-          <span class="username">{{ user?.display_name || user?.username }}</span>
-          <button class="logout-btn" @click="logout">退出</button>
-        </div>
+        <span class="topbar-hint">同步问答与流式问答使用同一检索工作流</span>
       </header>
 
       <p v-if="conv.errorMsg.value" class="global-error">{{ conv.errorMsg.value }}</p>
@@ -55,7 +66,7 @@ function onSend(content: string): void {
 <style scoped>
 .chat-layout {
   display: flex;
-  height: 100vh;
+  height: 100%;
   overflow: hidden;
 }
 .chat-area {
@@ -78,27 +89,7 @@ function onSend(content: string): void {
   color: #333;
   font-size: 15px;
 }
-.topbar-right {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.username {
-  color: #666;
-  font-size: 13px;
-}
-.logout-btn {
-  border: 1px solid #ddd;
-  background: #fff;
-  border-radius: 6px;
-  padding: 5px 12px;
-  font-size: 13px;
-  cursor: pointer;
-  color: #555;
-}
-.logout-btn:hover {
-  background: #f3f4f6;
-}
+.topbar-hint { color: #9aa4b2; font-size: 11px; }
 .global-error {
   margin: 0;
   padding: 8px 16px;

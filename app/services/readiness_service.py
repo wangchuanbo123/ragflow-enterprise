@@ -7,32 +7,31 @@ import time
 from datetime import datetime, timezone
 
 from app.core.config import READINESS_CACHE_SECONDS, READINESS_TIMEOUT_SECONDS
+from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 
 logger = logging.getLogger(__name__)
 
 _cache: dict = {"data": None, "expires_at": 0}
 
 
-def _check_database() -> dict:
+def _check_database(metadata_provider=None) -> dict:
     try:
-        from app.core.database import SessionLocal
-        with SessionLocal() as db:
-            db.execute(__import__("sqlalchemy").text("SELECT 1"))
-        return {"status": "ok"}
+        from app.bootstrap.container import get_provider_container
+
+        provider = metadata_provider or get_provider_container().metadata
+        return provider.health().as_dict()
     except Exception as exc:
         return {"status": "fail", "detail": str(exc)[:200]}
 
 
-def _check_vector_store() -> dict:
+def _check_vector_store(vector_provider=None) -> dict:
     try:
-        import chromadb
-        from app.core.config import VECTOR_DB_DIR
-        from app.core.database import SessionLocal
+        from app.bootstrap.container import get_provider_container
         from app.repositories.knowledge_repository import KnowledgeRepository
+        from rag.providers.interfaces import VectorIndexRef
 
-        client = chromadb.PersistentClient(path=str(VECTOR_DB_DIR))
-
-        with SessionLocal() as db:
+        container = get_provider_container()
+        with container.metadata.session() as db:
             repo = KnowledgeRepository(db)
             state = repo.get_index_state()
             active = state.active_collection_name
@@ -40,77 +39,38 @@ def _check_vector_store() -> dict:
                 chunk.id for chunk in repo.list_all_active_chunks()
             }
 
-        if not active:
-            return {"status": "fail", "detail": "No active collection configured"}
-
-        try:
-            collection = client.get_collection(active)
-        except Exception:
-            return {
-                "status": "fail",
-                "detail": f"Active collection '{active}' not found",
-            }
-
-        vector_count = collection.count()
-        chunk_count = len(chunk_ids)
-        result = {
-            "collection": active,
-            "vector_count": vector_count,
-            "chunk_count": chunk_count,
-        }
-        if vector_count != chunk_count:
-            return {
-                **result,
-                "status": "fail",
-                "detail": (
-                    f"Vector count ({vector_count}) != active SQLite "
-                    f"chunk count ({chunk_count})"
-                ),
-            }
-
-        vector_ids = set(collection.get(include=[])["ids"])
-        if vector_ids != chunk_ids:
-            missing = sorted(chunk_ids - vector_ids)[:5]
-            unexpected = sorted(vector_ids - chunk_ids)[:5]
-            return {
-                **result,
-                "status": "fail",
-                "detail": (
-                    "Vector IDs do not match active SQLite chunk IDs; "
-                    f"missing={missing}, unexpected={unexpected}"
-                ),
-            }
-
-        return {**result, "status": "ok"}
+        provider = vector_provider or container.vector_store
+        return provider.health(
+            VectorIndexRef(
+                name=active,
+                knowledge_base_id=DEFAULT_KNOWLEDGE_BASE_ID,
+            ),
+            expected_ids=chunk_ids,
+        ).as_dict()
     except Exception as exc:
         return {"status": "fail", "detail": str(exc)[:200]}
 
 
-def _check_ollama() -> dict:
+def _check_ollama(container=None) -> dict:
     try:
         import httpx
-        from app.core.config import (
-            EMBEDDING_MODEL,
-            EMBEDDING_PROVIDER,
-            GRAPH_EXTRACTION_MODEL,
-            GRAPH_EXTRACTION_PROVIDER,
-            LLM_API_KEY,
-            LLM_BASE_URL,
-            LLM_PROVIDER,
-            OLLAMA_BASE_URL,
-            OLLAMA_LLM_MODEL,
-        )
+        from app.bootstrap.container import get_provider_container
+        from app.core.config import OLLAMA_BASE_URL
+
+        container = container or get_provider_container()
 
         required_models: set[str] = set()
-        if EMBEDDING_PROVIDER == "ollama":
-            required_models.add(EMBEDDING_MODEL)
-        if LLM_PROVIDER == "ollama" or (
-            LLM_PROVIDER in {"zhipu", "zai", "glm"}
-            and (not LLM_API_KEY.strip() or not LLM_BASE_URL.strip())
-        ):
-            required_models.add(OLLAMA_LLM_MODEL)
-        if GRAPH_EXTRACTION_PROVIDER == "ollama":
-            required_models.add(GRAPH_EXTRACTION_MODEL)
+        providers = (
+            container.llm,
+            container.rewrite_llm,
+            container.router_llm,
+            container.extraction_llm,
+            container.embedding,
+        )
+        for provider in providers:
+            identity = provider.identity()
+            if identity.provider == "ollama" and identity.model:
+                required_models.add(identity.model)
 
         if not required_models:
             return {"status": "ok", "detail": "not required", "models": []}
@@ -153,16 +113,57 @@ def _check_index_worker() -> dict:
     return {"status": "fail", "detail": "Index worker is not running", **worker}
 
 
+def _check_provider(provider) -> dict:
+    try:
+        return provider.health().as_dict()
+    except Exception as exc:
+        return {"status": "fail", "detail": str(exc)[:200]}
+
+
+def _check_model_profiles(container) -> dict:
+    try:
+        profiles = {}
+        for purpose, provider in {
+            "answer": container.llm,
+            "rewrite": container.rewrite_llm,
+            "router": container.router_llm,
+            "extraction": container.extraction_llm,
+            "embedding": container.embedding,
+            "reranker": container.reranker,
+        }.items():
+            health = provider.health().as_dict()
+            profiles[purpose] = {
+                **provider.identity().as_dict(),
+                "status": health.get("status", "fail"),
+                **({"detail": health["detail"]} if health.get("detail") else {}),
+            }
+        status = (
+            "ok"
+            if all(item["status"] == "ok" for item in profiles.values())
+            else "fail"
+        )
+        return {"status": status, "profiles": profiles}
+    except Exception as exc:
+        return {"status": "fail", "detail": str(exc)[:200]}
+
+
 def check_readiness(force: bool = False) -> dict:
     """检查所有组件就绪状态。结果缓存 READINESS_CACHE_SECONDS 秒。"""
     now = time.time()
     if not force and _cache["data"] and now < _cache["expires_at"]:
         return _cache["data"]
 
+    from app.bootstrap.container import get_provider_container
+
+    container = get_provider_container()
     components = {
-        "database": _check_database(),
+        "database": _check_database(container.metadata),
+        "object_store": _check_provider(container.object_store),
+        "task_queue": _check_provider(container.task_queue),
+        "cache": _check_provider(container.cache),
         "vector_store": _check_vector_store(),
-        "ollama": _check_ollama(),
+        "model_profiles": _check_model_profiles(container),
+        "ollama": _check_ollama(container),
         "index_worker": _check_index_worker(),
     }
 

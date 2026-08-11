@@ -7,6 +7,8 @@ Chroma()：简单、本地运行、LangChain原生支持
 """
 
 def load_vector_store(embedding, persist_dir):
-    from rag.providers.factory import get_vector_store_provider
+    from rag.providers.interfaces import VectorIndexRef
+    from rag.providers.vector_store import ChromaVectorStoreProvider
 
-    return get_vector_store_provider().load(embedding, persist_dir)
+    provider = ChromaVectorStoreProvider(persist_dir=persist_dir)
+    return provider.open(embedding, VectorIndexRef())

@@ -1,84 +1,508 @@
-@startuml
-title 当前 RAG 在线问答时序
+@startuml RAG_Sync_Question
+title 1. 统一 LangGraph 同步问答时序
 
-skinparam backgroundColor white
+skinparam backgroundColor #FFFFFF
 skinparam shadowing false
 skinparam sequenceMessageAlign center
+autonumber
 
-actor "用户" as User
-participant "FastAPI" as API
-participant "ChatService /\nRAGService" as Service
-participant "问答编排\nCompiledGraph / 手工节点流" as Flow
-participant "LLM Provider" as LLM
-participant "HybridGraphRetriever" as Retriever
-database "Chroma + SQLite" as Stores
-participant "Reranker" as Reranker
+actor "用户 / API 客户端" as User
+participant "FastAPI\n问答入口" as API
+participant "鉴权与知识库权限" as Auth
+participant "ChatService\n（仅会话入口）" as Chat
+participant "RAGConcurrency" as Limit
+participant "RAGService / Runtime" as RAG
+database "SQLAlchemy\nSQLite / PostgreSQL" as SQL
+participant "Compiled LangGraph" as Graph
+participant "Rewrite / Router LLM" as RouteLLM
+participant "Scope Resolver" as Scope
+participant "Text Retriever" as Text
+participant "Graph Retriever" as KG
+participant "Code Retriever" as Code
+database "Chroma\n文档/实体向量" as Chroma
+participant "Fuse + Reranker" as Rank
 participant "ContextBuilder" as Context
+participant "Answer LLM" as AnswerLLM
 
-User -> API : 提交问题
-API -> API : 登录鉴权
-API -> Service : 获取 RAG 并发许可
+User -> API : 提交 query + 可选 retrieval options
+API -> Auth : 校验登录身份
 
 alt POST /ask
-  API -> Service : ask_question(query)
-  Service -> Flow : compiled_graph.invoke(state)
-else Web 同步或 SSE
-  API -> Service : answer_sync / answer_stream
-  Service -> Flow : 依次调用共享节点函数
+  Auth -> Auth : 使用默认知识库
+else POST /knowledge-bases/{kb_id}/ask
+  Auth -> SQL : 校验 knowledge_base read 权限
+else POST /conversations/{id}/messages
+  Auth -> Chat : 校验会话归属
+  Chat -> SQL : 保存 user message、读取最近历史
 end
 
-note right of Service
-索引状态时间戳变化时，
-自动刷新 Runtime、BM25
-和 Compiled LangGraph。
+API -> Limit : 获取 RAG 并发许可
+Limit -> RAG : ask(query, history, kb_id, retrieval)
+RAG -> SQL : 读取活动索引与 index_signature
+alt index_signature 已变化
+  RAG -> RAG : 失效 Runtime / Graph / BM25 缓存
+  RAG -> SQL : 重新构建当前知识库 Runtime
+end
+RAG -> Graph : invoke(generation_mode="sync")
+
+Graph -> RouteLLM : rewrite(original_query, history)
+alt 改写成功且有效
+  RouteLLM --> Graph : original + rewritten queries
+else 改写失败或无效
+  RouteLLM --> Graph : 只保留 original query
+end
+
+Graph -> Scope : route_request(explicit → rules → optional LLM)
+opt 规则未形成强意图且启用混合路由
+  Scope -> RouteLLM : 要求 JSON channels
+  RouteLLM --> Scope : text / graph / code
+end
+Scope -> SQL : 按 kb_id 解析 document/tag/folder/metadata
+SQL --> Scope : allowed_document_ids
+Scope --> Graph : route + scope_match_count
+
+par text_retrieve
+  Graph -> Text : original + rewritten queries + allowed IDs
+  Text -> Chroma : 文档向量检索（范围 Filter）
+  Text -> SQL : 中文 BM25（当前 KB Chunk）
+  Text -> Text : 通道内 Weighted RRF
+  Text --> Graph : text_docs / skipped / error
+else graph_retrieve
+  Graph -> KG : 词法实体 + 可选实体向量种子
+  KG -> Chroma : 实体语义向量检索
+  KG -> SQL : 1~2 跳关系、Overlay、Evidence 回链 Chunk
+  KG --> Graph : graph_docs / skipped / error
+else code_retrieve
+  Graph -> Code : 搜索活动快照符号
+  Code -> SQL : 符号、源码摘录、调用/依赖关系
+  Code --> Graph : code_docs / skipped / error
+end
+
+Graph -> Rank : Fan-in + 通道加权 RRF + chunk_id 去重
+Rank -> Rank : original_query 重排；失败保留融合排序
+Rank --> Graph : top documents + channel_results
+Graph -> Context : 去重、来源配额、Chunk/Token 预算、引用
+Context --> Graph : context + sources
+Graph -> AnswerLLM : generate(original_query, history, context)
+AnswerLLM --> Graph : answer
+Graph --> RAG : answer + sources + route
+RAG --> Limit : 释放许可
+
+alt 会话入口
+  Limit --> Chat : 回答结果
+  Chat -> SQL : 保存 completed assistant message\n失败时保存 failed message
+  Chat --> API : user_message + assistant_message
+else 无会话入口
+  Limit --> API : answer + sources + route
+end
+API --> User : JSON 响应
+
+note over Text,Code
+  三个节点是独立 LangGraph 分支。
+  route 未选择时返回 skipped；单通道异常记录 error，
+  不阻断其余通道和最终回答。
 end note
 
-Flow -> LLM : rewrite(original_query)
-LLM --> Flow : rewritten_query
-note right of Flow
-检索通常同时使用
-original_query 与 rewritten_query。
+note over API,Graph
+  retrieval/debug 复用相同流程，
+  但 generation_mode=context，在 build_context 后结束，
+  返回 route、sources 与 context_preview，不调用 Answer LLM。
 end note
 
-Flow -> Retriever : retrieve_multi_query(queries)
-Retriever -> Stores : Vector + 中文 BM25 + 图谱证据检索
-Stores --> Retriever : 三路候选 Chunk
-Retriever -> Retriever : Weighted RRF 融合并按 chunk_id 去重
-Retriever --> Flow : retrieval candidates
+@enduml
 
-Flow -> Reranker : rerank(original_query, candidates)
-Reranker --> Flow : top documents
+@startuml RAG_SSE_Question
+title 2. Web SSE 问答时序
 
-Flow -> Context : build_context(documents)
-Context -> Context : 去重、来源配额、Token 预算、citation_id
-Context --> Flow : context + sources
-note right of Context
-CONTEXT_JSON_EXPORT_ENABLED=true 时，
-在 generate 前写入 data/debug/contexts/context_*.json。
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+autonumber
+
+actor "Web 用户" as User
+participant "Web api/client.ts" as Web
+participant "FastAPI SSE Route" as API
+participant "ChatService" as Chat
+database "SQLAlchemy" as SQL
+participant "RAGService" as RAG
+participant "Compiled LangGraph" as Graph
+participant "Text / Graph / Code" as Retrieval
+participant "ContextBuilder" as Context
+participant "Answer LLM.stream" as LLM
+
+User -> Web : 发送消息
+Web -> API : POST .../messages/stream
+API -> Chat : answer_stream(content, retrieval)
+Chat -> SQL : 校验会话归属并保存 user message
+Chat -> SQL : 创建 status=streaming 的 assistant message
+Chat --> API : event: message {message_id}
+API --> Web : SSE message
+
+Chat -> RAG : stream(query, history, kb_id)
+RAG -> Graph : invoke(generation_mode="context")
+Graph -> Retrieval : rewrite → route → 三通道并行 → fuse → rerank
+Retrieval --> Graph : docs + route/channel_results
+Graph -> Context : build_context(docs)
+Context --> Graph : context + sources
+Graph --> RAG : END（不执行 generate 节点）
+
+RAG --> Chat : event: route
+Chat --> API : event: route
+API --> Web : SSE route
+RAG -> LLM : stream(original_query, history, context)
+loop 模型流式分片
+  LLM --> RAG : delta
+  RAG --> Chat : event: delta
+  Chat --> API : event: delta
+  API --> Web : SSE delta
+  Web --> User : 增量显示
+end
+RAG --> Chat : event: sources
+Chat --> API : event: sources
+API --> Web : SSE sources
+Chat -> SQL : assistant = completed\n保存正文、sources、route
+Chat --> API : event: done
+API --> Web : SSE done
+
+alt 任一步骤异常
+  Chat -> SQL : assistant = failed + error_message
+  Chat --> API : event: error
+  API --> Web : SSE error（不发送 done）
+end
+
+note over Graph,LLM
+  SSE 的 rewrite、路由、检索、融合、重排和上下文
+  均由统一 compiled LangGraph 完成；
+  只有最终 Token 流由同一 Runtime 的 LLM.stream 在图外输出。
 end note
 
-alt /ask 或 Web 同步
-  Flow -> LLM : generate(query, context)
-  LLM --> Flow : answer
-  Flow --> Service : answer + sources
-  Service --> API : 保存并返回结果
-  API --> User : 最终响应
-else Web SSE
-  Flow -> LLM : stream_generate(query, context)
-  loop 模型流式分片
-    LLM --> Flow : delta
-    Flow --> Service : delta
-    Service --> API : SSE delta
-    API --> User : SSE delta
+@enduml
+
+@startuml Document_Index_Job
+title 3. 文档上传与持久化索引任务时序
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+autonumber
+
+actor "管理员 / editor" as Admin
+participant "Documents API" as API
+participant "DocumentIndexService" as Service
+database "ObjectStore\nlocal / MinIO" as ObjectStore
+database "SQL Metadata" as SQL
+queue "TaskQueue\ninline / Celery" as Queue
+participant "IndexWorker" as Worker
+participant "Lease Heartbeat" as Lease
+participant "Loader + Chunker" as Parser
+participant "EmbeddingProvider" as Embedding
+database "Chroma 文档索引" as Chroma
+participant "Cache / Readiness" as Cache
+
+Admin -> API : 单个/批量上传或重建
+API -> API : 校验 edit 权限、格式、文件数与大小
+API -> Service : create file/rebuild job
+Service -> ObjectStore : 保存原文对象和不可变版本
+Service -> SQL : 文档 pending + version\n创建 IndexJob / Item / Event
+Service -> Queue : enqueue(job_id)
+API --> Admin : 202 + job_id + 拒绝文件清单
+
+alt local Profile
+  Queue -> Worker : 唤醒进程内 Worker
+else enterprise Profile
+  Queue -> Worker : Celery 投递（数据库仍为事实源）
+end
+
+Worker -> SQL : 原子 claim、attempt+1、lease_owner/expires_at
+Worker -> Lease : 启动周期心跳
+
+alt file / delete 任务
+  loop 每个未完成 Item
+    Worker -> SQL : 检查 cancel_requested，Item=running
+    alt delete
+      Worker -> Chroma : 删除文档旧向量
+      Worker -> SQL : 删除/停用文档与 Chunk
+    else file
+      Worker -> ObjectStore : materialize(source_path)
+      ObjectStore --> Worker : 临时本地 Path
+      Worker -> Parser : 解析 TXT/PDF/MD/DOCX/HTML 并切片
+      Parser --> Worker : deterministic chunks
+      Worker -> Embedding : 分批 passage embedding
+      Embedding --> Worker : vectors
+      Worker -> Chroma : 写入活动 Collection
+      Worker -> SQL : 事务替换文档元数据和 Chunk\n标记 ready，更新 index_signature
+      Worker -> Chroma : 成功后清理旧向量
+    end
+    Worker -> SQL : Item completed/failed + Job 进度事件
   end
-  Flow --> Service : sources + done
-  Service --> API : 完成事件
-  API --> User : sources + done
+else rebuild 全量影子任务
+  note over Worker,Chroma
+    当前 rebuild 分支是默认知识库本地目录的兼容流程；
+    企业对象存储中的文档应通过持久化 file/reindex 任务重建。
+  end note
+  Worker -> Chroma : 创建 documents_build_* 影子 Collection
+  loop 所有支持文档
+    Worker -> ObjectStore : 读取对象
+    Worker -> Parser : Loader + Chunker
+    Worker -> Embedding : 批量 Embedding
+    Worker -> Chroma : 写影子 Collection
+  end
+  Worker -> Chroma : 校验数量与完整 Chunk ID 集
+  alt 校验通过
+    Worker -> SQL : 单事务替换 Chunk\n切换 active_collection
+  else 任一文档或校验失败
+    Worker -> Chroma : 清理失败影子索引
+    Worker -> SQL : 保持旧活动索引
+  end
 end
 
-note over Retriever,Context
-graph_facts 当前保存在 Document metadata 中，
-接口尚未单独返回 graph_subgraph。
+Worker -> Lease : 停止心跳
+Worker -> SQL : Job completed / partial / failed / cancelled
+Worker -> Cache : 清 Runtime/Graph/BM25/Readiness 本地缓存\n发布失效通知
+
+note over Queue,Worker
+  Queue 只负责投递或唤醒，index_jobs 才是任务状态事实源。
+  Worker 丢失后由租约恢复机制把过期任务重新置为 pending。
+end note
+
+note over SQL,Chroma
+  文档索引完成后，新 Chunk 的 graph_status 为 pending；
+  不会自动抽取知识图谱，图谱由独立 graph_rebuild 任务执行。
+end note
+
+@enduml
+
+@startuml Knowledge_Graph_Build
+title 4. 文档知识图谱构建与治理时序
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+autonumber
+
+actor "知识库管理员 / editor" as Admin
+participant "Graph Governance API" as API
+database "SQL Job + Graph Tables" as SQL
+queue "TaskQueue" as Queue
+participant "IndexWorker" as Worker
+participant "GraphBuildService" as Build
+participant "Schema Registry" as Schema
+database "Extraction Cache" as Cache
+participant "Extraction LLM" as LLM
+participant "Validator + Normalizer" as Quality
+participant "GraphGovernanceService" as Governance
+participant "EntityVectorService" as EntityVector
+database "Chroma 实体向量" as Chroma
+
+Admin -> API : POST .../knowledge-graph/build\nmode=pending/retry_failed/full
+API -> API : 校验 edit 权限
+API -> SQL : 去重未完成 graph_rebuild\n创建持久任务
+API -> Queue : enqueue(job_id)
+API --> Admin : 202 + job_id
+
+Queue -> Worker : 投递任务
+Worker -> SQL : claim + lease heartbeat
+Worker -> Build : build_graph(mode)
+Build -> SQL : 恢复遗留 processing → pending
+Build -> Schema : 获取当前 KB active Schema
+Schema --> Build : entity types、relation dictionary\nextraction_prompt、version
+Build -> SQL : 选择 ready 文档的 Chunk\n按 mode 过滤并标记 processing
+
+loop 按 Chunk 数和字符预算分批
+  par 并行抽取 Worker
+    Build -> Cache : lookup(content + schema + model fingerprint)
+    alt cache hit
+      Cache --> Build : 解析候选
+    else cache miss
+      Build -> LLM : Schema 约束 Prompt + Chunk 原文
+      LLM --> Build : JSON entities / relations
+      Build -> Cache : 保存可复用抽取结果
+    end
+    Build -> Quality : JSON、实体类型、关系字典\nlocal_id、自环、Evidence 原文定位\n置信度与端点校验
+    Quality --> Build : accepted facts + rejected reasons
+  end
+
+  Build -> SQL : 顺序替换每个 Chunk 的旧图结果\n固定 NFKC 名称标准化\n实体/关系去重与 Upsert\n保存 Alias/Mention/Relation/Evidence
+  Build -> SQL : Chunk completed 或 failed
+end
+
+Build -> SQL : 清理孤儿实体/关系\n协调人工校正 Overlay
+Build --> Worker : succeeded / failed / skipped
+Worker -> Governance : assess_quality()
+Governance -> SQL : 质量报告、门禁结果、Review Queue
+
+opt rebuild_communities=true
+  Worker -> Governance : rebuild_communities()
+  Governance -> SQL : 全局 root + 连通分量子社区\n确定性摘要与成员 Evidence
+end
+
+opt rebuild_entity_vectors=true
+  Worker -> EntityVector : rebuild()
+  EntityVector -> SQL : 读取实体、计算图/Embedding 指纹
+  EntityVector -> Chroma : 构建影子实体 Collection 并校验
+  EntityVector -> SQL : 激活索引状态，清理旧 Collection
+end
+
+alt 抽取失败或质量门禁未通过
+  Worker -> SQL : Job=partial + 明确错误
+else 全部通过
+  Worker -> SQL : Job=completed
+end
+
+note over Quality,SQL
+  去幻觉依赖 Schema、关系字典、端点和 Evidence 原文门禁；
+  相似度只生成待人工复核的合并候选，不自动合并实体。
+  人工合并是可撤销的逻辑 Overlay，不破坏底层事实。
+end note
+
+@enduml
+
+@startuml Connector_Synchronization
+title 5. 数据源连接器与周期调度时序
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+autonumber
+
+actor "管理员 / editor" as Admin
+participant "Connector Scheduler\nlocal timer / Celery Beat" as Scheduler
+participant "Sources API" as API
+database "SQL DataSource + Jobs" as SQL
+queue "TaskQueue" as Queue
+participant "DataSourceService" as Source
+participant "CredentialResolver" as Credential
+participant "Git / S3 / Local Directory" as External
+database "ObjectStore" as Objects
+participant "DocumentIndexService" as Documents
+participant "CodeIndexService" as CodeIndex
+
+alt 手工同步
+  Admin -> API : POST .../sources/{id}/sync
+  API -> SQL : 校验 edit 权限和 source 状态
+else 周期同步
+  Scheduler -> SQL : 查询 active 且 next_sync_at 到期的数据源
+  Scheduler -> Source : request_sync(source_id)
+end
+
+alt local_directory
+  API -> Source : 当前线程执行轻量扫描
+  Source -> External : 校验允许根目录、枚举文件
+  External --> Source : 文件列表
+else Git / S3
+  API -> SQL : 创建父 connector_sync Job
+  API -> Queue : enqueue(parent_job_id)
+  API --> Admin : 202（立即返回）
+  Queue -> Source : Worker 执行 connector_sync
+  Source -> Credential : resolve env:// 或 file://
+  Credential --> Source : Token / JSON 凭据（不落库）
+  alt Git
+    Source -> External : 浅克隆到临时目录、读取 revision
+  else S3 / MinIO
+    Source -> External : 分页列举 s3://bucket/prefix\n按大小限制下载
+  end
+  External --> Source : 文件、revision/cursor、拒绝项
+end
+
+Source -> Source : Hash 比对新增/修改/未变\n识别同内容重命名\n应用 ignore/delete 删除策略
+Source -> Objects : 保存原文和版本对象
+Source -> Documents : 创建子 file/delete 索引任务
+Documents -> SQL : 持久化 child Job / Items
+Documents -> Queue : enqueue(child_job_id)
+
+opt local/Git 且 index_code=true
+  Source -> CodeIndex : 当前连接器调用线程内同步构建代码索引
+end
+
+Source -> SQL : 保存 sync_cursor、last status/detail\nlast_synced_at、next_sync_at
+Source --> API : accepted / skipped / rejected + child job
+
+note over SQL,Documents
+  父 connector_sync 完成表示采集、落对象和子任务创建成功；
+  不表示 child file Job 已完成切片、Embedding 和向量写入。
+end note
+
+note over Scheduler,Queue
+  local 使用进程内 Scheduler；enterprise 使用 Celery Beat。
+  到期调度和人工点击最终都落到同一持久化任务模型。
+end note
+
+@enduml
+
+@startuml Code_Graph_Index
+title 6. 代码图索引与在线检索时序
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam sequenceMessageAlign center
+autonumber
+
+actor "管理员 / editor" as Admin
+participant "Code Graph API" as API
+database "SQL Jobs" as Jobs
+queue "TaskQueue" as Queue
+participant "IndexWorker" as Worker
+participant "CodeIndexService" as Indexer
+participant "DataSourceService" as Source
+participant "CodeParser" as Parser
+database "ObjectStore" as Objects
+database "SQL Code Graph" as GraphDB
+participant "CodeGraphRetriever" as Retriever
+participant "LangGraph code_retrieve" as CodeNode
+
+Admin -> API : POST .../code-graph/index {data_source_id}
+API -> API : 校验 edit 权限；仅 local_directory / Git
+API -> Jobs : 去重 open code_index，创建任务
+API -> Queue : enqueue(job_id)
+API --> Admin : 202 + job_id
+Queue -> Worker : 投递任务
+Worker -> Jobs : claim + lease
+
+alt local_directory
+  Worker -> Source : 解析允许的本地根目录
+  Source --> Indexer : directory Path
+else Git
+  Worker -> Source : 浅克隆到临时目录、获取 revision
+  Source --> Indexer : repository Path + revision
+end
+
+Indexer -> Indexer : 扫描支持后缀\n排除依赖/构建目录、符号链接和超大文件\n计算内容 fingerprint
+alt fingerprint 与活动快照相同
+  Indexer --> Worker : unchanged（不创建重复快照）
+else 内容变化
+  Indexer -> GraphDB : 创建 status=building Snapshot
+  par 并行解析文件
+    Indexer -> Parser : parse(path, source)
+    alt Python
+      Parser -> Parser : stdlib ast 提取符号与关系
+    else 其他支持语言
+      Parser -> Parser : Tree-sitter 语法解析/恢复检查\n当前由确定性 Regex emitter 提取事实
+    end
+    Parser --> Indexer : ParsedFile（临时 AST 不持久化）
+  end
+  Indexer -> Objects : 保存代码源副本
+  Indexer -> GraphDB : 保存 File / Symbol\nCONTAINS / IMPORTS / CALLS / EXTENDS
+  Indexer -> Indexer : 跨文件名称解析
+  Indexer -> GraphDB : 标记 resolved / ambiguous / external\n保留行号和源码摘录
+  Indexer -> GraphDB : 新 Snapshot=active\n旧 Snapshot=superseded\n按 retention 清理历史
+  Indexer --> Worker : files/symbols/relations 统计
+end
+
+Worker -> Jobs : completed / failed
+
+Admin -> API : GET symbols 或 subgraph
+API -> GraphDB : 只查询活动 Snapshot
+GraphDB --> API : 符号、调用/依赖边、源码行号
+API --> Admin : Code Graph DTO
+
+CodeNode -> Retriever : 在线问题命中 code 通道
+Retriever -> GraphDB : 搜索活动符号并扩展关系
+GraphDB --> Retriever : symbols + relations
+Retriever --> CodeNode : 代码检索 Documents
+
+note over Parser,GraphDB
+  静态分析不承诺解析动态调用、反射、宏和运行时注入；
+  不确定的关系保留 resolution_status，不伪造确定调用边。
 end note
 
 @enduml

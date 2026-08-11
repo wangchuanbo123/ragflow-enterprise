@@ -7,42 +7,107 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 from app.models.index_job import KnowledgeIndexState
 from app.models.knowledge_chunk import KnowledgeChunk
 from app.models.knowledge_document import KnowledgeDocument
 
 
 class KnowledgeRepository:
-    def __init__(self, db: Session):
+    def __init__(
+        self,
+        db: Session,
+        knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+    ):
         self.db = db
+        self.knowledge_base_id = knowledge_base_id
 
     # --- Documents ---
 
     def get_by_source_path(self, source_path: str) -> KnowledgeDocument | None:
         return self.db.scalar(
-            select(KnowledgeDocument).where(KnowledgeDocument.source_path == source_path)
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.knowledge_base_id == self.knowledge_base_id,
+                KnowledgeDocument.source_path == source_path,
+            )
         )
 
     def get_by_id(self, document_id: str) -> KnowledgeDocument | None:
-        return self.db.get(KnowledgeDocument, document_id)
+        return self.db.scalar(
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.id == document_id,
+                KnowledgeDocument.knowledge_base_id == self.knowledge_base_id,
+            )
+        )
 
-    def list_documents(self) -> list[KnowledgeDocument]:
-        return list(self.db.scalars(
-            select(KnowledgeDocument).order_by(KnowledgeDocument.created_at.desc())
-        ))
+    def list_documents(
+        self,
+        *,
+        folder_id: str | None = None,
+        status: str | None = None,
+        tag_ids: list[str] | None = None,
+        filename_contains: str | None = None,
+        metadata_filters: dict[str, str] | None = None,
+    ) -> list[KnowledgeDocument]:
+        stmt = select(KnowledgeDocument).where(
+            KnowledgeDocument.knowledge_base_id == self.knowledge_base_id
+        )
+        if folder_id is not None:
+            stmt = stmt.where(KnowledgeDocument.folder_id == folder_id)
+        if status is not None:
+            stmt = stmt.where(KnowledgeDocument.status == status)
+        if filename_contains:
+            stmt = stmt.where(
+                KnowledgeDocument.original_filename.contains(filename_contains)
+            )
+        if tag_ids:
+            from app.models.document_management import DocumentTagLink
+
+            stmt = (
+                stmt.join(
+                    DocumentTagLink,
+                    DocumentTagLink.document_id == KnowledgeDocument.id,
+                )
+                .where(
+                    DocumentTagLink.knowledge_base_id == self.knowledge_base_id,
+                    DocumentTagLink.tag_id.in_(tag_ids),
+                )
+                .distinct()
+            )
+        documents = list(
+            self.db.scalars(stmt.order_by(KnowledgeDocument.created_at.desc()))
+        )
+        if metadata_filters:
+            documents = [
+                document
+                for document in documents
+                if all(
+                    str((document.metadata_json or {}).get(key)) == value
+                    for key, value in metadata_filters.items()
+                )
+            ]
+        return documents
 
     def list_ready_documents(self) -> list[KnowledgeDocument]:
         return list(self.db.scalars(
-            select(KnowledgeDocument).where(KnowledgeDocument.status == "ready")
+            select(KnowledgeDocument).where(
+                KnowledgeDocument.knowledge_base_id == self.knowledge_base_id,
+                KnowledgeDocument.status == "ready",
+            )
         ))
 
     def upsert_document(self, doc: KnowledgeDocument) -> KnowledgeDocument:
+        if doc.knowledge_base_id not in {None, self.knowledge_base_id}:
+            raise ValueError("Document belongs to another knowledge base")
+        doc.knowledge_base_id = self.knowledge_base_id
         self.db.add(doc)
         self.db.commit()
         self.db.refresh(doc)
         return doc
 
     def delete_document(self, doc: KnowledgeDocument) -> None:
+        if doc.knowledge_base_id != self.knowledge_base_id:
+            raise ValueError("Document belongs to another knowledge base")
         self.db.delete(doc)
         self.db.commit()
 
@@ -51,21 +116,31 @@ class KnowledgeRepository:
     def list_chunks_for_document(self, document_id: str) -> list[KnowledgeChunk]:
         return list(self.db.scalars(
             select(KnowledgeChunk)
-            .where(KnowledgeChunk.document_id == document_id)
+            .where(
+                KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+                KnowledgeChunk.document_id == document_id,
+            )
             .order_by(KnowledgeChunk.chunk_index)
         ))
 
     def list_chunk_ids_for_document(self, document_id: str) -> list[str]:
         return list(self.db.scalars(
             select(KnowledgeChunk.id)
-            .where(KnowledgeChunk.document_id == document_id)
+            .where(
+                KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+                KnowledgeChunk.document_id == document_id,
+            )
         ))
 
     def list_all_active_chunks(self) -> list[KnowledgeChunk]:
         return list(self.db.scalars(
             select(KnowledgeChunk)
             .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
-            .where(KnowledgeDocument.status == "ready")
+            .where(
+                KnowledgeDocument.knowledge_base_id == self.knowledge_base_id,
+                KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+                KnowledgeDocument.status == "ready",
+            )
             .order_by(KnowledgeChunk.document_id, KnowledgeChunk.chunk_index)
         ))
 
@@ -78,6 +153,9 @@ class KnowledgeRepository:
 
     def add_chunks(self, chunks: list[KnowledgeChunk]) -> None:
         for c in chunks:
+            if c.knowledge_base_id not in {None, self.knowledge_base_id}:
+                raise ValueError("Chunk belongs to another knowledge base")
+            c.knowledge_base_id = self.knowledge_base_id
             self.db.add(c)
         self.db.commit()
 
@@ -85,16 +163,24 @@ class KnowledgeRepository:
         return self.db.scalar(
             select(func.count(KnowledgeChunk.id))
             .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
-            .where(KnowledgeDocument.status == "ready")
+            .where(
+                KnowledgeDocument.knowledge_base_id == self.knowledge_base_id,
+                KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+                KnowledgeDocument.status == "ready",
+            )
         ) or 0
 
     # --- Index state ---
 
     def get_index_state(self) -> KnowledgeIndexState:
-        state = self.db.get(KnowledgeIndexState, 1)
+        state = self.db.scalar(
+            select(KnowledgeIndexState).where(
+                KnowledgeIndexState.knowledge_base_id == self.knowledge_base_id
+            )
+        )
         if state is None:
             state = KnowledgeIndexState(
-                id=1,
+                knowledge_base_id=self.knowledge_base_id,
                 active_collection_name=None,
                 index_schema_version=2,
                 embedding_fingerprint="",

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.bootstrap.container import get_provider_container
 from app.core.config import KNOWLEDGE_GRAPH_ENABLED
 from app.core.database import get_db
 from app.models.user import User
@@ -12,7 +13,6 @@ from app.schemas.knowledge_graph import (
     GraphStatsOut,
     NeighborRelationOut,
 )
-from rag.knowledge_graph.sqlite_store import SqliteGraphStore
 
 router = APIRouter(prefix="/knowledge-graph", tags=["knowledge-graph"])
 
@@ -29,7 +29,7 @@ def graph_stats(
     db: Session = Depends(get_db),
 ):
     _check_enabled()
-    store = SqliteGraphStore(db)
+    store = get_provider_container().graph_store(db)
     return GraphStatsOut(**store.stats())
 
 
@@ -41,7 +41,7 @@ def search_entities(
     db: Session = Depends(get_db),
 ):
     _check_enabled()
-    store = SqliteGraphStore(db)
+    store = get_provider_container().graph_store(db)
     entities = store.search_entities(query, limit)
     return [EntityOut(**e) for e in entities]
 
@@ -79,6 +79,6 @@ def get_neighbors(
     db: Session = Depends(get_db),
 ):
     _check_enabled()
-    store = SqliteGraphStore(db)
+    store = get_provider_container().graph_store(db)
     relations = store.get_neighbors([entity_id], hops, limit)
     return [NeighborRelationOut(**r) for r in relations]

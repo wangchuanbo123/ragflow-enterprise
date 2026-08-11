@@ -126,6 +126,21 @@ class GraphExtractor:
 
             max_content_chars = GRAPH_EXTRACTION_MAX_CHARS
         self.max_content_chars = max_content_chars
+        self.entity_types = set(VALID_ENTITY_TYPES)
+        self.relation_types = set(VALID_PREDICATES)
+        self.prompt_prefix: str | None = None
+
+    def configure_schema(
+        self,
+        *,
+        entity_types: list[str] | None = None,
+        relation_types: list[str] | None = None,
+        prompt_prefix: str | None = None,
+    ) -> None:
+        """Apply an active registry schema without coupling it to a provider."""
+        self.entity_types = set(entity_types or VALID_ENTITY_TYPES)
+        self.relation_types = set(relation_types or VALID_PREDICATES)
+        self.prompt_prefix = prompt_prefix
 
     @property
     def llm(self):
@@ -180,15 +195,17 @@ class GraphExtractor:
             "你是知识图谱实体关系抽取助手。请严格遵守以下规则：\n"
             "1. 只提取原文明确出现的信息，不得补充常识。\n"
             "2. entity type 只能使用："
-            + ", ".join(sorted(VALID_ENTITY_TYPES))
+            + ", ".join(sorted(self.entity_types))
             + "。\n3. predicate 只能使用："
-            + ", ".join(sorted(VALID_PREDICATES))
+            + ", ".join(sorted(self.relation_types))
             + "。\n4. evidence 必须是对应 chunk 中可找到的原文短句。\n"
             "5. 每个输入 chunk 都必须返回一个结果，没有内容时返回空列表。\n"
             '只输出 JSON：{"chunks":[{"chunk_id":"...",'
             '"entities":[],"relations":[]}]}\n\n输入：\n'
             + json.dumps(payload, ensure_ascii=False)
         )
+        if self.prompt_prefix:
+            prompt = self.prompt_prefix.strip() + "\n\n" + prompt
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):

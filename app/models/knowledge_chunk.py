@@ -7,6 +7,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
 from app.core.database import Base
+from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 
 
 class KnowledgeChunk(Base):
@@ -16,6 +17,14 @@ class KnowledgeChunk(Base):
     )
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    knowledge_base_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        default=DEFAULT_KNOWLEDGE_BASE_ID,
+        server_default=DEFAULT_KNOWLEDGE_BASE_ID,
+        index=True,
+        nullable=False,
+    )
     document_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("knowledge_documents.id", ondelete="CASCADE"), index=True, nullable=False
     )

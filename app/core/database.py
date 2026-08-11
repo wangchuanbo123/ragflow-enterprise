@@ -28,8 +28,7 @@ class Base(DeclarativeBase):
 
 def get_db() -> Generator[Session, None, None]:
     """FastAPI 依赖：提供一个数据库会话并在请求结束后关闭。"""
-    db = SessionLocal()
-    try:
+    from app.bootstrap.container import get_provider_container
+
+    with get_provider_container().metadata.session() as db:
         yield db
-    finally:
-        db.close()

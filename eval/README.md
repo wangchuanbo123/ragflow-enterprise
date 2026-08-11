@@ -91,6 +91,18 @@ python -m scripts.evaluate_rag --compare <baseline.json> <final.json>
 
 `full` 模式会调用当前 LLM，可能产生云端费用或占用本地模型计算资源。
 
+### 路由评测（不调用模型）
+
+`data/routing_cases.jsonl` 是检索路由金标准集，覆盖普通文档、关系、代码、
+显式通道和通道不可用降级。执行：
+
+```powershell
+python -m scripts.evaluate_routing --output eval/results/routing_latest.json
+```
+
+该命令只运行确定性规则路由，不调用生成、Embedding 或抽取模型；默认要求
+通道 Exact Match 为 100%，不通过时返回非零退出码。
+
 ## 指标
 
 检索：
