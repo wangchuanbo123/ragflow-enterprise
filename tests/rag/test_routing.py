@@ -29,3 +29,10 @@ def test_explicit_channels_override_intent_rules():
     assert decision["method"] == "explicit"
     assert decision["selected_channels"] == ["graph"]
     assert decision["scope"]["document_ids"] == ["doc-1"]
+
+
+def test_function_location_question_selects_code_channel():
+    decision = route_query("订单超时在哪里处理？", code_available=True)
+
+    assert decision["selected_channels"] == ["text", "code"]
+    assert decision["method"] == "rules"

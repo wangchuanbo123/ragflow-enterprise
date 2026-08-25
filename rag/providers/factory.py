@@ -65,6 +65,8 @@ def create_llm_provider(
         "glm",
         "openai",
         "openai_compatible",
+        "anthropic",
+        "anthropic_compatible",
     }:
         if not api_key.strip() or not base_url.strip():
             if not allow_ollama_fallback:
@@ -80,7 +82,9 @@ def create_llm_provider(
                 timeout=PROVIDER_TIMEOUT_SECONDS,
             )
 
-        if provider in {"zhipu", "zai", "glm"}:
+        if provider in {"anthropic", "anthropic_compatible"}:
+            from rag.providers.llm import AnthropicCompatibleLLMProvider as ProviderClass
+        elif provider in {"zhipu", "zai", "glm"}:
             from rag.providers.llm import ZhipuLLMProvider as ProviderClass
         else:
             from rag.providers.llm import OpenAICompatibleLLMProvider as ProviderClass

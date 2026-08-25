@@ -15,6 +15,7 @@ _GRAPH_TERMS = {
 }
 _CODE_TERMS = {
     "代码", "函数", "类", "方法", "调用", "模块", "接口", "源码", "实现",
+    "在哪里处理", "在哪处理", "哪里处理", "处理逻辑", "业务入口", "入口在哪",
     "code", "function", "class", "method", "call", "module", "symbol",
     "implementation",
 }

@@ -132,6 +132,49 @@ class CodeGraphRepository:
         ).all()
         return [self._symbol_dict(symbol, path, language) for symbol, path, language in rows]
 
+    def list_symbols(
+        self,
+        snapshot_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict]:
+        if snapshot_id is None:
+            active = self.active_snapshot()
+            if active is None:
+                return []
+            snapshot_id = active.id
+        statement = (
+            select(CodeSymbol, CodeFile.path, CodeFile.language)
+            .join(CodeFile, CodeFile.id == CodeSymbol.file_id)
+            .where(
+                CodeSymbol.knowledge_base_id == self.knowledge_base_id,
+                CodeSymbol.snapshot_id == snapshot_id,
+            )
+            .order_by(CodeFile.path, CodeSymbol.start_line, CodeSymbol.id)
+        )
+        if limit is not None:
+            statement = statement.limit(limit)
+        return [
+            self._symbol_dict(symbol, path, language)
+            for symbol, path, language in self.db.execute(statement).all()
+        ]
+
+    def get_symbols(self, symbol_ids: list[str]) -> list[dict]:
+        if not symbol_ids:
+            return []
+        rows = self.db.execute(
+            select(CodeSymbol, CodeFile.path, CodeFile.language)
+            .join(CodeFile, CodeFile.id == CodeSymbol.file_id)
+            .where(
+                CodeSymbol.knowledge_base_id == self.knowledge_base_id,
+                CodeSymbol.id.in_(symbol_ids),
+            )
+        ).all()
+        by_id = {
+            symbol.id: self._symbol_dict(symbol, path, language)
+            for symbol, path, language in rows
+        }
+        return [by_id[symbol_id] for symbol_id in symbol_ids if symbol_id in by_id]
+
     def get_symbol(self, symbol_id: str) -> dict | None:
         row = self.db.execute(
             select(CodeSymbol, CodeFile.path, CodeFile.language)
@@ -176,6 +219,64 @@ class CodeGraphRepository:
             "end_line": relation.evidence_end_line,
         } for relation, source, target in rows]
 
+    def relation_context(
+        self,
+        snapshot_id: str,
+        per_symbol_limit: int = 12,
+    ) -> dict[str, list[str]]:
+        """Return compact incoming/outgoing relation facts for summary generation."""
+        subject = aliased(CodeSymbol)
+        target = aliased(CodeSymbol)
+        rows = self.db.execute(
+            select(CodeRelation, subject, target)
+            .join(subject, subject.id == CodeRelation.subject_symbol_id)
+            .outerjoin(target, target.id == CodeRelation.target_symbol_id)
+            .where(
+                CodeRelation.knowledge_base_id == self.knowledge_base_id,
+                CodeRelation.snapshot_id == snapshot_id,
+            )
+            .order_by(
+                CodeRelation.evidence_path,
+                CodeRelation.evidence_start_line,
+                CodeRelation.id,
+            )
+        ).all()
+        context: dict[str, list[str]] = {}
+
+        def append(symbol_id: str | None, fact: str) -> None:
+            if not symbol_id:
+                return
+            facts = context.setdefault(symbol_id, [])
+            if fact not in facts and len(facts) < per_symbol_limit:
+                facts.append(fact)
+
+        for relation, source_symbol, target_symbol in rows:
+            target_name = (
+                target_symbol.qualified_name
+                if target_symbol is not None
+                else relation.target_qualified_name
+            )
+            append(
+                source_symbol.id,
+                f"{relation.relation_type} -> {target_name}",
+            )
+            if target_symbol is not None:
+                append(
+                    target_symbol.id,
+                    f"{relation.relation_type} <- {source_symbol.qualified_name}",
+                )
+        return context
+
+    def update_symbol_metadata(self, symbol_id: str, metadata: dict) -> None:
+        self.db.execute(
+            update(CodeSymbol)
+            .where(
+                CodeSymbol.id == symbol_id,
+                CodeSymbol.knowledge_base_id == self.knowledge_base_id,
+            )
+            .values(metadata_json=metadata)
+        )
+
     def stats(self) -> dict:
         snapshot = self.active_snapshot()
         if snapshot is None:
@@ -193,8 +294,10 @@ class CodeGraphRepository:
 
     @staticmethod
     def _symbol_dict(symbol: CodeSymbol, path: str, language: str) -> dict:
+        metadata = symbol.metadata_json or {}
         return {
             "id": symbol.id,
+            "stable_key": symbol.stable_key,
             "snapshot_id": symbol.snapshot_id,
             "file_id": symbol.file_id,
             "path": path,
@@ -206,5 +309,6 @@ class CodeGraphRepository:
             "start_line": symbol.start_line,
             "end_line": symbol.end_line,
             "source_excerpt": symbol.source_excerpt,
-            "metadata": symbol.metadata_json or {},
+            "functional_summary": metadata.get("functional_summary"),
+            "metadata": metadata,
         }

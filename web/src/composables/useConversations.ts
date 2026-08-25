@@ -1,6 +1,6 @@
 import { reactive, ref } from 'vue'
 import * as api from '../api/client'
-import type { Conversation, ConversationDetail, Message, SourceItem } from '../types'
+import type { Conversation, ConversationDetail, Message, RetrievalStrategy, SourceItem } from '../types'
 
 const conversations = ref<Conversation[]>([])
 const activeId = ref<string | null>(null)
@@ -61,7 +61,7 @@ async function remove(id: string): Promise<void> {
   }
 }
 
-async function send(content: string): Promise<void> {
+async function send(content: string, strategy: RetrievalStrategy = 'standard'): Promise<void> {
   if (!activeId.value || sending.value) return
   const convId = activeId.value
   sending.value = true
@@ -112,6 +112,7 @@ async function send(content: string): Promise<void> {
           errorMsg.value = message
         },
       },
+      strategy,
     )
   } catch (e) {
     assistantMsg.status = 'failed'

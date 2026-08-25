@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections import defaultdict, deque
 from datetime import datetime
 
@@ -13,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.config import (
     GRAPH_LOW_CONFIDENCE_REVIEW_THRESHOLD,
     GRAPH_ENTITY_MERGE_SIMILARITY,
+    GRAPH_AUTO_BUILD_ENABLED,
     GRAPH_MERGE_CANDIDATE_LIMIT,
     GRAPH_RELATED_TO_MAX_RATIO,
     GRAPH_SCHEMA_VERSION,
@@ -28,6 +30,7 @@ from app.models.graph_governance import (
     KgEntityMerge,
 )
 from app.models.index_job import IndexJob
+from app.models.knowledge_base import KnowledgeBase
 from app.models.knowledge_chunk import KnowledgeChunk
 from app.models.knowledge_graph import KgAlias, KgEntity, KgEntityMention, KgRelation, KgRelationEvidence
 from app.repositories.index_job_repository import IndexJobRepository
@@ -47,6 +50,20 @@ class GraphGovernanceService:
         return list(self.db.scalars(select(GraphSchemaDefinition).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id
         ).order_by(GraphSchemaDefinition.version.desc())))
+
+    @staticmethod
+    def _validate_schema_types(entity_types: list[str], relation_types: list[str]) -> tuple[list[str], list[str]]:
+        pattern = re.compile(r"^[A-Z][A-Z0-9_]{0,31}$")
+        entities = sorted({item.strip().upper() for item in entity_types if item.strip()})
+        relations = sorted({item.strip().upper() for item in relation_types if item.strip()})
+        if not entities or not relations:
+            raise ValueError("Schema 至少需要一个实体类型和一个关系类型")
+        invalid = [item for item in [*entities, *relations] if not pattern.fullmatch(item)]
+        if invalid:
+            raise ValueError(f"Schema 类型必须是 1-32 位大写字母、数字或下划线：{invalid}")
+        if len(entities) > 100 or len(relations) > 100:
+            raise ValueError("实体类型和关系类型分别不能超过 100 个")
+        return entities, relations
 
     def active_schema(self, *, create_default: bool = True) -> GraphSchemaDefinition | None:
         schema = self.db.scalar(select(GraphSchemaDefinition).where(
@@ -74,12 +91,9 @@ class GraphGovernanceService:
         self, *, entity_types: list[str], relation_types: list[str],
         normalization_rules: dict, extraction_prompt: str | None, created_by: str,
     ) -> GraphSchemaDefinition:
-        unknown_entities = set(entity_types) - set(VALID_ENTITY_TYPES)
-        unknown_relations = set(relation_types) - set(VALID_PREDICATES)
-        if unknown_entities or unknown_relations:
-            raise ValueError(
-                f"Schema 包含未注册类型：{sorted(unknown_entities | unknown_relations)}"
-            )
+        entity_types, relation_types = self._validate_schema_types(
+            entity_types, relation_types
+        )
         latest = self.db.scalar(select(func.max(GraphSchemaDefinition.version)).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id
         )) or 0
@@ -87,8 +101,8 @@ class GraphGovernanceService:
             knowledge_base_id=self.knowledge_base_id,
             version=max(int(latest) + 1, GRAPH_SCHEMA_VERSION),
             status="draft",
-            entity_types_json=sorted(set(entity_types)),
-            relation_types_json=sorted(set(relation_types)),
+            entity_types_json=entity_types,
+            relation_types_json=relation_types,
             normalization_rules_json=normalization_rules,
             extraction_prompt=extraction_prompt,
             created_by=created_by,
@@ -97,6 +111,46 @@ class GraphGovernanceService:
         self.db.commit()
         self.db.refresh(schema)
         return schema
+
+    def update_schema(
+        self, schema_id: str, *, entity_types: list[str], relation_types: list[str],
+        normalization_rules: dict, extraction_prompt: str | None,
+    ) -> GraphSchemaDefinition | None:
+        schema = self.db.scalar(select(GraphSchemaDefinition).where(
+            GraphSchemaDefinition.id == schema_id,
+            GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+        ))
+        if schema is None:
+            return None
+        if schema.status != "draft":
+            raise ValueError("仅草稿 Schema 可以直接修改；请复制活动版本创建新草稿")
+        entities, relations = self._validate_schema_types(entity_types, relation_types)
+        schema.entity_types_json = entities
+        schema.relation_types_json = relations
+        schema.normalization_rules_json = normalization_rules
+        schema.extraction_prompt = extraction_prompt
+        self.db.commit()
+        self.db.refresh(schema)
+        return schema
+
+    def automation_settings(self) -> dict:
+        knowledge_base = self.db.get(KnowledgeBase, self.knowledge_base_id)
+        settings = (knowledge_base.settings_json or {}) if knowledge_base else {}
+        return {
+            "auto_build_enabled": bool(
+                settings.get("graph_auto_build_enabled", GRAPH_AUTO_BUILD_ENABLED)
+            )
+        }
+
+    def update_automation_settings(self, *, auto_build_enabled: bool) -> dict:
+        knowledge_base = self.db.get(KnowledgeBase, self.knowledge_base_id)
+        if knowledge_base is None:
+            raise ValueError("知识库不存在")
+        settings = dict(knowledge_base.settings_json or {})
+        settings["graph_auto_build_enabled"] = auto_build_enabled
+        knowledge_base.settings_json = settings
+        self.db.commit()
+        return {"auto_build_enabled": auto_build_enabled}
 
     def activate_schema(self, schema_id: str) -> GraphSchemaDefinition | None:
         schema = self.db.scalar(select(GraphSchemaDefinition).where(
@@ -136,6 +190,27 @@ class GraphGovernanceService:
         ))
         self.task_queue.enqueue(job.id)
         return job
+
+    def request_automatic_build(
+        self, requested_by: str | None, source_job_id: str
+    ) -> IndexJob | None:
+        if not self.automation_settings()["auto_build_enabled"]:
+            return None
+        pending = int(self.db.scalar(select(func.count(KnowledgeChunk.id)).where(
+            KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+            KnowledgeChunk.graph_status == "pending",
+        )) or 0)
+        if pending == 0:
+            return None
+        return self.request_build(
+            "pending",
+            requested_by,
+            {
+                "trigger": "document_index_completed",
+                "source_job_id": source_job_id,
+                "pending_chunks_at_enqueue": pending,
+            },
+        )
 
     def latest_quality(self) -> GraphQualityReport | None:
         return self.db.scalar(select(GraphQualityReport).where(
@@ -317,6 +392,79 @@ class GraphGovernanceService:
                 created += 1
         self.db.commit()
         return {"scanned": len(entities), "candidates": created, "threshold": GRAPH_ENTITY_MERGE_SIMILARITY}
+
+    def scan_relation_merge_candidates(self) -> dict:
+        """Find relations that become duplicate after active entity disambiguation."""
+        relations = list(self.db.scalars(select(KgRelation).where(
+            KgRelation.knowledge_base_id == self.knowledge_base_id
+        )))
+        entity_map = {
+            item.merged_entity_id: item.canonical_entity_id
+            for item in self.db.scalars(select(KgEntityMerge).where(
+                KgEntityMerge.knowledge_base_id == self.knowledge_base_id,
+                KgEntityMerge.status == "active",
+            ))
+        }
+        existing = set(self.db.scalars(select(GraphReviewItem.target_id).where(
+            GraphReviewItem.knowledge_base_id == self.knowledge_base_id,
+            GraphReviewItem.status == "pending",
+        )))
+        grouped: dict[tuple[str, str, str], list[KgRelation]] = defaultdict(list)
+        for relation in relations:
+            subject = entity_map.get(relation.subject_entity_id, relation.subject_entity_id)
+            obj = entity_map.get(relation.object_entity_id, relation.object_entity_id)
+            grouped[(subject, relation.predicate, obj)].append(relation)
+        created = 0
+        for triple, group in grouped.items():
+            if len(group) < 2:
+                continue
+            relation_ids = sorted(item.id for item in group)
+            target = "relation-merge:" + ":".join(relation_ids)
+            if target in existing:
+                continue
+            self.db.add(GraphReviewItem(
+                knowledge_base_id=self.knowledge_base_id,
+                item_type="relation_merge_candidate",
+                target_id=target,
+                payload_json={"relation_ids": relation_ids, "resolved_triple": list(triple)},
+                reason="实体消歧后关系指向同一三元组，建议人工确认合并",
+                confidence=min(float(item.confidence) for item in group),
+            ))
+            existing.add(target)
+            created += 1
+        self.db.commit()
+        return {"scanned": len(relations), "candidates": created}
+
+    def list_relation_merges(self):
+        from app.models.knowledge_graph import KgGraphCorrection
+        return list(self.db.scalars(select(KgGraphCorrection).where(
+            KgGraphCorrection.knowledge_base_id == self.knowledge_base_id,
+            KgGraphCorrection.action == "merge_relation",
+        ).order_by(KgGraphCorrection.created_at.desc())))
+
+    def merge_relations(self, canonical_id: str, merged_id: str, reason: str, created_by: str):
+        from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
+        return KnowledgeGraphRepository(self.db, self.knowledge_base_id).create_correction(
+            action="merge_relation",
+            target_id=merged_id,
+            payload={"canonical_relation_id": canonical_id},
+            reason=reason,
+            created_by=created_by,
+        )
+
+    def revert_relation_merge(self, merge_id: str, reverted_by: str):
+        from app.models.knowledge_graph import KgGraphCorrection
+        from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
+        record = self.db.scalar(select(KgGraphCorrection).where(
+            KgGraphCorrection.id == merge_id,
+            KgGraphCorrection.knowledge_base_id == self.knowledge_base_id,
+            KgGraphCorrection.action == "merge_relation",
+        ))
+        if record is None:
+            return None
+        return KnowledgeGraphRepository(self.db, self.knowledge_base_id).revert_correction(
+            merge_id, reverted_by
+        )
 
     def list_merges(self) -> list[KgEntityMerge]:
         return list(self.db.scalars(select(KgEntityMerge).where(

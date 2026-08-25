@@ -81,7 +81,12 @@ def _normalize_source(source: str | None) -> str:
     return Path(*parts).as_posix() if parts else p.as_posix()
 
 
-def build_context(docs: list[Document]) -> tuple[str, list[dict]]:
+def build_context(
+    docs: list[Document],
+    *,
+    max_chunks: int | None = None,
+    max_tokens: int | None = None,
+) -> tuple[str, list[dict]]:
     """构建上下文文本和来源列表。
 
     返回 (context_str, sources)。
@@ -89,7 +94,9 @@ def build_context(docs: list[Document]) -> tuple[str, list[dict]]:
     if not docs:
         return "知识库中没有与该问题相关的信息。", []
 
-    token_budget = int(MAX_CONTEXT_TOKENS * CONTEXT_TOKEN_SAFETY_RATIO)
+    token_budget = int(
+        (max_tokens or MAX_CONTEXT_TOKENS) * CONTEXT_TOKEN_SAFETY_RATIO
+    )
 
     # Deduplicate by chunk_id and content_hash
     seen_chunk_ids: set[str] = set()
@@ -120,7 +127,7 @@ def build_context(docs: list[Document]) -> tuple[str, list[dict]]:
         quota_filtered.append(doc)
 
     # Limit total chunks
-    quota_filtered = quota_filtered[:MAX_CONTEXT_CHUNKS]
+    quota_filtered = quota_filtered[:(max_chunks or MAX_CONTEXT_CHUNKS)]
 
     # Build context with citation numbers
     context_parts: list[str] = []

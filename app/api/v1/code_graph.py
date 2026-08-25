@@ -16,9 +16,11 @@ from app.schemas.code_graph import (
     CodeSnapshotOut,
     CodeSubgraphOut,
     CodeSymbolOut,
+    CodeVectorStateOut,
 )
 from app.schemas.document import IndexJobOut
 from app.services.code_index_service import CodeIndexService
+from app.services.code_vector_service import CodeVectorService
 
 router = APIRouter(prefix="/knowledge-bases", tags=["code-graph"])
 
@@ -87,7 +89,35 @@ def search_code_symbols(
     db: Session = Depends(get_db),
 ):
     _require(db, knowledge_base_id, current_user)
-    return CodeGraphRepository(db, knowledge_base_id).search_symbols(query, limit)
+    try:
+        return CodeVectorService(db, knowledge_base_id).hybrid_search(query, limit)
+    except Exception:
+        return CodeGraphRepository(db, knowledge_base_id).search_symbols(query, limit)
+
+
+@router.get("/{knowledge_base_id}/code-graph/vector", response_model=CodeVectorStateOut)
+def code_vector_state(
+    knowledge_base_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require(db, knowledge_base_id, current_user)
+    state = CodeVectorService(db, knowledge_base_id).state()
+    return state or CodeVectorStateOut()
+
+
+@router.post(
+    "/{knowledge_base_id}/code-graph/vector/rebuild",
+    response_model=IndexJobOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def rebuild_code_vectors(
+    knowledge_base_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require(db, knowledge_base_id, current_user, edit=True)
+    return CodeVectorService(db, knowledge_base_id).request_rebuild(current_user.id)
 
 
 @router.get("/{knowledge_base_id}/code-graph/subgraph", response_model=CodeSubgraphOut)

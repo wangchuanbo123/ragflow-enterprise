@@ -6,15 +6,15 @@ Enterprise RAG 是一套可在本地笔记本和企业服务器上运行的多�
 
 ## 当前状态
 
-截至 2026-08-11，计划内的核心功能代码已经完成，本地集中验证已经通过：
+截至 2026-08-25，计划内的核心功能代码已经完成，本地集中验证已经通过：
 
 - 27 个现有文档和 3880 个 Chunk 保持完整，残留 `processing` Chunk 为 0。
-- 数据库已升级到 Alembic `a38c7d9e0f14 (head)`。
-- Python 全量回归为 127 项测试和 2 个 subtests 全部通过。
+- 当前 Alembic 唯一 Head 为 `f6b2c3d4e5a7`；全量内存数据库升级验证通过，已有环境会在下次启动时自动执行迁移。
+- Python 全量回归为 147 项测试和 2 个 subtests 全部通过。
 - Vue TypeScript 检查和 Vite 生产构建通过。
 - Python 使用标准库 AST 提取符号和关系；其他支持语言使用 Tree-sitter 做语法解析与错误恢复检查，当前持久化事实由确定性规则 emitter 提取，并保留降级路径。
 
-当前仍处于企业实机验收前：开发机没有 Docker，因此企业 Compose 只做过静态检查，尚未真实启动 PostgreSQL、Chroma Server、MinIO、Redis/Celery 和企业模型端点；真实 Git/S3 连接器、实体向量全量构建、3880 个 Chunk 的知识图谱重抽取、压力与故障恢复也尚未执行。
+当前仍处于企业实机验收前：开发机没有 Docker，因此企业 Compose 只做过静态检查，尚未真实启动 PostgreSQL、Chroma Server、MinIO、Redis/Celery 和企业模型端点；真实 Git/S3 连接器、实体/关系/代码向量全量构建、3880 个 Chunk 的知识图谱重抽取、压力与故障恢复也尚未执行。
 
 > 当前可直接配置切换的企业图存储是 PostgreSQL 上的 SQLAlchemy 图表。Neo4j 和 pgvector 尚未提供经过验收的 Adapter，不能仅修改连接串启用。
 
@@ -30,22 +30,16 @@ Enterprise RAG 是一套可在本地笔记本和企业服务器上运行的多�
 | 检索路由 | 用户显式选择、规则意图路由、可选 LLM 结构化回退；文本、知识图谱、代码图条件路由和并行检索 |
 | 检索范围 | 按文档、标签、目录和元数据筛选；范围先解析为当前知识库允许的文档 ID，再下推到各检索通道 |
 | 文本检索 | Chroma 向量检索、中文 BM25、多查询召回、加权 RRF、BGE/HTTP/透传重排、上下文 Token 预算和来源配额 |
-| 文档知识图谱 | Schema Registry、实体类型与关系字典、并行抽取、缓存、标准化、Evidence 校验、置信度过滤、质量门禁和分层社区 |
-| 图谱治理 | 文档/实体子图、人工校正与撤销、复核队列、Embedding 合并候选、人工合并/拆分 Overlay、实体语义向量索引 |
-| 代码图谱 | 临时 AST、符号索引、源码行号、版本化快照、contains/imports/calls/extends 关系、调用图/依赖图查询 |
+| 文档知识图谱 | 文档解析完成后自动增量构图、可编辑 Schema Registry、自定义实体/关系字典、Schema 约束 LLM 抽取、缓存、Evidence 校验、置信度过滤、质量门禁和分层社区 |
+| 图谱治理 | 文档/实体子图、实体与关系人工增删改/撤销、复核队列、实体/关系消歧候选、人工合并/拆分 Overlay、实体与关系独立语义向量索引 |
+| 图谱检索 | 实体名称/别名词法召回、实体向量召回、关系谓词/中英文别名词法召回、关系向量召回、关系端点种子与 1～2 跳图遍历、Evidence Chunk 回溯 |
+| 代码图谱 | 临时 AST、文件级增量解析、符号索引、源码行号、版本化快照、contains/imports/calls/extends 关系、调用图/依赖图查询、代码结构/功能摘要双向量与词法/向量 RRF 召回 |
 | Web 工作台 | 知识问答、文档、数据源与成员、索引任务、知识图谱、图谱治理、代码图谱、检索调试和运行状态页面 |
 | 可替换 Provider | 回答/改写/路由/抽取模型、Embedding、Reranker、元数据、向量、图、对象、任务队列和缓存均从业务服务中解耦 |
 
 ## 架构文档
 
-- [Enterprise RAG 完整架构图](EnterpriseRAG完整架构图.md)：从 Web、API、服务、LangGraph、离线任务到本地/企业基础设施的完整视图。
-- [RAG 架构图](RAG架构图.md)：在线问答、混合路由、三路检索和上下文生成的逻辑架构。
-- [RAG 时序图](RAG时序图.md)：同步/SSE 问答、文档索引、图谱构建和连接器/代码索引时序。
-- [完整 PlantUML 源文件](EnterpriseRAG完整架构图.puml)
-- [RAG PlantUML 源文件](RAG架构图.puml)
-- [时序图 PlantUML 源文件](RAG时序图.puml)
-- [改造和新增功能实现方案](改造和新增功能实现方案.md)
-- [RAG 核心业务处理器基础功能与接口清单](RAG核心业务处理器基础功能与接口清单.md)
+- [RAG 端到端架构 PlantUML](RAG架构图.puml)：文档/图谱/代码构建，以及提问、路由、三路检索、召回、融合、重排和生成链路。
 - [项目文档导航](docs/README.md)
 - [代码阅读指南](docs/代码阅读指南.md)
 - [历史实现状态（旧基线）](docs/当前实现状态.md)
@@ -119,7 +113,38 @@ OBJECT_STORE_PROVIDER=local
 TASK_QUEUE_PROVIDER=inline
 CACHE_PROVIDER=memory
 GRAPH_STORE_PROVIDER=sqlite
+GRAPH_AUTO_BUILD_ENABLED=true
 ```
+
+`GRAPH_AUTO_BUILD_ENABLED=true` 是默认值。文档索引任务成功并产生待构图 Chunk 后，系统会去重创建 `graph_rebuild(mode=pending)` 任务；也可以在“图谱治理”页面按知识库关闭或重新开启，不影响手动构建。
+
+关系和代码向量召回默认开启，常用参数如下：
+
+```dotenv
+# 图谱实体召回
+GRAPH_ENTITY_VECTOR_ENABLED=true
+GRAPH_ENTITY_SEARCH_K=5
+
+# 图谱关系召回
+GRAPH_RELATION_VECTOR_ENABLED=true
+GRAPH_RELATION_SEARCH_K=8
+GRAPH_MAX_HOPS=2
+GRAPH_MAX_RELATIONS=50
+
+# 代码 Symbol 召回
+CODE_VECTOR_ENABLED=true
+CODE_SEARCH_K=12
+CODE_VECTOR_SEARCH_K=12
+CODE_VECTOR_MAX_CHARS=6000
+CODE_FUNCTION_VECTOR_ENABLED=true
+CODE_FUNCTION_SUMMARY_LLM_ENABLED=true
+CODE_FUNCTION_SUMMARY_BATCH_SIZE=8
+CODE_FUNCTION_SUMMARY_MAX_SOURCE_CHARS=3000
+CODE_FUNCTION_SUMMARY_MAX_CHARS=800
+CODE_FUNCTION_SUMMARY_RELATION_LIMIT=12
+```
+
+文档、实体、关系和代码 Symbol 分别使用独立的版本化 Chroma Collection，切换新索引状态后才清理旧 Collection。向量服务异常时，在线检索会降级到仍可用的词法召回和图遍历，不会使整个问答请求失败。
 
 ### 4. 准备本地模型
 
@@ -147,6 +172,32 @@ LLM_BASE_URL=https://model-gateway.example/v1
 LLM_API_KEY=your-api-key
 ```
 
+如果网关提供 Anthropic Messages `POST /v1/messages` 协议：
+
+```dotenv
+LLM_PROVIDER=anthropic_compatible
+LLM_MODEL=your-model
+LLM_BASE_URL=https://model-gateway.example/v1/messages
+LLM_API_KEY=your-api-key
+```
+
+远程 Embedding 与 Reranker 可独立配置：
+
+```dotenv
+EMBEDDING_PROVIDER=openai_compatible
+EMBEDDING_MODEL=your-embedding-model
+EMBEDDING_BASE_URL=https://embedding-gateway.example/v1
+EMBEDDING_API_KEY=your-api-key
+
+RERANKER_PROVIDER=http
+RERANKER_MODEL=your-reranker-model
+RERANKER_BASE_URL=https://reranker-gateway.example/v1
+RERANKER_API_KEY=your-api-key
+```
+
+`RERANKER_PROVIDER=bge` 表示由应用进程使用 Sentence Transformers 加载本地
+CrossEncoder，并不是从 Ollama 获取；`http` 才表示调用远程 `/v1/rerank`。
+
 `ANSWER_LLM_*`、`REWRITE_LLM_*`、`ROUTER_LLM_*` 和 `GRAPH_EXTRACTION_*` 可以分别覆盖默认 `LLM_*`。本地 Profile 在远程 LLM 配置缺失时允许回退 Ollama；enterprise Profile 会直接启动失败，防止静默切换模型。
 
 ### 5. 启动后端
@@ -162,6 +213,12 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 2. 创建初始管理员和默认知识库。
 3. 恢复租约已过期的持久化任务。
 4. 按 local Profile 启动进程内 Worker 和连接器 Scheduler。
+
+也可以在启动前手工升级数据库：
+
+```powershell
+.\venv\Scripts\python.exe -m alembic upgrade head
+```
 
 常用地址：
 
@@ -238,20 +295,56 @@ python -m scripts.ingest_documents --list-collections
 python -m scripts.ingest_documents --rollback-collection <collection_name> --yes
 python -m scripts.ingest_documents --cleanup-collection <collection_name> --yes
 
-# 图谱增量构建或失败重试
+# 图谱默认在文档解析完成后自动增量构建；以下命令用于手动构建或失败重试
 python -m scripts.ingest_documents --graph-only
 python -m scripts.ingest_documents --retry-failed
 ```
 
 多知识库、批量任务、连接器、代码图和图谱治理应优先使用 Web 或 `/api/v1/knowledge-bases/{knowledge_base_id}/...` API。
 
+## 端到端 RAG 架构
+
+系统将离线构建和在线问答分开，文档、图谱和代码使用独立的逻辑存储与向量索引：
+
+```text
+离线构建
+  文档 → 解析 → Chunk → 文档库 ─┬→ 文档向量索引
+                                 ├→ BM25 索引
+                                 └→ 自动构图任务 → 活动 Schema 约束 LLM 抽取
+                                                   → 消歧候选/人工合并 → 图谱库 ─┬→ 实体向量索引
+                                                            └→ 关系向量索引
+
+  代码 → 文件哈希差异分类 → 仅解析新增/修改文件 → 复用未变化 Symbol/Relation
+       → 全局关系重解析 → 原子切换代码快照 → 功能摘要生成/复用
+       → 增量更新代码结构向量 + 功能摘要向量
+
+在线问答
+  提问 → 权限与限制层 → 检索路由 → 按置信度/多轮状态决定是否 Query Rewrite
+       → 生成一次共享问题向量
+       → [文档通道 | 图谱通道 | 代码通道] 条件并行
+       → 通道内召回融合 → 跨通道融合 → Rerank
+       → Context Token Budget → LLM 生成 → 引用与答案校验
+```
+
+三条业务检索通道下面可以包含多种底层召回方式：
+
+| 业务通道 | 底层召回 | 通道内处理 |
+| --- | --- | --- |
+| 文档通道 | Chroma 向量、BM25、多查询召回 | 共享问题向量、加权 RRF、范围过滤、Chunk 去重 |
+| 图谱通道 | 实体词法、实体向量、关系词法、关系向量、图遍历 | 合并实体/关系种子，将关系作为 0 跳种子，以端点扩展 1～2 跳并回溯 Evidence Chunk |
+| 代码通道 | Symbol 名称/限定名/签名词法召回、代码结构向量、功能摘要向量 | 多向量按 Symbol 去重融合，再与词法结果 RRF 融合并扩展调用与依赖关系 |
+
+当前代码图谱与文档知识保持独立：没有建立 `Code Symbol → Document Chunk` 显式关联，也不会进行代码—文本跨索引扩展。该能力留待后续单独设计和验收。
+
 ## 统一 LangGraph 问答
 
 所有问答入口共享同一份编译后的工作流：
 
 ```text
-rewrite
-  → route_request
+route_request
+  → rewrite（仅低路由置信度或多轮问题）
+  → route_after_rewrite（改写成功后仅用规则复核意图）
+  → embed_query（只生成一次并供全部向量索引复用）
   → [text_retrieve | graph_retrieve | code_retrieve]  条件并行
   → fuse
   → rerank
@@ -260,9 +353,12 @@ rewrite
 ```
 
 - `route_request` 支持显式通道、规则优先和可选 LLM 回退，并解析文档、标签、目录、元数据范围。
+- `retrieval.strategy` 支持 `fast`、`standard`、`deep`；三档分别控制召回数量、图遍历深度、代码候选、重排数量以及上下文预算，默认 `standard`。
+- `rewrite` 仅在路由置信度低于 `QUERY_REWRITE_CONFIDENCE_THRESHOLD`（默认 `0.75`）或存在历史消息时调用 LLM；首轮高置信度问题不会增加改写模型调用。
+- `embed_query` 对最终语义查询只生成一次向量，文档、实体、关系和代码向量索引统一使用 `similarity_search_by_vector`，词法检索仍可同时利用原始问题和改写问题。
 - `text_retrieve` 在 Chroma 向量与 SQLite BM25 之间执行多查询加权 RRF。
-- `graph_retrieve` 使用词法实体和实体向量匹配，遍历关系并回链 Evidence Chunk。
-- `code_retrieve` 搜索活动代码快照中的符号、源码片段和调用/依赖关系。
+- `graph_retrieve` 并行执行实体词法/向量召回和关系词法/向量召回；关系候选直接作为 0 跳事实，随后从实体与关系端点继续遍历并回链 Evidence Chunk。
+- `code_retrieve` 对活动代码快照执行 Symbol 词法/向量 RRF 召回，再补充源码片段及 calls/imports/extends 等调用和依赖事实。
 - 三个通道互不写同一个状态字段；单通道失败会记录状态并允许其余通道继续。
 - `fuse` 再次按权重融合并按 `chunk_id` 去重，之后进行重排、来源配额和 Token 预算控制。
 - 同步请求由 LangGraph 完成生成；SSE 使用同一个 Graph 准备上下文，再从同一个 Runtime 流式调用回答模型。
@@ -280,16 +376,36 @@ rewrite
 | `.../{kb_id}/documents/*` | 上传、批量上传、详情、标签、Chunk、版本、恢复和批量操作 |
 | `.../{kb_id}/sources/*` | 数据源创建、检查、同步、启停和删除 |
 | `.../{kb_id}/index-jobs/*` | 任务、事件、取消和失败项重试 |
-| `.../{kb_id}/knowledge-graph/*` | 实体、子图、Schema、构建、质量、复核、合并、社区和实体向量 |
+| `.../{kb_id}/knowledge-graph/*` | 自动构图设置、实体、子图、Schema 编辑/激活、构建、质量、人工校正、实体/关系消歧合并、社区以及实体/关系向量状态与重建 |
 | `.../{kb_id}/documents/{document_id}/subgraph` | 按文档获取知识子图 |
-| `.../{kb_id}/code-graph/*` | 代码快照、索引、符号搜索和调用/依赖子图 |
+| `.../{kb_id}/code-graph/*` | 代码快照、索引、词法/向量符号搜索、调用/依赖子图以及代码向量状态与重建 |
 | `/api/v1/health`、`/api/v1/ready` | 存活和 Provider/模型/索引就绪状态 |
 
 ## 知识图谱和代码图谱
 
-文档图谱构建会读取当前活动 Schema，恢复异常中断状态，以 Chunk 为输入并行调用抽取模型。候选必须通过实体/关系字典、原文 Evidence、置信度、自环和端点校验，之后才会标准化、去重并写入逻辑图表。抽取缓存、质量报告、人工复核、可逆 Overlay、社区层级和实体向量均按知识库隔离。
+文档索引任务成功后会按知识库设置自动创建去重的增量构图任务。构建读取当前活动 Schema，把自定义实体类型、关系字典和领域抽取规则写入 LLM Prompt，并再次使用相同 Schema 校验模型输出。候选还必须通过原文 Evidence、置信度、自环和端点校验，之后才会标准化、去重并写入逻辑图表。
 
-代码索引不会永久保存完整 AST。Python 使用 `ast`，其他支持语言优先使用 Tree-sitter；解析结果转换为文件、符号和关系，完成跨文件名称解析后才激活新快照。旧快照按配置保留，用于查看历史和安全切换。
+Web“图谱治理”页面可以查看完整 Schema 内容，创建或修改草稿、复制活动版本并激活；也可以搜索实体加载两跳子图，修改实体名称/描述，新增、修改或隐藏关系。实体向量和实体合并结果会产生消歧候选；实体合并后落到同一三元组的关系会产生关系合并候选。人工实体合并、关系合并和图谱校正均保留审计记录，可以拆分或回退；被合并关系的 Evidence 会汇聚到保留关系。
+
+关系词法召回使用标准谓词及其中英文别名识别问题中的关系意图；关系向量文档包含主语、谓词、宾语、关系描述和最多三条原文证据。词法与向量关系候选合并后直接作为 0 跳关系事实，同时把主客体加入图遍历种子，最终通过 `kg_relation_evidence` 回溯到可引用的文档 Chunk。
+
+代码索引不会永久保存完整 AST。Python 使用 `ast`，其他支持语言优先使用 Tree-sitter；解析结果转换为文件、符号和关系。同步时按相对路径和 SHA-256 对新旧代码清单分类：新增或修改文件重新解析，未变化文件直接复用上一快照的持久化文件、Symbol 和 Relation 事实，删除文件不进入新快照；随后对全部关系端点重新解析并原子激活新快照。Parser 版本变化或数据源变化时自动退化为全量解析。
+
+每个 Symbol 默认生成两类向量：结构向量包含语言、路径、类型、限定名、签名和源码片段；功能摘要向量包含由抽取模型根据源码与调用关系生成的中文业务功能摘要。摘要连同来源指纹、模型指纹和生成方式保存在 Symbol metadata 中；未变化摘要直接跨快照复用，只对源码、关系或摘要模型发生变化的 Symbol 重新生成。模型不可用或输出无效时使用确定性摘要降级，并在后续构建中允许重试模型摘要。
+
+两类向量都使用由 `vector_kind + stable_key` 派生的稳定向量 ID。新快照激活后，仅删除已消失 Symbol 的向量、重算内容变化的向量，并保留未变化向量；Embedding 配置变化、旧索引格式或增量基线不可用时自动执行影子全量重建。检索时结构与功能摘要命中先按 Symbol 去重融合，并返回 `vector_match_types` 解释命中类型。Git/本地目录连接器同步代码图后会自动刷新代码向量，旧快照仍按配置保留，用于查看历史和安全切换。
+
+功能摘要默认复用 `extraction_llm`。如果企业代码不允许发送到配置的模型端点，可设置 `CODE_FUNCTION_SUMMARY_LLM_ENABLED=false`；系统仍会用 Symbol、签名和调用关系生成确定性摘要向量，但业务语义表达能力会弱于模型摘要。
+
+图谱构建任务默认同时重建实体和关系向量；代码索引任务和启用代码索引的 Git/本地目录同步默认增量刷新活动 Snapshot 的代码向量。也可以独立查询或触发重建：
+
+```text
+GET  /api/v1/knowledge-bases/{kb_id}/knowledge-graph/relation-vector
+POST /api/v1/knowledge-bases/{kb_id}/knowledge-graph/relation-vector/rebuild
+
+GET  /api/v1/knowledge-bases/{kb_id}/code-graph/vector
+POST /api/v1/knowledge-bases/{kb_id}/code-graph/vector/rebuild
+```
 
 ## 企业服务器部署
 
@@ -385,9 +501,10 @@ python -m scripts.evaluate_model_routing --cases eval/routing_model_cases.exampl
 ## 已知边界
 
 - 尚未完成真实企业 Compose 启动和横向扩缩容验收。
-- 尚未完成真实 Git/S3/MinIO 凭据联调和全量图谱/实体向量构建。
+- 尚未完成真实 Git/S3/MinIO 凭据联调以及生产语料的全量图谱、实体向量、关系向量和代码向量构建。
 - Neo4j、pgvector 和其他厂商数据库需要新增 Adapter 与统一契约测试。
 - 静态代码分析不保证解析动态调用、反射、宏或运行时注入；不确定边会保留解析状态。
+- 当前没有建立代码 Symbol 与文档 Chunk 的显式关联；代码检索结果和文档检索结果只在跨通道融合阶段共同参与排序，不进行跨库关系扩展。
 - 当前不提供本地历史文档、向量、图谱、会话和任务向企业服务器的搬迁。
 - Metrics、Tracing、集中告警、容量规划和生产灾难演练仍属于企业运维收尾。
 - Redis 目前负责共享缓存和失效消息发布，但 API 端尚未实现订阅消费；分布式 Worker 激活新的代码快照后，API 进程需要通过后续索引签名变化或重启才能确保立即加载新的 Code Retriever。

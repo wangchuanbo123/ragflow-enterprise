@@ -13,6 +13,7 @@ class RAGState(TypedDict, total=False):
     original_query: str
     retrieval_query: str
     retrieval_queries: List[str]
+    query_embedding: List[float] | None
     retrieval_candidates: List[Document]
     query: str
     history: List[dict]
@@ -23,6 +24,7 @@ class RAGState(TypedDict, total=False):
     sources: List[dict]
     timings: dict[str, float]
     retrieval_options: dict
+    retrieval_strategy: str
     route: dict
     allowed_document_ids: set[str] | None
     text_docs: List[Document]

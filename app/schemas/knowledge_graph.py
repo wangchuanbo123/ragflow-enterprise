@@ -85,6 +85,7 @@ class GraphCorrectionCreate(BaseModel):
         "hide_relation",
         "update_relation",
         "update_entity",
+        "merge_relation",
     ]
     target_id: str | None = None
     payload: dict = Field(default_factory=dict)
@@ -99,6 +100,10 @@ class GraphCorrectionCreate(BaseModel):
                 raise ValueError(f"新增关系缺少字段：{', '.join(sorted(missing))}")
         elif not self.target_id:
             raise ValueError("该校正操作必须提供 target_id")
+        if self.action == "merge_relation" and not self.payload.get(
+            "canonical_relation_id"
+        ):
+            raise ValueError("关系合并必须提供 canonical_relation_id")
         if self.action == "update_relation" and not {
             "predicate", "confidence", "description"
         }.intersection(self.payload):

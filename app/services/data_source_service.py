@@ -130,6 +130,7 @@ class DataSourceService:
                         result["code_graph"] = CodeIndexService(
                             self.db, self.knowledge_base_id
                         ).index_directory(root, data_source_id=source.id, revision=revision)
+                        self._refresh_code_vectors(result)
                     return self._complete(source, result, {"revision": revision})
             elif source.source_type == "s3":
                 files, rejected, cursor = self._collect_s3(source)
@@ -143,6 +144,7 @@ class DataSourceService:
                 result["code_graph"] = CodeIndexService(
                     self.db, self.knowledge_base_id
                 ).index_directory(code_root, data_source_id=source.id)
+                self._refresh_code_vectors(result)
             return self._complete(source, result, cursor)
         except Exception as exc:
             self._fail(source, str(exc))
@@ -185,6 +187,17 @@ class DataSourceService:
             source.next_sync_at = _utcnow() + timedelta(minutes=source.sync_interval_minutes)
         self.db.commit()
         return result
+
+    def _refresh_code_vectors(self, result: dict) -> None:
+        from app.core.config import CODE_VECTOR_ENABLED
+
+        if not CODE_VECTOR_ENABLED:
+            return
+        from app.services.code_vector_service import CodeVectorService
+
+        result["code_vectors"] = CodeVectorService(
+            self.db, self.knowledge_base_id
+        ).rebuild()
 
     def _fail(self, source, detail: str) -> dict:
         source.last_sync_status = "failed"

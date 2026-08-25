@@ -256,6 +256,13 @@ def _process_job(
                             result = service.index_directory(root, data_source_id=source.id, revision=revision)
                     else:
                         raise ValueError("代码索引仅支持本地目录和 Git 数据源")
+                    from app.core.config import CODE_VECTOR_ENABLED
+                    if CODE_VECTOR_ENABLED:
+                        from app.services.code_vector_service import CodeVectorService
+
+                        result["code_vectors"] = CodeVectorService(
+                            db, job.knowledge_base_id, container=container
+                        ).rebuild()
                     job_repo.update(
                         job, status="completed", total_items=1, processed_items=1,
                         succeeded_items=1, failed_items=0,
@@ -270,10 +277,31 @@ def _process_job(
                         job, status="completed", total_items=1, processed_items=1,
                         succeeded_items=1, failed_items=0,
                     )
+                elif job.job_type == "relation_vector_rebuild":
+                    from app.services.relation_vector_service import RelationVectorService
+
+                    result = RelationVectorService(
+                        db, job.knowledge_base_id, container=container
+                    ).rebuild()
+                    job_repo.update(
+                        job, status="completed", total_items=1, processed_items=1,
+                        succeeded_items=1, failed_items=0,
+                    )
+                elif job.job_type == "code_vector_rebuild":
+                    from app.services.code_vector_service import CodeVectorService
+
+                    result = CodeVectorService(
+                        db, job.knowledge_base_id, container=container
+                    ).rebuild()
+                    job_repo.update(
+                        job, status="completed", total_items=1, processed_items=1,
+                        succeeded_items=1, failed_items=0,
+                    )
                 elif job.job_type == "graph_rebuild":
                     from app.services.entity_vector_service import EntityVectorService
                     from app.services.graph_governance_service import GraphGovernanceService
                     from app.services.knowledge_graph_service import GraphBuildService
+                    from app.services.relation_vector_service import RelationVectorService
 
                     options = job.options_json or {}
                     mode = options.get("mode", "pending")
@@ -293,6 +321,23 @@ def _process_job(
                         result["entity_vectors"] = EntityVectorService(
                             db, job.knowledge_base_id, container=container
                         ).rebuild()
+                    if options.get("rebuild_relation_vectors", True):
+                        result["relation_vectors"] = RelationVectorService(
+                            db, job.knowledge_base_id, container=container
+                        ).rebuild()
+                    try:
+                        result["entity_disambiguation"] = (
+                            governance.scan_semantic_merge_candidates()
+                        )
+                        result["relation_disambiguation"] = (
+                            governance.scan_relation_merge_candidates()
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Graph disambiguation candidate scan failed for %s: %s",
+                            job.knowledge_base_id,
+                            exc,
+                        )
                     failed = int(result.get("failed", 0))
                     job_repo.update(
                         job,
@@ -305,6 +350,24 @@ def _process_job(
                     )
                 else:
                     raise ValueError(f"Unsupported index job type: {job.job_type}")
+
+                if job.job_type in {"sync", "rebuild", "file"}:
+                    completed_document_job = job_repo.get(job_id)
+                    if (
+                        completed_document_job is not None
+                        and completed_document_job.status in {"completed", "partial"}
+                        and completed_document_job.succeeded_items > 0
+                    ):
+                        from app.services.graph_governance_service import GraphGovernanceService
+
+                        GraphGovernanceService(
+                            db,
+                            job.knowledge_base_id,
+                            task_queue=container.task_queue,
+                        ).request_automatic_build(
+                            job.requested_by,
+                            source_job_id=job.id,
+                        )
 
             from app.services.rag_service import invalidate_rag_caches
 

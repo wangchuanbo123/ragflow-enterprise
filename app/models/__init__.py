@@ -8,7 +8,9 @@ from app.models.code_graph import (
     CodeRelation,
     CodeSnapshot,
     CodeSymbol,
+    CodeVectorIndexState,
     EntityVectorIndexState,
+    RelationVectorIndexState,
 )
 from app.models.conversation import Conversation
 from app.models.document_management import (
@@ -51,7 +53,9 @@ __all__ = [
     "CodeFile",
     "CodeSymbol",
     "CodeRelation",
+    "CodeVectorIndexState",
     "EntityVectorIndexState",
+    "RelationVectorIndexState",
     "User",
     "Conversation",
     "Message",

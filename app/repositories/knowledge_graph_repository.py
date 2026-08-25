@@ -112,6 +112,25 @@ class KnowledgeGraphRepository:
             .order_by(KgGraphCorrection.created_at.desc())
         ))
 
+    def list_relation_evidence(
+        self, relation_ids: list[str] | None = None
+    ) -> list[KgRelationEvidence]:
+        statement = select(KgRelationEvidence).where(
+            KgRelationEvidence.knowledge_base_id == self.knowledge_base_id
+        )
+        if relation_ids is not None:
+            if not relation_ids:
+                return []
+            statement = statement.where(
+                KgRelationEvidence.relation_id.in_(relation_ids)
+            )
+        return list(self.db.scalars(
+            statement.order_by(
+                KgRelationEvidence.relation_id,
+                KgRelationEvidence.id,
+            )
+        ))
+
     def create_correction(
         self,
         *,
@@ -121,7 +140,21 @@ class KnowledgeGraphRepository:
         reason: str,
         created_by: str,
     ) -> KgGraphCorrection:
+        from app.models.graph_governance import GraphSchemaDefinition
         from rag.knowledge_graph.schemas import VALID_PREDICATES
+
+        if action not in {
+            "add_relation", "hide_relation", "update_relation",
+            "update_entity", "merge_relation",
+        }:
+            raise ValueError("不支持的图谱校正操作")
+        active_schema = self.db.scalar(select(GraphSchemaDefinition).where(
+            GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+            GraphSchemaDefinition.status == "active",
+        ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
+        allowed_predicates = set(
+            active_schema.relation_types_json if active_schema else VALID_PREDICATES
+        )
 
         target_type = "entity" if action == "update_entity" else "relation"
         if action == "add_relation":
@@ -131,7 +164,7 @@ class KnowledgeGraphRepository:
                 raise ValueError("关系两端不能是同一个实体")
             if self.get_entity(subject_id) is None or self.get_entity(object_id) is None:
                 raise ValueError("关系实体不存在或不属于当前知识库")
-            if payload.get("predicate") not in VALID_PREDICATES:
+            if payload.get("predicate") not in allowed_predicates:
                 raise ValueError("关系类型不在关系字典中")
             confidence = float(payload.get("confidence", 1.0))
             if not 0 <= confidence <= 1:
@@ -146,7 +179,7 @@ class KnowledgeGraphRepository:
             )
             if relation is None:
                 raise ValueError("关系不存在或不属于当前知识库")
-            if payload.get("predicate") and payload["predicate"] not in VALID_PREDICATES:
+            if payload.get("predicate") and payload["predicate"] not in allowed_predicates:
                 raise ValueError("关系类型不在关系字典中")
             if "confidence" in payload and not 0 <= float(payload["confidence"]) <= 1:
                 raise ValueError("置信度必须在 0 到 1 之间")
@@ -155,6 +188,32 @@ class KnowledgeGraphRepository:
                 raise ValueError("实体不存在或不属于当前知识库")
             if not str(payload.get("canonical_name", "")).strip() and "canonical_name" in payload:
                 raise ValueError("实体标准名称不能为空")
+        elif action == "merge_relation":
+            canonical_id = str(payload.get("canonical_relation_id", ""))
+            if not canonical_id or canonical_id == target_id:
+                raise ValueError("合并关系必须不同")
+            relation_ids = list(self.db.scalars(select(KgRelation.id).where(
+                KgRelation.knowledge_base_id == self.knowledge_base_id,
+                KgRelation.id.in_([canonical_id, target_id]),
+            )))
+            if len(relation_ids) != 2:
+                raise ValueError("合并关系不存在或不属于当前知识库")
+            existing_merge = self.db.scalar(select(KgGraphCorrection.id).where(
+                KgGraphCorrection.knowledge_base_id == self.knowledge_base_id,
+                KgGraphCorrection.action == "merge_relation",
+                KgGraphCorrection.target_id == target_id,
+                KgGraphCorrection.status == "active",
+            ))
+            if existing_merge:
+                raise ValueError("该关系已经被合并")
+            reverse = self.db.scalar(select(KgGraphCorrection.id).where(
+                KgGraphCorrection.knowledge_base_id == self.knowledge_base_id,
+                KgGraphCorrection.action == "merge_relation",
+                KgGraphCorrection.target_id == canonical_id,
+                KgGraphCorrection.status == "active",
+            ))
+            if reverse:
+                raise ValueError("关系合并会形成循环")
 
         correction = KgGraphCorrection(
             knowledge_base_id=self.knowledge_base_id,
@@ -247,6 +306,16 @@ class KnowledgeGraphRepository:
                 )
             )
             return None if relation_exists else "机器生成的目标关系已不存在"
+        if correction.action == "merge_relation":
+            merged_exists = self.db.scalar(select(KgRelation.id).where(
+                KgRelation.id == correction.target_id,
+                KgRelation.knowledge_base_id == self.knowledge_base_id,
+            ))
+            canonical_exists = self.db.scalar(select(KgRelation.id).where(
+                KgRelation.id == (correction.payload_json or {}).get("canonical_relation_id"),
+                KgRelation.knowledge_base_id == self.knowledge_base_id,
+            ))
+            return None if merged_exists and canonical_exists else "关系合并引用的关系已不存在"
         if correction.action == "update_entity":
             return (
                 None

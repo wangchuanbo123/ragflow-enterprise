@@ -7,6 +7,7 @@ Query Rewrite Node
 
 import logging
 
+from app.core.config import QUERY_REWRITE_CONFIDENCE_THRESHOLD
 from rag.prompts.prompt_loader import load_prompt
 from rag.providers.interfaces import LLMProvider
 from rag.utils.history import format_history
@@ -33,23 +34,41 @@ def _normalize(text: str) -> str:
 def create_rewrite_node(llm: LLMProvider):
     def rewrite_node(state):
         original = state.get("original_query") or state.get("query", "")
-        prompt = _build_prompt(state, PROMPT)
-
         retrieval_queries = [original]
         rewritten = ""
+        history = state.get("history") or []
+        route = dict(state.get("route") or {})
+        confidence = float(route.get("confidence", 1.0))
+        is_multi_turn = bool(history)
+        is_low_confidence = confidence < QUERY_REWRITE_CONFIDENCE_THRESHOLD
+        should_rewrite = is_multi_turn or is_low_confidence
+        reason = "not_needed"
 
-        try:
-            rewritten = llm.generate(prompt).strip()
-        except Exception as exc:
-            logger.warning("Query rewrite failed, using original only: %s", exc)
+        if should_rewrite:
+            reason = "multi_turn" if is_multi_turn else "low_route_confidence"
+            prompt = _build_prompt(state, PROMPT)
+            try:
+                rewritten = llm.generate(prompt).strip()
+            except Exception as exc:
+                reason = "failed"
+                logger.warning("Query rewrite failed, using original only: %s", exc)
 
-        if rewritten and _normalize(rewritten) != _normalize(original):
+        rewrite_changed = bool(
+            rewritten and _normalize(rewritten) != _normalize(original)
+        )
+        if rewrite_changed:
             retrieval_queries = [original, rewritten]
 
+        route["rewrite"] = {
+            "applied": rewrite_changed,
+            "requested": should_rewrite,
+            "reason": reason,
+        }
         return {
             "original_query": original,
             "retrieval_query": rewritten or original,
             "retrieval_queries": retrieval_queries,
+            "route": route,
         }
 
     return rewrite_node

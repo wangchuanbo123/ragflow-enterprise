@@ -15,11 +15,13 @@ from app.core.config import (
     GRAPH_ENTITY_SEARCH_K,
     GRAPH_MAX_HOPS,
     GRAPH_MAX_RELATIONS,
+    GRAPH_RELATION_SEARCH_K,
     KNOWLEDGE_GRAPH_ENABLED,
 )
 from app.core.database import SessionLocal
 from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 from rag.knowledge_graph.normalizer import normalize_name
+from rag.retrieval_strategy import get_retrieval_policy
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +29,8 @@ logger = logging.getLogger(__name__)
 class KnowledgeGraphRetriever:
     """知识图谱检索器。
 
-    1. 种子实体匹配（精确/包含）
-    2. 最多二跳图遍历
+    1. 实体词法/向量匹配与关系词法/向量匹配
+    2. 以实体和关系端点为种子进行最多二跳图遍历
     3. 映射回原始 chunk
     """
 
@@ -58,23 +60,57 @@ class KnowledgeGraphRetriever:
             logger.warning("Graph retrieval failed: %s", exc)
             return []
 
-    def _retrieve(self, query: str, top_k: int) -> list[Document]:
+    def retrieve_with_options(
+        self,
+        queries: list[str],
+        *,
+        query_embedding: list[float] | None = None,
+        strategy: str = "standard",
+        allowed_document_ids: set[str] | None = None,
+    ) -> list[Document]:
+        policy = get_retrieval_policy(strategy)
+        query = " ".join(dict.fromkeys(queries))
+        docs = self._retrieve(
+            query,
+            policy.graph_top_k,
+            query_embedding=query_embedding,
+            strategy=strategy,
+        )
+        if allowed_document_ids is None:
+            return docs
+        return [
+            doc for doc in docs
+            if doc.metadata.get("document_id") in allowed_document_ids
+        ]
+
+    def _retrieve(
+        self,
+        query: str,
+        top_k: int,
+        *,
+        query_embedding: list[float] | None = None,
+        strategy: str = "standard",
+    ) -> list[Document]:
         from app.bootstrap.container import get_provider_container
+
+        policy = get_retrieval_policy(strategy)
 
         store = get_provider_container().graph_store(
             self.db,
             self.knowledge_base_id,
         )
 
-        # Step 1: seed entity matching
-        entities = store.search_entities(query, limit=GRAPH_ENTITY_SEARCH_K)
+        # Step 1: entity seeds from lexical and semantic matching.
+        entities = store.search_entities(query, limit=policy.graph_entity_k)
         try:
             from app.core.config import GRAPH_ENTITY_VECTOR_ENABLED
             from app.services.entity_vector_service import EntityVectorService
 
             semantic = (
                 EntityVectorService(self.db, self.knowledge_base_id).semantic_search(
-                    query, GRAPH_ENTITY_SEARCH_K
+                    query,
+                    policy.graph_entity_k,
+                    query_embedding=query_embedding,
                 )
                 if GRAPH_ENTITY_VECTOR_ENABLED else []
             )
@@ -106,51 +142,138 @@ class KnowledgeGraphRetriever:
                         }
             entities = sorted(
                 by_id.values(), key=lambda item: float(item.get("match_score", 0)), reverse=True
-            )[:GRAPH_ENTITY_SEARCH_K]
+            )[:policy.graph_entity_k]
         except Exception as exc:
             logger.debug("Semantic entity retrieval unavailable: %s", exc)
-        if not entities:
+
+        # Step 2: relation seeds from predicate lexical and semantic matching.
+        relation_seeds = store.search_relations(
+            query, limit=policy.graph_relation_k
+        )
+        for relation in relation_seeds:
+            relation["match_methods"] = [
+                relation.get("match_method", "relation_lexical")
+            ]
+        try:
+            from app.core.config import GRAPH_RELATION_VECTOR_ENABLED
+            from app.services.relation_vector_service import RelationVectorService
+
+            semantic_relations = (
+                RelationVectorService(
+                    self.db, self.knowledge_base_id
+                ).semantic_search(
+                    query,
+                    policy.graph_relation_k,
+                    query_embedding=query_embedding,
+                )
+                if GRAPH_RELATION_VECTOR_ENABLED else []
+            )
+            semantic_scores = {
+                item["relation_id"]: float(item.get("match_score", 0))
+                for item in semantic_relations
+                if item.get("relation_id")
+            }
+            hydrated = store.get_relations(list(semantic_scores))
+            by_id = {item["relation_id"]: item for item in relation_seeds}
+            for item in hydrated:
+                relation_id = item["relation_id"]
+                score = semantic_scores.get(relation_id, 0.0)
+                if relation_id in by_id:
+                    by_id[relation_id]["match_score"] = max(
+                        float(by_id[relation_id].get("match_score", 0)), score
+                    )
+                    methods = set(by_id[relation_id].get("match_methods", []))
+                    methods.add("relation_vector")
+                    by_id[relation_id]["match_methods"] = sorted(methods)
+                else:
+                    by_id[relation_id] = {
+                        **item,
+                        "match_score": score,
+                        "match_methods": ["relation_vector"],
+                    }
+            relation_seeds = sorted(
+                by_id.values(),
+                key=lambda item: float(item.get("match_score", 0)),
+                reverse=True,
+            )[:policy.graph_relation_k]
+        except Exception as exc:
+            logger.debug("Semantic relation retrieval unavailable: %s", exc)
+
+        if not entities and not relation_seeds:
             return []
 
-        entity_ids = [e["id"] for e in entities]
-        seed_scores = {}
+        seed_scores: dict[str, float] = {}
         for i, ent in enumerate(entities):
             seed_scores[ent["id"]] = ent.get("match_score", 1.0 / (i + 1))
 
-        # Step 2: graph traversal
-        relations = store.get_neighbors(entity_ids, GRAPH_MAX_HOPS, GRAPH_MAX_RELATIONS)
+        relation_seed_scores: dict[str, float] = {}
+        entity_ids = [entity["id"] for entity in entities]
+        for index, relation in enumerate(relation_seeds):
+            score = max(
+                0.0,
+                float(relation.get("match_score", 1.0 / (index + 1))),
+            )
+            relation_seed_scores[relation["relation_id"]] = score
+            for entity_id in (relation["subject_id"], relation["object_id"]):
+                seed_scores[entity_id] = max(seed_scores.get(entity_id, 0.0), score)
+                entity_ids.append(entity_id)
+        entity_ids = list(dict.fromkeys(entity_ids))
+
+        # Step 3: traverse from both entity matches and relation endpoints.
+        traversed = store.get_neighbors(
+            entity_ids, policy.graph_max_hops, policy.graph_max_relations
+        )
+        relations_by_id = {
+            relation["relation_id"]: {**relation, "hop": 0}
+            for relation in relation_seeds
+        }
+        for relation in traversed:
+            relations_by_id.setdefault(relation["relation_id"], relation)
+        relations = list(relations_by_id.values())[:policy.graph_max_relations]
         if not relations:
             return []
 
-        # Step 3: map back to chunks via evidence
+        # Step 4: map relations back to source chunks via evidence.
         relation_ids = [r["relation_id"] for r in relations]
         evidence = store.get_relation_evidence(relation_ids)
 
         # Build chunk -> graph_facts mapping
         chunk_facts: dict[str, list[str]] = {}
         chunk_scores: dict[str, float] = {}
+        chunk_match_methods: dict[str, set[str]] = {}
 
         for ev in evidence:
             cid = ev["chunk_id"]
             if cid not in chunk_facts:
                 chunk_facts[cid] = []
+                chunk_match_methods[cid] = set()
 
             rel = next((r for r in relations if r["relation_id"] == ev["relation_id"]), None)
             if rel:
                 fact = f"{rel['subject_name']} --{rel['predicate']}--> {rel['object_name']}"
                 if fact not in chunk_facts[cid]:
                     chunk_facts[cid].append(fact)
+                chunk_match_methods[cid].update(
+                    rel.get("match_methods", ["graph_traversal"])
+                )
 
-                # Score: seed_score * decay^hop * confidence
-                hop = rel["hop"]
-                subj_score = seed_scores.get(rel["subject_id"], 0.5)
-                graph_score = subj_score * math.pow(0.75, hop) * rel["confidence"]
+                hop = int(rel["hop"])
+                direct_score = relation_seed_scores.get(rel["relation_id"])
+                endpoint_score = max(
+                    seed_scores.get(rel["subject_id"], 0.0),
+                    seed_scores.get(rel["object_id"], 0.0),
+                    0.5,
+                )
+                graph_score = (
+                    direct_score if direct_score is not None
+                    else endpoint_score * math.pow(0.75, hop)
+                ) * rel["confidence"]
                 chunk_scores[cid] = max(chunk_scores.get(cid, 0), graph_score)
 
         if not chunk_facts:
             return []
 
-        # Step 4: load chunks from SQLite
+        # Step 5: load chunks from SQLite.
         from app.models.knowledge_chunk import KnowledgeChunk
         from sqlalchemy import select
 
@@ -189,6 +312,7 @@ class KnowledgeGraphRetriever:
                     "content_hash": chunk.content_hash,
                     "graph_facts": chunk_facts.get(cid, []),
                     "graph_score": chunk_scores[cid],
+                    "graph_match_methods": sorted(chunk_match_methods.get(cid, set())),
                     "_channel": "graph",
                 },
             )

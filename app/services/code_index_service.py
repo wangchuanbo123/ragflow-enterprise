@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import select
@@ -24,6 +25,17 @@ _EXCLUDED_PARTS = {
     ".git", ".hg", ".svn", "node_modules", "vendor", "dist", "build",
     ".venv", "venv", "__pycache__", ".idea", ".vscode", "target",
 }
+
+
+@dataclass(frozen=True)
+class _PendingRelation:
+    subject_local_key: str
+    target_qualified_name: str
+    relation_type: str
+    start_line: int
+    end_line: int
+    confidence: float = 1.0
+    metadata: dict | None = None
 
 
 class CodeIndexService:
@@ -94,8 +106,33 @@ class CodeIndexService:
             "\n".join(f"{path}:{digest}" for path, digest in manifest).encode("utf-8")
         ).hexdigest()
         active = self.repository.active_snapshot()
-        if active and active.content_hash == content_hash and active.data_source_id == data_source_id:
+        same_source = bool(active and active.data_source_id == data_source_id)
+        same_parser = bool(active and active.parser_version == PARSER_VERSION)
+        if (
+            active
+            and active.content_hash == content_hash
+            and same_source
+            and same_parser
+        ):
             return {"status": "unchanged", **self.repository.stats()}
+
+        previous_files = {}
+        if active and same_source and same_parser:
+            previous_files = {
+                item.path: item
+                for item in self.db.scalars(
+                    select(CodeFile).where(CodeFile.snapshot_id == active.id)
+                )
+            }
+        current_hashes = dict(manifest)
+        reused_paths = {
+            path
+            for path, digest in manifest
+            if path in previous_files
+            and previous_files[path].content_hash == digest
+        }
+        parsed_paths = set(current_hashes) - reused_paths
+        deleted_paths = set(previous_files) - set(current_hashes)
 
         snapshot = self.repository.create_snapshot(CodeSnapshot(
             knowledge_base_id=self.knowledge_base_id,
@@ -106,12 +143,25 @@ class CodeIndexService:
             status="building",
         ))
         try:
-            parsed_by_path = self._parse_parallel(source_by_path)
+            parsed_by_path = self._parse_parallel({
+                path: source_by_path[path] for path in parsed_paths
+            })
             language_counts = Counter()
             symbol_by_local_key: dict[str, CodeSymbol] = {}
-            pending_relations = []
+            pending_relations: list[tuple[str, _PendingRelation]] = []
             for relative, digest in manifest:
                 data = source_by_path[relative]
+                previous_file = previous_files.get(relative)
+                if relative in reused_paths and previous_file is not None:
+                    language_counts[previous_file.language] += 1
+                    self._copy_unchanged_file(
+                        previous_file,
+                        snapshot.id,
+                        symbol_by_local_key,
+                        pending_relations,
+                    )
+                    continue
+
                 parsed = parsed_by_path[relative]
                 language_counts[parsed.language] += 1
                 object_ref = self.object_store.put_bytes(
@@ -152,7 +202,21 @@ class CodeIndexService:
                     parent_key = (symbol.metadata_json or {}).pop("parent_local_key", None)
                     if parent_key and parent_key in symbol_by_local_key:
                         symbol.parent_symbol_id = symbol_by_local_key[parent_key].id
-                pending_relations.extend((relative, relation) for relation in parsed.relations)
+                pending_relations.extend(
+                    (
+                        relative,
+                        _PendingRelation(
+                            subject_local_key=relation.subject_local_key,
+                            target_qualified_name=relation.target_qualified_name,
+                            relation_type=relation.relation_type,
+                            start_line=relation.start_line,
+                            end_line=relation.end_line,
+                            confidence=relation.confidence,
+                            metadata=dict(relation.metadata or {}),
+                        ),
+                    )
+                    for relation in parsed.relations
+                )
                 self.db.flush()
 
             relations = self._resolve_relations(snapshot.id, symbol_by_local_key, pending_relations)
@@ -163,6 +227,9 @@ class CodeIndexService:
                 "relations": len(relations),
                 "resolved_relations": sum(item.resolution_status == "resolved" for item in relations),
                 "languages": dict(language_counts),
+                "files_reused": len(reused_paths),
+                "files_parsed": len(parsed_paths),
+                "files_deleted": len(deleted_paths),
             }
             self.repository.activate_snapshot(snapshot, stats)
             self.repository.prune_snapshots(CODE_SNAPSHOT_RETENTION)
@@ -173,6 +240,82 @@ class CodeIndexService:
             if persisted is not None:
                 self.repository.fail_snapshot(persisted, str(exc))
             raise
+
+    def _copy_unchanged_file(
+        self,
+        previous_file: CodeFile,
+        snapshot_id: str,
+        symbol_by_local_key: dict[str, CodeSymbol],
+        pending_relations: list[tuple[str, _PendingRelation]],
+    ) -> None:
+        """Copy durable facts while avoiding source loading and AST parsing."""
+        code_file = self.repository.add_file(CodeFile(
+            knowledge_base_id=self.knowledge_base_id,
+            snapshot_id=snapshot_id,
+            path=previous_file.path,
+            language=previous_file.language,
+            content_hash=previous_file.content_hash,
+            file_size=previous_file.file_size,
+            object_key=previous_file.object_key,
+            parse_status=previous_file.parse_status,
+            parse_errors_json=list(previous_file.parse_errors_json or []),
+        ))
+        previous_symbols = list(self.db.scalars(
+            select(CodeSymbol)
+            .where(CodeSymbol.file_id == previous_file.id)
+            .order_by(CodeSymbol.start_line, CodeSymbol.id)
+        ))
+        old_to_new: dict[str, CodeSymbol] = {}
+        copied_symbols = []
+        for previous in previous_symbols:
+            symbol = CodeSymbol(
+                knowledge_base_id=self.knowledge_base_id,
+                snapshot_id=snapshot_id,
+                file_id=code_file.id,
+                stable_key=previous.stable_key,
+                kind=previous.kind,
+                name=previous.name,
+                qualified_name=previous.qualified_name,
+                signature=previous.signature,
+                start_line=previous.start_line,
+                end_line=previous.end_line,
+                source_excerpt=previous.source_excerpt,
+                metadata_json=dict(previous.metadata_json or {}),
+            )
+            copied_symbols.append(symbol)
+            old_to_new[previous.id] = symbol
+            symbol_by_local_key[symbol.stable_key] = symbol
+        self.repository.add_symbols(copied_symbols)
+        for previous in previous_symbols:
+            if previous.parent_symbol_id:
+                old_to_new[previous.id].parent_symbol_id = old_to_new.get(
+                    previous.parent_symbol_id
+                ).id if previous.parent_symbol_id in old_to_new else None
+
+        relation_rows = self.db.execute(
+            select(CodeRelation, CodeSymbol.stable_key)
+            .join(CodeSymbol, CodeSymbol.id == CodeRelation.subject_symbol_id)
+            .where(
+                CodeRelation.snapshot_id == previous_file.snapshot_id,
+                CodeSymbol.file_id == previous_file.id,
+            )
+        ).all()
+        for relation, subject_stable_key in relation_rows:
+            pending_relations.append((
+                previous_file.path,
+                _PendingRelation(
+                    subject_local_key=subject_stable_key,
+                    target_qualified_name=str(
+                        (relation.metadata_json or {}).get("target_reference")
+                        or relation.target_qualified_name
+                    ),
+                    relation_type=relation.relation_type,
+                    start_line=relation.evidence_start_line,
+                    end_line=relation.evidence_end_line,
+                    confidence=relation.confidence,
+                    metadata=dict(relation.metadata_json or {}),
+                ),
+            ))
 
     def _parse_parallel(self, sources: dict[str, bytes]):
         results = {}
@@ -208,6 +351,8 @@ class CodeIndexService:
             if key in seen:
                 continue
             seen.add(key)
+            metadata = dict(item.metadata or {})
+            metadata.setdefault("target_reference", target_text)
             result.append(CodeRelation(
                 knowledge_base_id=self.knowledge_base_id,
                 snapshot_id=snapshot_id,
@@ -220,6 +365,6 @@ class CodeIndexService:
                 evidence_path=path,
                 evidence_start_line=item.start_line,
                 evidence_end_line=item.end_line,
-                metadata_json=item.metadata,
+                metadata_json=metadata,
             ))
         return result

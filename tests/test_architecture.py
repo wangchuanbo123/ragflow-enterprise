@@ -139,9 +139,13 @@ class ArchitectureTests(unittest.TestCase):
         )
         graph = build_graph(runtime)
 
-        result = ask_question("原始问题", graph=graph)
+        result = ask_question(
+            "原始问题",
+            graph=graph,
+            retrieval_options={"channels": ["graph"], "strategy": "fast"},
+        )
 
-        # Dual-query: original + rewritten are both queried
+        # A low-confidence fallback requests rewrite; both queries are retrieved.
         self.assertIn("原始问题", retriever.queries)
         self.assertIn("重写后的问题", retriever.queries)
         self.assertEqual(result["answer"], "基于知识库生成的答案")

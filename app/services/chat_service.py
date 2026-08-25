@@ -76,6 +76,7 @@ def answer_sync(
 
     conversation_repo = ConversationRepository(db)
     message_repo = MessageRepository(db)
+    history = _load_history(db, conversation.id, user_id)
     user_message = message_repo.add(
         Message(
             conversation_id=conversation.id,
@@ -86,7 +87,6 @@ def answer_sync(
         )
     )
     conversation_repo.touch(conversation)
-    history = _load_history(db, conversation.id, user_id)
 
     try:
         from app.services import rag_service
@@ -145,6 +145,7 @@ def answer_stream(
 
     conversation_repo = ConversationRepository(db)
     message_repo = MessageRepository(db)
+    history = _load_history(db, conversation.id, user_id)
     message_repo.add(
         Message(
             conversation_id=conversation.id,
@@ -155,7 +156,6 @@ def answer_stream(
         )
     )
     conversation_repo.touch(conversation)
-    history = _load_history(db, conversation.id, user_id)
     assistant = message_repo.add(
         Message(
             conversation_id=conversation.id,

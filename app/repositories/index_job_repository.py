@@ -172,6 +172,7 @@ class IndexJobRepository:
                 IndexJob.job_type.in_([
                     "sync", "rebuild", "connector_sync", "code_index",
                     "graph_rebuild", "entity_vector_rebuild",
+                    "relation_vector_rebuild", "code_vector_rebuild",
                 ]),
             )
         )

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, watch } from 'vue'
+import type { RetrievalStrategy } from '../types'
 import { useConversations } from '../composables/useConversations'
 import ConversationSidebar from './ConversationSidebar.vue'
 import MessageList from './MessageList.vue'
@@ -14,8 +15,8 @@ onMounted(() => {
   conv.loadList()
 })
 
-function onSend(content: string): void {
-  void conv.send(content)
+function onSend(payload: { content: string; strategy: RetrievalStrategy }): void {
+  void conv.send(payload.content, payload.strategy)
 }
 
 function onCreate(): void {

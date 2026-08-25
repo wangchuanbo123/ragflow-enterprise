@@ -13,6 +13,14 @@ class GraphSchemaCreate(BaseModel):
     extraction_prompt: str | None = Field(default=None, max_length=10000)
 
 
+class GraphSchemaUpdate(GraphSchemaCreate):
+    """Draft schemas are editable; active schemas remain immutable versions."""
+
+
+class GraphAutomationSettings(BaseModel):
+    auto_build_enabled: bool = True
+
+
 class GraphSchemaOut(BaseModel):
     id: str
     knowledge_base_id: str
@@ -32,6 +40,7 @@ class GraphSchemaOut(BaseModel):
 class GraphBuildRequest(BaseModel):
     mode: Literal["pending", "retry_failed", "full"] = "pending"
     rebuild_entity_vectors: bool = True
+    rebuild_relation_vectors: bool = True
     rebuild_communities: bool = True
 
 
@@ -75,6 +84,18 @@ class EntityMergeOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class RelationMergeCreate(BaseModel):
+    canonical_relation_id: str
+    merged_relation_id: str
+    reason: str = Field(min_length=3, max_length=1000)
+
+    @model_validator(mode="after")
+    def distinct_relations(self):
+        if self.canonical_relation_id == self.merged_relation_id:
+            raise ValueError("合并关系必须不同")
+        return self
+
+
 class ReviewResolve(BaseModel):
     decision: Literal["accepted", "rejected"]
 
@@ -110,6 +131,17 @@ class EntityVectorStateOut(BaseModel):
     embedding_fingerprint: str = ""
     graph_fingerprint: str = ""
     entity_count: int = 0
+    status: str = "empty"
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class RelationVectorStateOut(BaseModel):
+    index_name: str | None = None
+    embedding_fingerprint: str = ""
+    graph_fingerprint: str = ""
+    relation_count: int = 0
     status: str = "empty"
     updated_at: datetime | None = None
 

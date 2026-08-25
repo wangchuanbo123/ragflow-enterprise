@@ -18,6 +18,14 @@ class GraphStore(Protocol):
         """通过精确/包含匹配查询实体。"""
         ...
 
+    def search_relations(self, query: str, limit: int) -> list[dict]:
+        """通过关系谓词及其别名匹配关系。"""
+        ...
+
+    def get_relations(self, relation_ids: list[str]) -> list[dict]:
+        """按 ID 获取应用人工治理覆盖后的关系。"""
+        ...
+
     def get_neighbors(
         self,
         entity_ids: list[str],

@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from threading import Lock
+from typing import Any
 
 from app.bootstrap.container import get_provider_container
 from app.core.database import SessionLocal
@@ -35,6 +36,7 @@ class RAGRuntime:
     router_llm: LLMProvider | None = None
     graph_retriever: Retriever | None = None
     code_retriever: Retriever | None = None
+    embedding_model: Any | None = None
 
 
 @lru_cache(maxsize=32)
@@ -94,6 +96,7 @@ def get_runtime(
         router_llm=providers.router_llm,
         graph_retriever=graph_retriever,
         code_retriever=code_retriever,
+        embedding_model=embedding,
     )
 
     # Build BM25 index from knowledge_chunks if available

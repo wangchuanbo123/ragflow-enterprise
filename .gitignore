@@ -42,3 +42,4 @@ web/dist/
 
 # Local shell scripts
 *.sh
+!deploy/enterprise/deploy.sh

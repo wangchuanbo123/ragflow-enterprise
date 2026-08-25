@@ -179,10 +179,11 @@ export function deleteConversation(id: string): Promise<void> {
 export function sendMessage(
   conversationId: string,
   content: string,
+  strategy: import('../types').RetrievalStrategy = 'standard',
 ): Promise<{ user_message: Message; assistant_message: Message }> {
   return request(`/conversations/${conversationId}/messages`, {
     method: 'POST',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, retrieval: { strategy } }),
   })
 }
 
@@ -320,7 +321,7 @@ export function reconcileGraphCorrections(
 export function debugRetrieval(
   knowledgeBaseId: string,
   query: string,
-  retrieval: { channels: string[]; scope: { document_ids: string[]; tag_ids: string[]; folder_id: string | null; metadata: Record<string, string> } },
+  retrieval: { strategy?: import('../types').RetrievalStrategy; channels: string[]; scope: { document_ids: string[]; tag_ids: string[]; folder_id: string | null; metadata: Record<string, string> } },
 ): Promise<RetrievalDebugResult> {
   return request(`/knowledge-bases/${knowledgeBaseId}/retrieval/debug`, {
     method: 'POST',
@@ -377,6 +378,26 @@ export function activateGraphSchema(knowledgeBaseId: string, schemaId: string): 
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/${schemaId}/activate`, { method: 'POST' })
 }
 
+export function updateGraphSchema(
+  knowledgeBaseId: string,
+  schemaId: string,
+  payload: { entity_types: string[]; relation_types: string[]; normalization_rules?: Record<string, unknown>; extraction_prompt?: string | null },
+): Promise<GraphSchema> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/${schemaId}`, {
+    method: 'PUT', body: JSON.stringify(payload),
+  })
+}
+
+export function getGraphAutomation(knowledgeBaseId: string): Promise<import('../types').GraphAutomationSettings> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/automation`)
+}
+
+export function updateGraphAutomation(knowledgeBaseId: string, autoBuildEnabled: boolean): Promise<import('../types').GraphAutomationSettings> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/automation`, {
+    method: 'PUT', body: JSON.stringify({ auto_build_enabled: autoBuildEnabled }),
+  })
+}
+
 export function requestGraphBuild(knowledgeBaseId: string, mode: 'pending' | 'retry_failed' | 'full'): Promise<IndexJob> {
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/build`, {
     method: 'POST', body: JSON.stringify({ mode, rebuild_entity_vectors: true, rebuild_communities: true }),
@@ -427,6 +448,24 @@ export function revertEntityMerge(knowledgeBaseId: string, mergeId: string): Pro
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/merges/${mergeId}/revert`, { method: 'POST' })
 }
 
+export function listRelationMerges(knowledgeBaseId: string): Promise<import('../types').GraphCorrection[]> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/relation-merges`)
+}
+
+export function scanRelationMergeCandidates(knowledgeBaseId: string): Promise<{ scanned: number; candidates: number }> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/relation-merge-candidates/scan`, { method: 'POST' })
+}
+
+export function createRelationMerge(knowledgeBaseId: string, canonicalRelationId: string, mergedRelationId: string, reason: string): Promise<import('../types').GraphCorrection> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/relation-merges`, {
+    method: 'POST', body: JSON.stringify({ canonical_relation_id: canonicalRelationId, merged_relation_id: mergedRelationId, reason }),
+  })
+}
+
+export function revertRelationMerge(knowledgeBaseId: string, mergeId: string): Promise<import('../types').GraphCorrection> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/relation-merges/${mergeId}/revert`, { method: 'POST' })
+}
+
 export function listGraphCommunities(knowledgeBaseId: string): Promise<GraphCommunity[]> {
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/communities`)
 }
@@ -448,13 +487,14 @@ export async function streamMessage(
   conversationId: string,
   content: string,
   handlers: StreamHandlers,
+  strategy: import('../types').RetrievalStrategy = 'standard',
   signal?: AbortSignal,
 ): Promise<void> {
   const res = await fetch(`${BASE}/conversations/${conversationId}/messages/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, retrieval: { strategy } }),
     signal,
   })
   if (!res.ok || !res.body) throw new Error(await parseError(res))

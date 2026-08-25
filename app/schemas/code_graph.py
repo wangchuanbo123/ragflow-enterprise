@@ -38,6 +38,7 @@ class CodeSymbolOut(BaseModel):
     start_line: int
     end_line: int
     source_excerpt: str | None = None
+    functional_summary: str | None = None
     metadata: dict = Field(default_factory=dict)
 
 
@@ -67,3 +68,15 @@ class CodeGraphStatsOut(BaseModel):
     symbols: int = 0
     relations: int = 0
     resolved_relations: int = 0
+
+
+class CodeVectorStateOut(BaseModel):
+    snapshot_id: str | None = None
+    index_name: str | None = None
+    embedding_fingerprint: str = ""
+    symbol_fingerprint: str = ""
+    symbol_count: int = 0
+    status: str = "empty"
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}

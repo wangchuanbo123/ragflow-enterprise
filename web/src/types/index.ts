@@ -72,6 +72,8 @@ export interface RetrievalScope {
   metadata: Record<string, string>
 }
 
+export type RetrievalStrategy = 'fast' | 'standard' | 'deep'
+
 export interface RouteDecision {
   method: string
   selected_channels: Array<'text' | 'graph' | 'code'>
@@ -83,6 +85,9 @@ export interface RouteDecision {
   scope_match_count?: number | null
   channel_results?: Record<string, { status: string; count: number; elapsed_ms: number }>
   fused_count?: number
+  strategy: RetrievalStrategy
+  rewrite?: { applied?: boolean; requested?: boolean; reason?: string }
+  query_embedding?: { status?: string; shared?: boolean; dimensions?: number; elapsed_ms?: number }
 }
 
 export interface Message {
@@ -225,7 +230,7 @@ export interface DocumentSubgraph {
 export interface GraphCorrection {
   id: string
   knowledge_base_id: string
-  action: 'add_relation' | 'hide_relation' | 'update_relation' | 'update_entity'
+  action: 'add_relation' | 'hide_relation' | 'update_relation' | 'update_entity' | 'merge_relation'
   target_type: string
   target_id: string | null
   payload: Record<string, any>
@@ -322,6 +327,10 @@ export interface GraphSchema {
   normalization_rules_json: Record<string, unknown> | null
   extraction_prompt: string | null
   created_at: string
+}
+
+export interface GraphAutomationSettings {
+  auto_build_enabled: boolean
 }
 
 export interface GraphQuality {

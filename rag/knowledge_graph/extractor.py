@@ -26,8 +26,8 @@ EXTRACTION_PROMPT = """你是知识图谱实体关系抽取助手。
 
 规则：
 1. 只提取文档中明确出现的信息，不要凭常识补充
-2. 实体类型必须是以下之一：SYSTEM, MODULE, INTERFACE, REQUIREMENT, TEST_CASE, ROLE, ENVIRONMENT, DOCUMENT, VERSION, TERM, OTHER
-3. 关系谓词必须是以下之一：CONTAINS, PART_OF, DEPENDS_ON, CALLS, PROVIDES, IMPLEMENTS, SATISFIES, VERIFIED_BY, DEPLOYED_ON, OWNED_BY, USES, RELATED_TO
+2. 实体类型必须是以下之一：{entity_types}
+3. 关系谓词必须是以下之一：{relation_types}
 4. evidence 必须是文档原文中的短句，不能改写
 5. 如果文档中没有明确的实体关系，返回空列表
 
@@ -50,6 +50,8 @@ def parse_extraction_response(
     raw_response: str,
     chunk_id: str,
     chunk_content: str,
+    entity_types: set[str] | frozenset[str] | None = None,
+    relation_types: set[str] | frozenset[str] | None = None,
 ) -> ChunkExtraction:
     """解析 LLM 输出为校验后的 ChunkExtraction。
 
@@ -70,6 +72,9 @@ def parse_extraction_response(
 
     data.setdefault("chunk_id", chunk_id)
 
+    allowed_entity_types = entity_types or VALID_ENTITY_TYPES
+    allowed_relation_types = relation_types or VALID_PREDICATES
+
     # Validate entities
     valid_entities: dict[str, ExtractedEntity] = {}
     for ent_data in data.get("entities", []):
@@ -77,7 +82,7 @@ def parse_extraction_response(
             ent = ExtractedEntity(**ent_data)
         except Exception:
             continue
-        if ent.type not in VALID_ENTITY_TYPES:
+        if ent.type not in allowed_entity_types:
             continue
         valid_entities[ent.local_id] = ent
 
@@ -90,7 +95,7 @@ def parse_extraction_response(
             rel = ExtractedRelation(**rel_data)
         except Exception:
             continue
-        if rel.predicate not in VALID_PREDICATES:
+        if rel.predicate not in allowed_relation_types:
             continue
         if rel.subject not in valid_entities or rel.object not in valid_entities:
             continue
@@ -159,7 +164,11 @@ class GraphExtractor:
         prompt = EXTRACTION_PROMPT.format(
             chunk_id=chunk_id,
             content=chunk_content[: self.max_content_chars],
+            entity_types=", ".join(sorted(self.entity_types)),
+            relation_types=", ".join(sorted(self.relation_types)),
         )
+        if self.prompt_prefix:
+            prompt = self.prompt_prefix.strip() + "\n\n" + prompt
 
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -170,7 +179,13 @@ class GraphExtractor:
                 )
             try:
                 raw = self.llm.generate(current_prompt)
-                return parse_extraction_response(raw, chunk_id, chunk_content)
+                return parse_extraction_response(
+                    raw,
+                    chunk_id,
+                    chunk_content,
+                    self.entity_types,
+                    self.relation_types,
+                )
             except Exception as exc:
                 last_error = exc
 
@@ -241,6 +256,8 @@ class GraphExtractor:
                         ),
                         chunk["chunk_id"],
                         chunk["content"],
+                        self.entity_types,
+                        self.relation_types,
                     )
                     for chunk in chunks
                 ]

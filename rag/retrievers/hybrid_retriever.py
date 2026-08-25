@@ -21,6 +21,7 @@ from app.core.config import (
 )
 from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 from rag.retrievers.bm25_retriever import get_bm25_retriever
+from rag.retrieval_strategy import get_retrieval_policy
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +134,8 @@ class HybridRRFRetriever:
         self,
         query: str,
         allowed_document_ids: set[str] | None = None,
+        query_embedding: list[float] | None = None,
+        strategy: str = "standard",
     ) -> list[Document]:
         """对单个 query 执行向量+BM25 双通道检索和 RRF 融合。"""
         if allowed_document_ids is not None and not allowed_document_ids:
@@ -142,22 +145,37 @@ class HybridRRFRetriever:
             if allowed_document_ids is not None
             else None
         )
+        policy = get_retrieval_policy(strategy)
         # Vector retrieval
         vector_docs: list[Document] = []
         try:
-            vector_docs = self.vector_store.similarity_search_with_relevance_scores(
-                query,
-                k=self.vector_k,
-                **({"filter": vector_filter} if vector_filter else {}),
-            )
+            if query_embedding is not None:
+                vector_docs = self.vector_store.similarity_search_by_vector_with_relevance_scores(
+                    query_embedding,
+                    k=policy.vector_k,
+                    **({"filter": vector_filter} if vector_filter else {}),
+                )
+            else:
+                vector_docs = self.vector_store.similarity_search_with_relevance_scores(
+                    query,
+                    k=policy.vector_k,
+                    **({"filter": vector_filter} if vector_filter else {}),
+                )
             vector_docs = [doc for doc, _ in vector_docs]
         except Exception:
             try:
-                vector_docs = self.vector_store.similarity_search(
-                    query,
-                    k=self.vector_k,
-                    **({"filter": vector_filter} if vector_filter else {}),
-                )
+                if query_embedding is not None:
+                    vector_docs = self.vector_store.similarity_search_by_vector(
+                        query_embedding,
+                        k=policy.vector_k,
+                        **({"filter": vector_filter} if vector_filter else {}),
+                    )
+                else:
+                    vector_docs = self.vector_store.similarity_search(
+                        query,
+                        k=policy.vector_k,
+                        **({"filter": vector_filter} if vector_filter else {}),
+                    )
             except Exception as exc:
                 logger.warning("Vector retrieval failed: %s", exc)
 
@@ -176,7 +194,7 @@ class HybridRRFRetriever:
             bm25_retriever = get_bm25_retriever(self.knowledge_base_id)
             bm25_docs = bm25_retriever.get_relevant_documents(
                 query,
-                top_k=self.bm25_k,
+                top_k=policy.bm25_k,
                 allowed_document_ids=allowed_document_ids,
             )
         except Exception as exc:
@@ -192,13 +210,15 @@ class HybridRRFRetriever:
                 (bm25_docs, self.bm25_weight),
             ],
             rrf_k=self.rrf_k,
-            candidate_k=self.candidate_k,
+            candidate_k=policy.candidate_k,
         )
 
     def retrieve_multi_query(
         self,
         queries: list[str],
         allowed_document_ids: set[str] | None = None,
+        query_embedding: list[float] | None = None,
+        strategy: str = "standard",
     ) -> list[Document]:
         """对多个 query 分别执行双通道检索，然后按 chunk_id 累加 RRF。"""
         if allowed_document_ids is not None and not allowed_document_ids:
@@ -208,28 +228,39 @@ class HybridRRFRetriever:
             if allowed_document_ids is not None
             else None
         )
+        policy = get_retrieval_policy(strategy)
         all_ranked: list[tuple[list[Document], float]] = []
 
-        for q in queries:
-            # Vector
-            vector_docs: list[Document] = []
-            try:
-                vector_docs = self.vector_store.similarity_search(
-                    q,
-                    k=self.vector_k,
+        # Semantic retrieval is intentionally executed once. The same vector is
+        # reused by every vector-backed channel; lexical retrieval can still use
+        # both the original and rewritten query.
+        semantic_query = queries[-1]
+        vector_docs: list[Document] = []
+        try:
+            if query_embedding is not None:
+                vector_docs = self.vector_store.similarity_search_by_vector(
+                    query_embedding,
+                    k=policy.vector_k,
                     **({"filter": vector_filter} if vector_filter else {}),
                 )
-            except Exception as exc:
-                logger.warning("Vector retrieval failed for query '%s': %s", q[:50], exc)
-            if allowed_document_ids is not None:
-                vector_docs = [
-                    doc for doc in vector_docs
-                    if doc.metadata.get("document_id") in allowed_document_ids
-                ]
-            for doc in vector_docs:
-                doc.metadata["_channel"] = "vector"
-            all_ranked.append((vector_docs, self.vector_weight))
+            else:
+                vector_docs = self.vector_store.similarity_search(
+                    semantic_query,
+                    k=policy.vector_k,
+                    **({"filter": vector_filter} if vector_filter else {}),
+                )
+        except Exception as exc:
+            logger.warning("Vector retrieval failed for query '%s': %s", semantic_query[:50], exc)
+        if allowed_document_ids is not None:
+            vector_docs = [
+                doc for doc in vector_docs
+                if doc.metadata.get("document_id") in allowed_document_ids
+            ]
+        for doc in vector_docs:
+            doc.metadata["_channel"] = "vector"
+        all_ranked.append((vector_docs, self.vector_weight))
 
+        for q in queries:
             # BM25
             bm25_docs: list[Document] = []
             try:
@@ -237,7 +268,7 @@ class HybridRRFRetriever:
                     self.knowledge_base_id
                 ).get_relevant_documents(
                     q,
-                    top_k=self.bm25_k,
+                    top_k=policy.bm25_k,
                     allowed_document_ids=allowed_document_ids,
                 )
             except Exception as exc:
@@ -249,7 +280,29 @@ class HybridRRFRetriever:
         return weighted_rrf_fusion(
             all_ranked,
             rrf_k=self.rrf_k,
-            candidate_k=self.candidate_k,
+            candidate_k=policy.candidate_k,
+        )
+
+    def retrieve_with_options(
+        self,
+        queries: list[str],
+        *,
+        query_embedding: list[float] | None = None,
+        strategy: str = "standard",
+        allowed_document_ids: set[str] | None = None,
+    ) -> list[Document]:
+        if len(queries) > 1:
+            return self.retrieve_multi_query(
+                queries,
+                allowed_document_ids=allowed_document_ids,
+                query_embedding=query_embedding,
+                strategy=strategy,
+            )
+        return self.retrieve_single(
+            queries[0],
+            allowed_document_ids=allowed_document_ids,
+            query_embedding=query_embedding,
+            strategy=strategy,
         )
 
 

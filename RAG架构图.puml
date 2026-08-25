@@ -1,224 +1,277 @@
-@startuml RAG_Logical_Architecture
-title Enterprise RAG 在线问答与检索架构（当前实现）
+@startuml EnterpriseRAGArchitecture
+title 企业级 RAG 构建、检索与生成架构
 
 left to right direction
-skinparam backgroundColor #FFFFFF
+skinparam backgroundColor #F8FAFC
 skinparam shadowing false
 skinparam roundcorner 10
 skinparam linetype ortho
 skinparam packageStyle rectangle
-skinparam componentStyle rectangle
+skinparam defaultFontName Microsoft YaHei
 skinparam defaultTextAlignment center
 skinparam ArrowColor #64748B
-skinparam packageBorderColor #94A3B8
-skinparam packageBackgroundColor #F8FAFC
-
-actor "用户 / API 客户端" as User
-
-package "问答入口" #E8F0FE {
-  component "POST /ask\n默认知识库兼容入口" as LegacyAsk
-  component "POST /api/v1/knowledge-bases/{kb_id}/ask\n知识库范围同步问答" as KBAsk
-  component "POST /api/v1/conversations/{id}/messages\nWeb 同步问答 + 消息持久化" as WebSync
-  component "POST .../messages/stream\nWeb SSE + 消息持久化" as WebStream
-  component "POST .../{kb_id}/retrieval/debug\n仅准备上下文，不生成答案" as DebugAsk
+skinparam ArrowThickness 1.2
+skinparam package {
+    BorderColor #94A3B8
+    FontColor #0F172A
+    FontStyle bold
+}
+skinparam rectangle {
+    BackgroundColor #FFFFFF
+    BorderColor #64748B
+    FontColor #1E293B
+}
+skinparam database {
+    BackgroundColor #FFF4CC
+    BorderColor #D69E2E
+    FontColor #5F4300
+}
+skinparam queue {
+    BackgroundColor #FFE7C2
+    BorderColor #DD6B20
+    FontColor #7B341E
+}
+skinparam actor {
+    BackgroundColor #DBEAFE
+    BorderColor #2563EB
+    FontColor #1E3A8A
+}
+skinparam note {
+    BackgroundColor #FFFBEA
+    BorderColor #D6B656
+    FontColor #4A3B00
 }
 
-package "访问控制与应用服务  app/services" #E8F5E9 {
-  component "JWT Cookie + 用户身份\n会话归属 + 知识库 read 权限" as Access
-  component "ChatService\n保存用户/助手消息\n读取最近历史" as Chat
-  component "RAGConcurrency\n进程内并发许可与排队超时" as Concurrency
-  component "RAGService\nask / stream / prepare_context\n统一编译 LangGraph" as Service
-  component "RAGRuntime（按知识库）\n模型、Retriever、Reranker\nindex_signature 变化后刷新" as Runtime
+actor "企业用户" as User
+
+package "一、知识构建阶段" #EAF4FF {
+
+    rectangle "文档数据源\nPDF / Word / Markdown\nWiki / 网页 / API" as DocumentSource #DBEAFE
+    rectangle "代码数据源\nGit / 本地目录" as CodeSource #DCFCE7
+
+    package "文档处理" #EDF7FF {
+        rectangle "文档解析\nOCR / 版面 / 结构解析" as DocumentParser #E0F2FE
+        rectangle "文档切片\n标题 / 段落 / 表格 / Token" as DocumentChunker #E0F2FE
+        rectangle "Chunk 标准化\n哈希 / 元数据 / 权限 / 版本" as ChunkNormalize #E0F2FE
+
+        database "文档与 Chunk 库" as ChunkStore
+        rectangle "Chunk 向量生成" as ChunkEmbedding #CCFBF1
+        database "文档向量索引" as DocumentVectorIndex #D1FAE5
+        database "BM25 / 全文索引" as BM25Index #FEF3C7
+
+        DocumentSource -[#2563EB]-> DocumentParser
+        DocumentParser --> DocumentChunker
+        DocumentChunker --> ChunkNormalize
+
+        ChunkNormalize --> ChunkStore
+        ChunkNormalize --> ChunkEmbedding
+        ChunkEmbedding --> DocumentVectorIndex
+        ChunkNormalize --> BM25Index
+    }
+
+    package "知识图谱构建" #F5F0FF {
+        rectangle "图谱 Schema\n实体类型 / 关系类型 / 约束" as GraphSchema #EDE9FE
+        rectangle "实体与关系抽取\nEntity / Relation / Evidence" as GraphExtraction #F3E8FF
+        rectangle "实体归一化与消歧\n别名 / 合并 / 人工修正" as EntityNormalize #F3E8FF
+
+        database "知识图谱库\n实体 / 关系 / 证据" as GraphStore #EDE9FE
+
+        rectangle "实体向量生成" as EntityEmbedding #CCFBF1
+        database "实体向量索引" as EntityVectorIndex #D1FAE5
+
+        rectangle "关系向量生成\n主语 + 谓词 + 宾语\n别名 + 描述 + 证据" as RelationEmbedding #CCFBF1
+        database "关系向量索引" as RelationVectorIndex #D1FAE5
+
+        ChunkStore --> GraphExtraction
+        GraphSchema --> GraphExtraction
+        GraphExtraction --> EntityNormalize
+        EntityNormalize --> GraphStore
+
+        GraphStore --> EntityEmbedding
+        EntityEmbedding --> EntityVectorIndex
+
+        GraphStore --> RelationEmbedding
+        RelationEmbedding --> RelationVectorIndex
+    }
+
+    package "代码知识构建" #EFFAF2 {
+        rectangle "代码扫描\n语言识别 / 文件过滤 / 哈希" as CodeScanner #DCFCE7
+        rectangle "AST 解析" as ASTParser #DCFCE7
+        rectangle "代码切片与符号提取\nFile / Class / Method / Function" as SymbolExtraction #DCFCE7
+        rectangle "代码关系提取\nCalls / Imports / Extends / Depends" as CodeRelationExtraction #DCFCE7
+
+        database "版本化代码图谱\nSnapshot / File / Symbol / Relation" as CodeGraphStore #DCFCE7
+
+        rectangle "代码片段向量生成\n路径 + 语言 + 类型\n限定名 + 签名 + 源码" as CodeEmbedding #CCFBF1
+        database "代码 Symbol 向量索引" as CodeVectorIndex #D1FAE5
+
+        CodeSource -[#16A34A]-> CodeScanner
+        CodeScanner --> ASTParser
+        ASTParser --> SymbolExtraction
+        SymbolExtraction --> CodeRelationExtraction
+        CodeRelationExtraction --> CodeGraphStore
+
+        CodeGraphStore --> CodeEmbedding
+        CodeEmbedding --> CodeVectorIndex
+    }
+
+    queue "异步索引任务\n状态 / 重试 / 租约" as IndexJobQueue
+
+    ChunkNormalize --> IndexJobQueue
+    GraphExtraction --> IndexJobQueue
+    CodeScanner --> IndexJobQueue
 }
 
-package "Compiled LangGraph" #E8F5E9 {
-  component "rewrite\n保留 original_query\n生成可选 rewritten_query" as Rewrite
-  component "route_request\n路由决策 + 范围解析" as Route
+package "二、提问与路由阶段" #F4F0FF {
 
-  package "条件并行 Fan-out" as PARALLEL {
-    component "text_retrieve\n未选则 skipped\n异常局部降级" as TextNode
-    component "graph_retrieve\n未选/未就绪则 skipped\n异常局部降级" as GraphNode
-    component "code_retrieve\n未选/无活动快照则 skipped\n异常局部降级" as CodeNode
-  }
+    rectangle "用户提问" as Question #DBEAFE
+    rectangle "LLM 限制层\n认证 / 权限 / 租户隔离\n限流 / Prompt 防护" as InputGuard #FDE68A
+    rectangle "检索路由器\n规则路由 / LLM 路由\n单路或多路并行" as RetrievalRouter #DDD6FE
+    rectangle "自适应 Query Rewrite\n仅低置信度或多轮问题调用 LLM\n成功后以规则复核路由" as AdaptiveRewrite #EDE9FE
+    rectangle "共享问题向量\n只生成一次" as SharedQueryEmbedding #CCFBF1
+    rectangle "检索档位策略\n快速 / 标准 / 深度" as RetrievalPolicy #FCE7F3
 
-  component "fuse\nFan-in 屏障\n通道权重 + Weighted RRF\nchunk_id 去重" as Fuse
-  component "rerank\n始终使用 original_query\n失败保留融合顺序" as Rerank
-  component "build_context\n内容 Hash 去重、每来源配额\nChunk 上限、Token 预算、引用" as Context
-  component "generate\n同步回答生成节点" as Generate
-  circle "END" as EndNode
-
-  Rewrite --> Route
-  Route --> TextNode
-  Route --> GraphNode
-  Route --> CodeNode
-  TextNode --> Fuse
-  GraphNode --> Fuse
-  CodeNode --> Fuse
-  Fuse --> Rerank
-  Rerank --> Context
-  Context --> Generate : generation_mode=sync
-  Context --> EndNode : generation_mode=context
-  Generate --> EndNode
+    User --> Question
+    Question --> InputGuard
+    InputGuard --> RetrievalRouter
+    RetrievalRouter --> AdaptiveRewrite
+    AdaptiveRewrite --> SharedQueryEmbedding
+    SharedQueryEmbedding --> RetrievalPolicy
 }
 
-package "路由与检索范围" #F3E8FF {
-  component "路由优先级\n1. 显式 channels\n2. 关系/代码关键词规则\n3. 可选 Router LLM JSON 回退" as RoutingPolicy
-  component "RetrievalScope\ndocument_ids · tag_ids\nfolder_id · metadata" as Scope
-  component "SQL 范围解析\n校验 knowledge_base_id\n得到 allowed_document_ids" as ScopeResolver
+package "三、多路检索与召回阶段" #EEF8F1 {
 
-  RoutingPolicy --> Scope
-  Scope --> ScopeResolver
+    package "文档检索通道" #EDF7FF {
+        rectangle "文档检索计划\n知识库 / 权限 / 元数据过滤" as DocumentRetrieval #DBEAFE
+        rectangle "向量召回\nSemantic Top-K" as DocumentVectorRecall #CCFBF1
+        rectangle "词法召回\nBM25 Top-K" as BM25Recall #FEF3C7
+        rectangle "文档通道融合\nRRF / 加权融合 / 去重" as DocumentFusion #FFEDD5
+
+        RetrievalPolicy -[#2563EB]-> DocumentRetrieval
+
+        DocumentRetrieval --> DocumentVectorRecall
+        DocumentRetrieval --> BM25Recall
+
+        DocumentVectorIndex --> DocumentVectorRecall
+        BM25Index --> BM25Recall
+
+        DocumentVectorRecall --> DocumentFusion
+        BM25Recall --> DocumentFusion
+    }
+
+    package "知识图谱检索通道" #F5F0FF {
+        rectangle "图谱检索计划\n实体意图 / 关系意图 / 跳数" as GraphRetrieval #EDE9FE
+
+        rectangle "实体词法召回\n名称 / 别名 / 包含匹配" as EntityLexicalRecall #FEF3C7
+        rectangle "实体向量召回\nEntity Semantic Search" as EntityVectorRecall #CCFBF1
+
+        rectangle "关系词法召回\n谓词 / 中英文别名" as RelationLexicalRecall #FEF3C7
+        rectangle "关系向量召回\nRelation Semantic Search" as RelationVectorRecall #CCFBF1
+
+        rectangle "图谱种子融合\n实体种子 + 关系种子\n合并 / 去重 / 评分" as GraphSeedFusion #FFEDD5
+        rectangle "图遍历召回\n关系端点扩展\n1 到 2 跳邻居遍历" as GraphTraversal #EDE9FE
+        rectangle "关系证据回溯\nEvidence 映射到原始 Chunk" as GraphEvidenceRecall #FCE7F3
+
+        RetrievalPolicy -[#7C3AED]-> GraphRetrieval
+
+        GraphRetrieval --> EntityLexicalRecall
+        GraphRetrieval --> EntityVectorRecall
+        GraphRetrieval --> RelationLexicalRecall
+        GraphRetrieval --> RelationVectorRecall
+
+        GraphStore --> EntityLexicalRecall
+        EntityVectorIndex --> EntityVectorRecall
+        GraphStore --> RelationLexicalRecall
+        RelationVectorIndex --> RelationVectorRecall
+
+        EntityLexicalRecall --> GraphSeedFusion
+        EntityVectorRecall --> GraphSeedFusion
+        RelationLexicalRecall --> GraphSeedFusion
+        RelationVectorRecall --> GraphSeedFusion
+
+        GraphSeedFusion --> GraphTraversal
+        GraphStore --> GraphTraversal
+
+        GraphTraversal --> GraphEvidenceRecall
+        GraphStore --> GraphEvidenceRecall
+        ChunkStore --> GraphEvidenceRecall
+    }
+
+    package "代码检索通道" #EFFAF2 {
+        rectangle "代码检索计划\n语言 / 路径 / Symbol 类型\n调用与依赖意图" as CodeRetrieval #DCFCE7
+
+        rectangle "代码词法召回\n名称 / 限定名 / 签名" as CodeLexicalRecall #FEF3C7
+        rectangle "代码向量召回\n源码语义 / 功能描述" as CodeVectorRecall #CCFBF1
+
+        rectangle "代码候选融合\nLexical + Vector\nRRF / 去重" as CodeFusion #FFEDD5
+        rectangle "代码图扩展\nCalls / Imports / Extends\n调用与依赖关系补充" as CodeGraphExpansion #DCFCE7
+
+        RetrievalPolicy -[#16A34A]-> CodeRetrieval
+
+        CodeRetrieval --> CodeLexicalRecall
+        CodeRetrieval --> CodeVectorRecall
+
+        CodeGraphStore --> CodeLexicalRecall
+        CodeVectorIndex --> CodeVectorRecall
+
+        CodeLexicalRecall --> CodeFusion
+        CodeVectorRecall --> CodeFusion
+
+        CodeFusion --> CodeGraphExpansion
+        CodeGraphStore --> CodeGraphExpansion
+    }
 }
 
-package "Text Channel" #FFF7ED {
-  component "Multi-query\noriginal + 有效 rewrite" as MultiQuery
-  component "Chroma 文档向量\nEmbedding Query\n按 document_id Filter" as DocumentVector
-  component "中文 BM25\n由活动 SQL Chunk 构建\n按 allowed IDs 过滤" as BM25
-  component "通道内 Weighted RRF\nVector + BM25\n按 chunk_id 去重" as TextRRF
+package "四、融合、重排与生成阶段" #FFF5E8 {
 
-  MultiQuery --> DocumentVector
-  MultiQuery --> BM25
-  DocumentVector --> TextRRF
-  BM25 --> TextRRF
+    rectangle "多通道召回候选\n文档 Chunk\n图谱证据 Chunk\n代码 Symbol" as RecallCandidates #E0F2FE
+
+    rectangle "跨通道融合\n通道权重 + RRF\n统一评分 / 去重\n权限与版本过滤" as GlobalFusion #FED7AA
+
+    rectangle "候选重排\nCross-Encoder / Reranker" as Reranker #FBCFE8
+
+    rectangle "上下文组装\nToken Budget\n多样性控制 / 邻近片段补全\n来源与引用绑定" as ContextBuilder #EDE9FE
+
+    rectangle "生成限制层\nSystem Prompt / 上下文边界\n最大 Token / 敏感信息策略" as GenerationGuard #FDE68A
+
+    rectangle "LLM 答案生成\nGrounded Generation" as LLMGeneration #DDD6FE
+
+    rectangle "答案校验\n事实一致性 / 引用检查\n无证据拒答 / 风险过滤" as AnswerValidation #FCE7F3
+
+    rectangle "最终答案\nAnswer + Citations + Trace" as FinalAnswer #BBF7D0
+
+    DocumentFusion -[#2563EB]-> RecallCandidates
+    GraphEvidenceRecall -[#7C3AED]-> RecallCandidates
+    CodeGraphExpansion -[#16A34A]-> RecallCandidates
+
+    RecallCandidates -[#EA580C]-> GlobalFusion
+    GlobalFusion -[#DB2777]-> Reranker
+    Reranker -[#7C3AED]-> ContextBuilder
+    ContextBuilder -[#7C3AED]-> GenerationGuard
+    GenerationGuard -[#7C3AED]-> LLMGeneration
+    LLMGeneration -[#DB2777]-> AnswerValidation
+    AnswerValidation -[#16A34A]-> FinalAnswer
+    FinalAnswer -[#16A34A]-> User
 }
 
-package "Graph Channel" #FFF7ED {
-  component "实体种子\n名称/别名词法匹配" as EntityLexical
-  component "实体语义向量\n独立 Chroma Collection\n未构建时可降级" as EntitySemantic
-  component "SQL 逻辑图遍历\n最多 1~2 跳、关系上限\n应用人工合并 Overlay" as GraphTraversal
-  component "Evidence 回链\nrelation → evidence → Chunk\ngraph_facts + graph_score" as Evidence
+note bottom of RetrievalRouter
+路由器根据问题选择：
+1. 文档检索通道
+2. 知识图谱检索通道
+3. 代码检索通道
 
-  EntityLexical --> GraphTraversal
-  EntitySemantic --> GraphTraversal
-  GraphTraversal --> Evidence
-}
-
-package "Code Channel" #FFF7ED {
-  component "活动 Code Snapshot\n按知识库隔离" as ActiveSnapshot
-  component "符号搜索\n名称、qualified_name、签名" as SymbolSearch
-  component "关系扩展\nCONTAINS / IMPORTS\nCALLS / EXTENDS" as CodeRelations
-  component "代码检索文档\n源码摘录、文件路径、行号\nresolved/ambiguous/external" as CodeDocuments
-
-  ActiveSnapshot --> SymbolSearch
-  SymbolSearch --> CodeRelations
-  CodeRelations --> CodeDocuments
-}
-
-package "Provider 与数据" #F3E8FF {
-  component "Answer / Rewrite / Router\nLLMProvider" as LLM
-  component "EmbeddingProvider" as Embedding
-  component "Reranker\nBGE / HTTP / Passthrough" as RerankerProvider
-  database "SQLAlchemy\nlocal SQLite / enterprise PostgreSQL\nChunk、范围、图谱、代码图、签名" as SQL
-  database "VectorStoreProvider\nEmbedded / HTTP Chroma\n文档向量 + 实体向量" as VectorDB
-  component "Memory / Redis Cache\n本地缓存与失效发布" as Cache
-}
-
-package "结果" #E8F0FE {
-  component "answer\n同步答案" as Answer
-  component "sources\n正文来源 + graph_facts\n问答响应不内嵌完整子图" as Sources
-  component "route\nmethod、reasons、confidence\nselected/unavailable channels\nchannel_results、fused_count" as RouteResult
-  component "SSE\nmessage → route → delta*\n→ sources → done / error" as SSE
-}
-
-User --> LegacyAsk
-User --> KBAsk
-User --> WebSync
-User --> WebStream
-User --> DebugAsk
-
-LegacyAsk --> Access
-KBAsk --> Access
-WebSync --> Access
-WebStream --> Access
-DebugAsk --> Access
-Access --> Chat : 会话入口
-Access --> Concurrency
-Chat --> Concurrency
-Concurrency --> Service
-Service --> Runtime
-Runtime --> Rewrite
-
-Rewrite --> LLM
-Route --> RoutingPolicy
-Route --> ScopeResolver
-RoutingPolicy --> LLM : hybrid + enabled 时
-ScopeResolver --> SQL
-
-TextNode --> MultiQuery
-MultiQuery --> Embedding
-DocumentVector --> VectorDB
-BM25 --> SQL
-TextRRF --> TextNode
-
-GraphNode --> EntityLexical
-GraphNode --> EntitySemantic
-EntityLexical --> SQL
-EntitySemantic --> Embedding
-EntitySemantic --> VectorDB
-GraphTraversal --> SQL
-Evidence --> SQL
-Evidence --> GraphNode
-
-CodeNode --> ActiveSnapshot
-ActiveSnapshot --> SQL
-SymbolSearch --> SQL
-CodeRelations --> SQL
-CodeDocuments --> CodeNode
-
-Fuse --> RouteResult
-Rerank --> RerankerProvider
-Context --> Sources
-Generate --> LLM
-Generate --> Answer
-Runtime --> Cache
-Runtime --> SQL : 比较 index_signature
-
-Answer --> LegacyAsk
-Answer --> KBAsk
-Answer --> WebSync
-Sources --> LegacyAsk
-Sources --> KBAsk
-Sources --> WebSync
-RouteResult --> LegacyAsk
-RouteResult --> KBAsk
-RouteResult --> WebSync
-
-Context --> DebugAsk : context_preview + sources + route
-Context --> SSE : Web SSE 时图内到此结束
-SSE --> LLM : 同一 Runtime 调用 stream()
-SSE --> WebStream
-WebSync --> Chat : 持久化结果
-WebStream --> Chat : streaming/completed/failed
-
-note right of Service
-  <b>不再存在 Web 手工五节点编排</b>
-  所有入口都使用编译后的 Graph。
-  同步请求在 Graph 内执行 generate；
-  SSE 只把最终 Token 流留在 Graph 外。
+允许单通道或多通道并行检索。
 end note
 
-note top of PARALLEL
-  三个节点始终作为独立 LangGraph 分支参与 Fan-out；
-  route 决定节点执行还是返回 skipped。
-  每个节点写独立状态键，单通道错误不会中断其他通道。
+note bottom of GlobalFusion
+先进行通道内部融合，
+再进行跨通道融合，
+最后统一重排。
 end note
 
-note bottom of ScopeResolver
-  API 已支持标签、目录和 metadata 范围；
-  当前检索调试页主要暴露通道和文档多选，
-  普通聊天页尚未提供完整范围选择控件。
-end note
-
-note bottom of Sources
-  完整实体子图和文档子图通过独立 API 查询。
-  会话 MessageOut 当前只公开 source 与 preview，
-  兼容 /ask 与知识库 /ask 返回更完整的 sources 字典。
-end note
-
-note right of Cache
-  Redis 当前有失效消息 publish，但没有 API 订阅端。
-  文档索引依靠 SQL index_signature 刷新；
-  分布式代码快照激活后需要额外刷新或重启 API。
+note bottom of CodeGraphStore
+当前代码知识与文档知识独立存储、独立召回，
+暂不建立 Code Symbol 与 Document Chunk 的显式关联。
 end note
 
 @enduml

@@ -3,6 +3,7 @@
 import logging
 
 from rag.providers.interfaces import Reranker
+from rag.retrieval_strategy import get_retrieval_policy
 
 logger = logging.getLogger(__name__)
 
@@ -11,12 +12,13 @@ def create_rerank_node(reranker: Reranker):
     def rerank_node(state):
         query = state.get("original_query") or state.get("query", "")
         docs = state.get("docs") or state.get("retrieval_candidates") or []
+        policy = get_retrieval_policy(state.get("retrieval_strategy"))
 
         if not docs:
             return {"docs": []}
 
         try:
-            reranked = reranker.rerank(query, docs)
+            reranked = reranker.rerank(query, docs, top_k=policy.rerank_k)
         except Exception as exc:
             logger.warning("Reranker failed, degrading by fusion score: %s", exc)
             reranked = sorted(
@@ -24,6 +26,7 @@ def create_rerank_node(reranker: Reranker):
                 key=lambda d: d.metadata.get("fusion_score", 0.0),
                 reverse=True,
             )
+            reranked = reranked[:policy.rerank_k]
             for doc in reranked:
                 doc.metadata["reranker_degraded"] = True
 

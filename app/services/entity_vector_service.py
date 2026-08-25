@@ -128,7 +128,12 @@ class EntityVectorService:
                 pass
         return {"status": "ready", "entity_count": len(entities), "index_name": index_name}
 
-    def semantic_search(self, query: str, limit: int = 10) -> list[dict]:
+    def semantic_search(
+        self,
+        query: str,
+        limit: int = 10,
+        query_embedding: list[float] | None = None,
+    ) -> list[dict]:
         state = self.state()
         if state is None or state.status != "ready" or not state.index_name:
             return []
@@ -137,8 +142,17 @@ class EntityVectorService:
             VectorIndexRef(name=state.index_name, knowledge_base_id=self.knowledge_base_id),
         )
         try:
-            rows = store.similarity_search_with_relevance_scores(query, k=limit)
+            if query_embedding is not None:
+                rows = store.similarity_search_by_vector_with_relevance_scores(
+                    query_embedding, k=limit
+                )
+            else:
+                rows = store.similarity_search_with_relevance_scores(query, k=limit)
             return [{**doc.metadata, "match_score": float(score)} for doc, score in rows]
         except (AttributeError, NotImplementedError):
-            docs = store.similarity_search(query, k=limit)
+            docs = (
+                store.similarity_search_by_vector(query_embedding, k=limit)
+                if query_embedding is not None
+                else store.similarity_search(query, k=limit)
+            )
             return [{**doc.metadata, "match_score": 1.0 / (index + 1)} for index, doc in enumerate(docs)]

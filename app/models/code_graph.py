@@ -112,3 +112,32 @@ class EntityVectorIndexState(Base):
     entity_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="empty")
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class RelationVectorIndexState(Base):
+    __tablename__ = "relation_vector_index_state"
+    __table_args__ = (UniqueConstraint("knowledge_base_id", name="uq_relation_vector_state_kb"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(String(36), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False)
+    index_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    embedding_fingerprint: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    graph_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    relation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="empty")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
+class CodeVectorIndexState(Base):
+    __tablename__ = "code_vector_index_state"
+    __table_args__ = (UniqueConstraint("knowledge_base_id", name="uq_code_vector_state_kb"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(String(36), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False)
+    snapshot_id: Mapped[str | None] = mapped_column(String(36), ForeignKey("code_snapshots.id", ondelete="SET NULL"), nullable=True)
+    index_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    embedding_fingerprint: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    symbol_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    symbol_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="empty")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())

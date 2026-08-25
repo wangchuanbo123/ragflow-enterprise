@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { onMounted, ref, watch } from 'vue'
 import * as api from '../api/client'
-import type { KnowledgeDocument, RetrievalDebugResult } from '../types'
+import type { KnowledgeDocument, RetrievalDebugResult, RetrievalStrategy } from '../types'
 
 const props = defineProps<{ knowledgeBaseId: string }>()
 const documents = ref<KnowledgeDocument[]>([])
 const query = ref('')
 const channels = ref<string[]>(['text'])
+const strategy = ref<RetrievalStrategy>('standard')
 const documentIds = ref<string[]>([])
 const result = ref<RetrievalDebugResult | null>(null)
 const running = ref(false)
@@ -20,6 +21,7 @@ async function run(): Promise<void> {
   running.value = true
   try {
     result.value = await api.debugRetrieval(props.knowledgeBaseId, query.value.trim(), {
+      strategy: strategy.value,
       channels: channels.value,
       scope: { document_ids: documentIds.value, tag_ids: [], folder_id: null, metadata: {} },
     })
@@ -32,10 +34,10 @@ onMounted(load)
 
 <template>
   <div class="debug-page">
-    <section class="query-card"><div><h2>检索调试</h2><p>只执行改写、路由、检索、融合和重排，不调用回答生成模型。</p></div><textarea v-model="query" placeholder="输入一个需要验证的检索问题"></textarea><div class="options"><fieldset><legend>检索通道</legend><label><input v-model="channels" type="checkbox" value="text" />文档向量 + BM25</label><label><input v-model="channels" type="checkbox" value="graph" />知识图谱</label><label><input v-model="channels" type="checkbox" value="code" />代码图（未就绪时自动降级）</label></fieldset><label class="scope">检索文档范围<select v-model="documentIds" multiple><option v-for="document in documents" :key="document.id" :value="document.id">{{ document.original_filename }}</option></select><small>不选择表示检索整个知识库，可按 Ctrl/⌘ 多选。</small></label></div><button :disabled="running || !query.trim() || !channels.length" @click="run">{{ running ? '正在执行检索…' : '运行检索调试' }}</button></section>
+    <section class="query-card"><div><h2>检索调试</h2><p>只执行自适应改写、共享向量、路由、检索、融合和重排，不调用回答生成模型。</p></div><textarea v-model="query" placeholder="输入一个需要验证的检索问题"></textarea><div class="options"><fieldset><legend>检索通道</legend><label><input v-model="channels" type="checkbox" value="text" />文档向量 + BM25</label><label><input v-model="channels" type="checkbox" value="graph" />知识图谱</label><label><input v-model="channels" type="checkbox" value="code" />代码图（未就绪时自动降级）</label></fieldset><label class="scope">检索档位<select v-model="strategy"><option value="fast">快速</option><option value="standard">标准</option><option value="deep">深度</option></select><small>档位控制召回、遍历、重排和上下文预算。</small></label><label class="scope">检索文档范围<select v-model="documentIds" multiple><option v-for="document in documents" :key="document.id" :value="document.id">{{ document.original_filename }}</option></select><small>不选择表示检索整个知识库，可按 Ctrl/⌘ 多选。</small></label></div><button :disabled="running || !query.trim() || !channels.length" @click="run">{{ running ? '正在执行检索…' : '运行检索调试' }}</button></section>
     <p v-if="error" class="error">{{ error }}</p>
     <template v-if="result">
-      <div class="route-grid"><article><span>路由方式</span><strong>{{ result.route.method }}</strong></article><article><span>实际通道</span><strong>{{ result.route.selected_channels.join(' + ') }}</strong></article><article><span>路由置信度</span><strong>{{ Math.round(result.route.confidence * 100) }}%</strong></article><article><span>融合候选</span><strong>{{ result.route.fused_count ?? 0 }}</strong></article></div>
+      <div class="route-grid"><article><span>检索档位</span><strong>{{ result.route.strategy }}</strong></article><article><span>实际通道</span><strong>{{ result.route.selected_channels.join(' + ') }}</strong></article><article><span>自适应改写</span><strong>{{ result.route.rewrite?.applied ? '已执行' : '已跳过' }}</strong></article><article><span>共享问题向量</span><strong>{{ result.route.query_embedding?.shared ? `${result.route.query_embedding.dimensions} 维` : result.route.query_embedding?.status }}</strong></article><article><span>路由置信度</span><strong>{{ Math.round(result.route.confidence * 100) }}%</strong></article><article><span>融合候选</span><strong>{{ result.route.fused_count ?? 0 }}</strong></article></div>
       <div class="result-grid"><section><header>路由解释</header><ul><li v-for="reason in result.route.reasons" :key="reason">{{ reason }}</li></ul><div v-for="(channel, name) in result.route.channel_results" :key="name" class="channel"><b>{{ name }}</b><span>{{ channel.status }} · {{ channel.count }} 条 · {{ channel.elapsed_ms }} ms</span></div></section><section><header>引用候选（{{ result.sources.length }}）</header><article v-for="source in result.sources" :key="source.source"><strong>{{ source.source }}</strong><p>{{ source.preview }}</p></article></section><section class="context"><header>最终上下文预览</header><pre>{{ result.context_preview || '没有构建出上下文' }}</pre></section></div>
     </template>
   </div>

@@ -377,3 +377,39 @@ def test_graph_build_recovers_interrupted_processing_chunk(db_engine):
         assert result["succeeded"] == 1
         assert chunk.graph_status == "completed"
         assert chunk.graph_error is None
+
+
+def test_graph_extractor_uses_custom_active_schema_types():
+    from rag.knowledge_graph.extractor import GraphExtractor
+
+    class SchemaAwareLLM:
+        def __init__(self):
+            self.prompt = ""
+
+        def generate(self, prompt):
+            self.prompt = prompt
+            return (
+                '{"chunks":[{"chunk_id":"custom-1","entities":['
+                '{"local_id":"e1","name":"订单中心","type":"BUSINESS_SERVICE"},'
+                '{"local_id":"e2","name":"支付中心","type":"BUSINESS_SERVICE"}],'
+                '"relations":[{"subject":"e1","predicate":"ROUTES_TO",'
+                '"object":"e2","evidence":"订单中心路由到支付中心","confidence":0.95}]}]}'
+            )
+
+    llm = SchemaAwareLLM()
+    extractor = GraphExtractor(llm=llm, max_retries=0)
+    extractor.configure_schema(
+        entity_types=["BUSINESS_SERVICE"],
+        relation_types=["ROUTES_TO"],
+        prompt_prefix="只抽取生产系统之间的调用关系。",
+    )
+    result = extractor.extract_batch([{
+        "chunk_id": "custom-1",
+        "content": "订单中心路由到支付中心",
+    }])
+
+    assert result[0].entities[0].type == "BUSINESS_SERVICE"
+    assert result[0].relations[0].predicate == "ROUTES_TO"
+    assert "BUSINESS_SERVICE" in llm.prompt
+    assert "ROUTES_TO" in llm.prompt
+    assert llm.prompt.startswith("只抽取生产系统之间的调用关系。")

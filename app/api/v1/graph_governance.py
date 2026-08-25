@@ -14,15 +14,21 @@ from app.schemas.graph_governance import (
     EntityMergeCreate,
     EntityMergeOut,
     EntityVectorStateOut,
+    GraphAutomationSettings,
     GraphBuildRequest,
     GraphQualityOut,
     GraphSchemaCreate,
     GraphSchemaOut,
+    GraphSchemaUpdate,
+    RelationMergeCreate,
     ReviewItemOut,
     ReviewResolve,
+    RelationVectorStateOut,
 )
+from app.schemas.knowledge_graph import GraphCorrectionOut
 from app.services.entity_vector_service import EntityVectorService
 from app.services.graph_governance_service import GraphGovernanceService
+from app.services.relation_vector_service import RelationVectorService
 
 router = APIRouter(prefix="/knowledge-bases", tags=["graph-governance"])
 
@@ -62,6 +68,41 @@ def create_graph_schema(knowledge_base_id: str, payload: GraphSchemaCreate, curr
         raise bad_request(str(exc)) from exc
 
 
+@router.put("/{knowledge_base_id}/knowledge-graph/schemas/{schema_id}", response_model=GraphSchemaOut)
+def update_graph_schema(knowledge_base_id: str, schema_id: str, payload: GraphSchemaUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require(db, knowledge_base_id, current_user, edit=True)
+    try:
+        schema = GraphGovernanceService(db, knowledge_base_id).update_schema(
+            schema_id,
+            entity_types=payload.entity_types,
+            relation_types=payload.relation_types,
+            normalization_rules=payload.normalization_rules,
+            extraction_prompt=payload.extraction_prompt,
+        )
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
+    if schema is None:
+        raise not_found("图谱 Schema 不存在")
+    return schema
+
+
+@router.get("/{knowledge_base_id}/knowledge-graph/automation", response_model=GraphAutomationSettings)
+def graph_automation_settings(knowledge_base_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require(db, knowledge_base_id, current_user)
+    return GraphGovernanceService(db, knowledge_base_id).automation_settings()
+
+
+@router.put("/{knowledge_base_id}/knowledge-graph/automation", response_model=GraphAutomationSettings)
+def update_graph_automation_settings(knowledge_base_id: str, payload: GraphAutomationSettings, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require(db, knowledge_base_id, current_user, edit=True)
+    try:
+        return GraphGovernanceService(db, knowledge_base_id).update_automation_settings(
+            auto_build_enabled=payload.auto_build_enabled
+        )
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
+
+
 @router.post("/{knowledge_base_id}/knowledge-graph/schemas/{schema_id}/activate", response_model=GraphSchemaOut)
 def activate_graph_schema(knowledge_base_id: str, schema_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     _require(db, knowledge_base_id, current_user, edit=True)
@@ -79,6 +120,7 @@ def request_graph_build(knowledge_base_id: str, payload: GraphBuildRequest, curr
         current_user.id,
         {
             "rebuild_entity_vectors": payload.rebuild_entity_vectors,
+            "rebuild_relation_vectors": payload.rebuild_relation_vectors,
             "rebuild_communities": payload.rebuild_communities,
         },
     )
@@ -107,6 +149,19 @@ def entity_vector_state(knowledge_base_id: str, current_user: User = Depends(get
 def rebuild_entity_vectors(knowledge_base_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     _require(db, knowledge_base_id, current_user, edit=True)
     return EntityVectorService(db, knowledge_base_id).request_rebuild(current_user.id)
+
+
+@router.get("/{knowledge_base_id}/knowledge-graph/relation-vector", response_model=RelationVectorStateOut)
+def relation_vector_state(knowledge_base_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require(db, knowledge_base_id, current_user)
+    state = RelationVectorService(db, knowledge_base_id).state()
+    return state or RelationVectorStateOut()
+
+
+@router.post("/{knowledge_base_id}/knowledge-graph/relation-vector/rebuild", response_model=IndexJobOut, status_code=202)
+def rebuild_relation_vectors(knowledge_base_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require(db, knowledge_base_id, current_user, edit=True)
+    return RelationVectorService(db, knowledge_base_id).request_rebuild(current_user.id)
 
 
 @router.get("/{knowledge_base_id}/knowledge-graph/reviews", response_model=list[ReviewItemOut])
@@ -156,6 +211,43 @@ def revert_entity_merge(knowledge_base_id: str, merge_id: str, current_user: Use
     record = GraphGovernanceService(db, knowledge_base_id).revert_merge(merge_id, current_user.id)
     if record is None:
         raise not_found("实体合并记录不存在")
+    return record
+
+
+@router.get("/{knowledge_base_id}/knowledge-graph/relation-merges", response_model=list[GraphCorrectionOut])
+def list_relation_merges(knowledge_base_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require(db, knowledge_base_id, current_user)
+    return GraphGovernanceService(db, knowledge_base_id).list_relation_merges()
+
+
+@router.post("/{knowledge_base_id}/knowledge-graph/relation-merge-candidates/scan")
+def scan_relation_merge_candidates(knowledge_base_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require(db, knowledge_base_id, current_user, edit=True)
+    return GraphGovernanceService(db, knowledge_base_id).scan_relation_merge_candidates()
+
+
+@router.post("/{knowledge_base_id}/knowledge-graph/relation-merges", response_model=GraphCorrectionOut, status_code=201)
+def create_relation_merge(knowledge_base_id: str, payload: RelationMergeCreate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require(db, knowledge_base_id, current_user, edit=True)
+    try:
+        return GraphGovernanceService(db, knowledge_base_id).merge_relations(
+            payload.canonical_relation_id,
+            payload.merged_relation_id,
+            payload.reason,
+            current_user.id,
+        )
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
+
+
+@router.post("/{knowledge_base_id}/knowledge-graph/relation-merges/{merge_id}/revert", response_model=GraphCorrectionOut)
+def revert_relation_merge(knowledge_base_id: str, merge_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require(db, knowledge_base_id, current_user, edit=True)
+    record = GraphGovernanceService(db, knowledge_base_id).revert_relation_merge(
+        merge_id, current_user.id
+    )
+    if record is None or record.action != "merge_relation":
+        raise not_found("关系合并记录不存在")
     return record
 
 

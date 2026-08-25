@@ -10,6 +10,7 @@ from app.core.config import RETRIEVAL_SCOPE_MAX_IDS
 
 
 RetrievalChannel = Literal["text", "graph", "code"]
+RetrievalStrategy = Literal["fast", "standard", "deep"]
 
 
 class RetrievalScope(BaseModel):
@@ -28,6 +29,7 @@ class RetrievalScope(BaseModel):
 class RetrievalOptions(BaseModel):
     channels: list[RetrievalChannel] = Field(default_factory=list, max_length=3)
     scope: RetrievalScope = Field(default_factory=RetrievalScope)
+    strategy: RetrievalStrategy = "standard"
 
 
 class AskRequest(BaseModel):
@@ -46,6 +48,9 @@ class RouteDecisionOut(BaseModel):
     scope_match_count: int | None = None
     channel_results: dict[str, dict] = Field(default_factory=dict)
     fused_count: int = 0
+    strategy: RetrievalStrategy = "standard"
+    rewrite: dict = Field(default_factory=dict)
+    query_embedding: dict = Field(default_factory=dict)
 
 
 class AskResponse(BaseModel):

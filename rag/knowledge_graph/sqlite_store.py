@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import delete, func, literal, or_, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from app.models.knowledge_graph import (
     KgAlias,
@@ -21,6 +21,7 @@ from app.models.knowledge_graph import (
 from app.models.graph_governance import KgEntityMerge
 from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 from rag.knowledge_graph.normalizer import normalize_alias, normalize_name
+from rag.knowledge_graph.relation_vocabulary import relation_query_scores
 from rag.knowledge_graph.schemas import ChunkExtraction
 
 logger = logging.getLogger(__name__)
@@ -443,7 +444,7 @@ class SqliteGraphStore:
         hidden = {
             correction.target_id
             for correction in corrections
-            if correction.action == "hide_relation"
+            if correction.action in {"hide_relation", "merge_relation"}
         }
         relation_updates = {
             correction.target_id: correction
@@ -525,20 +526,186 @@ class SqliteGraphStore:
                 merged_relations[key] = item
         return list(merged_relations.values())[offset:offset + limit]
 
+    def search_relations(self, query: str, limit: int = 20) -> list[dict]:
+        """Match relation predicates using canonical names and multilingual aliases."""
+        scores = relation_query_scores(query)
+        if not scores or limit <= 0:
+            return []
+
+        corrections = self._active_corrections()
+        updated_ids = []
+        manual_ids = []
+        for correction in corrections:
+            predicate = str((correction.payload_json or {}).get("predicate", ""))
+            if predicate not in scores:
+                continue
+            if correction.action == "update_relation" and correction.target_id:
+                updated_ids.append(correction.target_id)
+            elif correction.action == "add_relation":
+                manual_ids.append(f"manual:{correction.id}")
+
+        candidate_limit = max(limit * 4, limit)
+        base_ids = list(self.db.scalars(
+            select(KgRelation.id)
+            .where(
+                KgRelation.knowledge_base_id == self.knowledge_base_id,
+                KgRelation.predicate.in_(list(scores)),
+            )
+            .order_by(KgRelation.confidence.desc(), KgRelation.id)
+            .limit(candidate_limit)
+        ))
+        relation_ids = list(dict.fromkeys([*base_ids, *updated_ids, *manual_ids]))
+        matches = []
+        for relation in self.get_relations(relation_ids):
+            match_score = scores.get(relation["predicate"], 0.0)
+            if match_score <= 0:
+                continue
+            matches.append({
+                **relation,
+                "match_score": match_score,
+                "match_method": "relation_lexical",
+            })
+        return sorted(
+            matches,
+            key=lambda item: (
+                -float(item["match_score"]),
+                -float(item["confidence"]),
+                item["relation_id"],
+            ),
+        )[:limit]
+
+    def get_relations(self, relation_ids: list[str]) -> list[dict]:
+        """Hydrate base/manual relations and apply active governance overlays."""
+        if not relation_ids:
+            return []
+
+        base_ids = [item for item in relation_ids if not item.startswith("manual:")]
+        manual_ids = {
+            item.split(":", 1)[1]
+            for item in relation_ids
+            if item.startswith("manual:")
+        }
+        subject = aliased(KgEntity)
+        obj = aliased(KgEntity)
+        rows = self.db.execute(
+            select(KgRelation, subject, obj)
+            .join(subject, subject.id == KgRelation.subject_entity_id)
+            .join(obj, obj.id == KgRelation.object_entity_id)
+            .where(
+                KgRelation.knowledge_base_id == self.knowledge_base_id,
+                KgRelation.id.in_(base_ids),
+            )
+        ).all() if base_ids else []
+
+        corrections = self._active_corrections()
+        hidden = {
+            correction.target_id
+            for correction in corrections
+            if correction.action in {"hide_relation", "merge_relation"} and correction.target_id
+        }
+        relation_updates = {
+            correction.target_id: correction
+            for correction in corrections
+            if correction.action == "update_relation" and correction.target_id
+        }
+        entity_overrides = self._entity_overrides()
+        items: list[dict] = []
+        for relation, subject_entity, object_entity in rows:
+            if relation.id in hidden:
+                continue
+            update = relation_updates.get(relation.id)
+            payload = (update.payload_json or {}) if update else {}
+            items.append({
+                "relation_id": relation.id,
+                "hop": 0,
+                "subject_id": subject_entity.id,
+                "subject_name": entity_overrides.get(subject_entity.id, {}).get(
+                    "canonical_name", subject_entity.canonical_name
+                ),
+                "subject_type": subject_entity.entity_type,
+                "predicate": payload.get("predicate", relation.predicate),
+                "object_id": object_entity.id,
+                "object_name": entity_overrides.get(object_entity.id, {}).get(
+                    "canonical_name", object_entity.canonical_name
+                ),
+                "object_type": object_entity.entity_type,
+                "confidence": float(payload.get("confidence", relation.confidence)),
+                **({"manual": True, "correction_id": update.id} if update else {}),
+            })
+
+        if manual_ids:
+            for correction in corrections:
+                if correction.id not in manual_ids or correction.action != "add_relation":
+                    continue
+                payload = correction.payload_json or {}
+                subject_entity = self.db.get(KgEntity, payload.get("subject_entity_id"))
+                object_entity = self.db.get(KgEntity, payload.get("object_entity_id"))
+                if subject_entity is None or object_entity is None:
+                    continue
+                items.append({
+                    "relation_id": f"manual:{correction.id}",
+                    "hop": 0,
+                    "subject_id": subject_entity.id,
+                    "subject_name": entity_overrides.get(subject_entity.id, {}).get(
+                        "canonical_name", subject_entity.canonical_name
+                    ),
+                    "subject_type": subject_entity.entity_type,
+                    "predicate": payload["predicate"],
+                    "object_id": object_entity.id,
+                    "object_name": entity_overrides.get(object_entity.id, {}).get(
+                        "canonical_name", object_entity.canonical_name
+                    ),
+                    "object_type": object_entity.entity_type,
+                    "confidence": float(payload.get("confidence", 1.0)),
+                    "manual": True,
+                    "correction_id": correction.id,
+                })
+
+        merge_map = self._merge_map()
+        merged: dict[tuple[str, str, str], dict] = {}
+        for relation in items:
+            item = dict(relation)
+            item["subject_id"] = merge_map.get(item["subject_id"], item["subject_id"])
+            item["object_id"] = merge_map.get(item["object_id"], item["object_id"])
+            if item["subject_id"] == item["object_id"]:
+                continue
+            for prefix in ("subject", "object"):
+                entity = self.db.get(KgEntity, item[f"{prefix}_id"])
+                if entity is not None:
+                    item[f"{prefix}_name"] = entity_overrides.get(entity.id, {}).get(
+                        "canonical_name", entity.canonical_name
+                    )
+                    item[f"{prefix}_type"] = entity.entity_type
+            key = (item["subject_id"], item["predicate"], item["object_id"])
+            previous = merged.get(key)
+            if previous is None or item["confidence"] > previous["confidence"]:
+                merged[key] = item
+
+        by_id = {item["relation_id"]: item for item in merged.values()}
+        return [by_id[item] for item in relation_ids if item in by_id]
+
     def get_relation_evidence(self, relation_ids: list[str]) -> list[dict]:
         """获取关系的原文证据。"""
         if not relation_ids:
             return []
         base_relation_ids = [item for item in relation_ids if not item.startswith("manual:")]
+        evidence_relation_map = {item: item for item in base_relation_ids}
+        for correction in self._active_corrections():
+            if correction.action != "merge_relation" or not correction.target_id:
+                continue
+            canonical_id = str((correction.payload_json or {}).get("canonical_relation_id", ""))
+            if canonical_id in base_relation_ids:
+                evidence_relation_map[correction.target_id] = canonical_id
+        evidence_source_ids = list(evidence_relation_map)
         evidence = self.db.scalars(
             select(KgRelationEvidence).where(
                 KgRelationEvidence.knowledge_base_id == self.knowledge_base_id,
-                KgRelationEvidence.relation_id.in_(base_relation_ids)
+                KgRelationEvidence.relation_id.in_(evidence_source_ids)
             )
-        ).all() if base_relation_ids else []
+        ).all() if evidence_source_ids else []
         result = [
             {
-                "relation_id": ev.relation_id,
+                "relation_id": evidence_relation_map.get(ev.relation_id, ev.relation_id),
                 "document_id": ev.document_id,
                 "chunk_id": ev.chunk_id,
                 "quote": ev.quote,
@@ -632,7 +799,7 @@ class SqliteGraphStore:
         hidden = {
             correction.target_id
             for correction in corrections
-            if correction.action == "hide_relation"
+            if correction.action in {"hide_relation", "merge_relation"}
         }
         relation_updates = {
             correction.target_id: correction

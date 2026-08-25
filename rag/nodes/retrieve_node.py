@@ -30,7 +30,15 @@ def create_retrieve_node(retriever: Retriever):
             return {"docs": [], "retrieval_candidates": []}
 
         allowed_document_ids = state.get("allowed_document_ids")
-        if isinstance(retriever, HybridRRFRetriever):
+        retrieve_with_options = getattr(retriever, "retrieve_with_options", None)
+        if callable(retrieve_with_options):
+            docs = retrieve_with_options(
+                unique_queries,
+                query_embedding=state.get("query_embedding"),
+                strategy=state.get("retrieval_strategy", "standard"),
+                allowed_document_ids=allowed_document_ids,
+            )
+        elif isinstance(retriever, HybridRRFRetriever):
             if len(unique_queries) > 1:
                 docs = retriever.retrieve_multi_query(
                     unique_queries,

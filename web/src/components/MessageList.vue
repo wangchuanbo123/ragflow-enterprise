@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import type { Message } from '../types'
+import type { Message, RetrievalStrategy } from '../types'
 
 defineProps<{
   messages: Message[]
@@ -8,14 +8,15 @@ defineProps<{
   sending: boolean
 }>()
 
-const emit = defineEmits<{ (e: 'retry', content: string): void }>()
+const emit = defineEmits<{ (e: 'retry', payload: { content: string; strategy: RetrievalStrategy }): void }>()
 
 const draft = ref('')
+const strategy = ref<RetrievalStrategy>('standard')
 
 function submit(): void {
   const text = draft.value.trim()
   if (!text) return
-  emit('retry', text)
+  emit('retry', { content: text, strategy: strategy.value })
   draft.value = ''
 }
 
@@ -62,6 +63,7 @@ function toggleSources(e: Event): void {
 
           <div v-if="m.route" class="route-note" :title="m.route.reasons.join('；')">
             检索：{{ m.route.selected_channels.map((item) => ({ text: '文档', graph: '图谱', code: '代码' }[item])).join(' + ') }}
+            <span>{{ { fast: '快速', standard: '标准', deep: '深度' }[m.route.strategy || 'standard'] }}</span>
             <span>置信度 {{ Math.round(m.route.confidence * 100) }}%</span>
           </div>
 
@@ -79,6 +81,11 @@ function toggleSources(e: Event): void {
     </div>
 
     <div class="composer">
+      <select v-model="strategy" class="strategy" aria-label="检索策略">
+        <option value="fast">快速</option>
+        <option value="standard">标准</option>
+        <option value="deep">深度</option>
+      </select>
       <textarea
         v-model="draft"
         class="input"
@@ -194,6 +201,7 @@ function toggleSources(e: Event): void {
   border-top: 1px solid #e5e7eb;
   background: #fff;
 }
+.strategy { align-self: stretch; padding: 0 8px; border: 1px solid #ddd; border-radius: 8px; background: #fff; color: #526075; }
 .input {
   flex: 1;
   resize: none;

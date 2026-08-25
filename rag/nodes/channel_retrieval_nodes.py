@@ -13,6 +13,7 @@ from app.core.config import (
 from rag.nodes.retrieve_node import create_retrieve_node
 from rag.retrieval_scope import filter_documents_by_scope
 from rag.retrievers.hybrid_retriever import weighted_rrf_fusion
+from rag.retrieval_strategy import get_retrieval_policy
 
 
 def create_text_retrieve_node(retriever):
@@ -141,7 +142,11 @@ def fusion_node(state):
         ranked.append((graph_docs, GRAPH_RETRIEVAL_WEIGHT or 1.0))
     if code_docs:
         ranked.append((code_docs, CODE_RETRIEVAL_WEIGHT or 1.0))
-    documents = weighted_rrf_fusion(ranked) if ranked else []
+    policy = get_retrieval_policy(state.get("retrieval_strategy"))
+    documents = (
+        weighted_rrf_fusion(ranked, candidate_k=policy.candidate_k)
+        if ranked else []
+    )
     route = dict(state.get("route") or {})
     route["channel_results"] = {
         "text": state.get("text_channel_result") or {"status": "skipped", "count": 0, "elapsed_ms": 0},
