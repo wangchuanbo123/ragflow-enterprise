@@ -107,6 +107,20 @@ class GraphCommunity(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
 
 
+class GraphCommunityState(Base):
+    """Deferred community lifecycle: empty -> stale -> ready (stale after graph edits)."""
+
+    __tablename__ = "graph_community_states"
+    __table_args__ = (UniqueConstraint("knowledge_base_id", name="uq_graph_community_state_kb"),)
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    knowledge_base_id: Mapped[str] = mapped_column(String(36), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="empty")
+    communities: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    entities: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    built_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now(), onupdate=func.now())
+
+
 class GraphCommunityMember(Base):
     __tablename__ = "graph_community_members"
     __table_args__ = (UniqueConstraint("community_id", "entity_id", name="uq_graph_community_member"),)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from app.core.config import (
     CELERY_CONNECTOR_SCHEDULE_TASK_NAME,
+    CELERY_GRAPH_MAINTENANCE_TASK_NAME,
     CELERY_INDEX_TASK_NAME,
     CELERY_RECONCILE_TASK_NAME,
 )
@@ -33,3 +34,10 @@ def schedule_due_connectors() -> dict:
     from app.services.connector_scheduler import enqueue_due_sources
 
     return {"queued": enqueue_due_sources()}
+
+
+@celery_app.task(name=CELERY_GRAPH_MAINTENANCE_TASK_NAME)
+def schedule_graph_maintenance() -> dict:
+    from app.services.graph_maintenance import enqueue_stale_community_rebuilds
+
+    return {"queued": enqueue_stale_community_rebuilds()}

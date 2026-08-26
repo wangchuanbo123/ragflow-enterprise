@@ -305,23 +305,46 @@ def _process_job(
 
                     options = job.options_json or {}
                     mode = options.get("mode", "pending")
+                    vector_update = options.get("vector_update", "full")
+                    community_update = options.get("community_update", "full")
                     result = GraphBuildService(
                         db, knowledge_base_id=job.knowledge_base_id
                     ).build_graph(
                         only_pending=mode != "full",
                         retry_failed=mode == "retry_failed",
                     )
+                    changes = result.get("changes", {})
                     governance = GraphGovernanceService(
                         db, job.knowledge_base_id, task_queue=container.task_queue
                     )
                     report = governance.assess_quality(job.requested_by)
-                    if options.get("rebuild_communities", True):
+                    if community_update == "defer":
+                        # 图谱立即可用，社区延迟到维护任务重建。
+                        if int(result.get("succeeded", 0)) or changes:
+                            governance.mark_communities_stale()
+                    elif community_update == "affected":
+                        result["communities"] = governance.rebuild_communities(
+                            changed_entity_ids=changes.get("community_entity_ids")
+                        )
+                    else:
                         result["communities"] = governance.rebuild_communities()
-                    if options.get("rebuild_entity_vectors", True):
+                    if vector_update == "incremental":
+                        result["entity_vectors"] = EntityVectorService(
+                            db, job.knowledge_base_id, container=container
+                        ).apply_changes(
+                            changes.get("changed_entity_ids"),
+                            changes.get("deleted_entity_ids"),
+                        )
+                        result["relation_vectors"] = RelationVectorService(
+                            db, job.knowledge_base_id, container=container
+                        ).apply_changes(
+                            changes.get("changed_relation_ids"),
+                            changes.get("deleted_relation_ids"),
+                        )
+                    elif vector_update == "full":
                         result["entity_vectors"] = EntityVectorService(
                             db, job.knowledge_base_id, container=container
                         ).rebuild()
-                    if options.get("rebuild_relation_vectors", True):
                         result["relation_vectors"] = RelationVectorService(
                             db, job.knowledge_base_id, container=container
                         ).rebuild()
@@ -348,10 +371,32 @@ def _process_job(
                         failed_items=failed,
                         error_message=("图谱质量门禁未全部通过" if report.status != "ready" else None),
                     )
+                elif job.job_type == "graph_maintenance":
+                    from app.services.graph_governance_service import GraphGovernanceService
+
+                    governance = GraphGovernanceService(
+                        db, job.knowledge_base_id, task_queue=container.task_queue
+                    )
+                    result = {}
+                    state = governance.community_state(create=False)
+                    if state is not None and state.status == "stale":
+                        result["communities"] = governance.rebuild_communities()
+                    report = governance.assess_quality(job.requested_by)
+                    job_repo.update(
+                        job,
+                        status="completed" if report.status == "ready" else "partial",
+                        total_items=1,
+                        processed_items=1,
+                        succeeded_items=1,
+                        failed_items=0,
+                        error_message=(
+                            None if report.status == "ready" else "图谱质量门禁未全部通过"
+                        ),
+                    )
                 else:
                     raise ValueError(f"Unsupported index job type: {job.job_type}")
 
-                if job.job_type in {"sync", "rebuild", "file"}:
+                if job.job_type in {"sync", "rebuild", "file", "graph_rebuild"}:
                     completed_document_job = job_repo.get(job_id)
                     if (
                         completed_document_job is not None

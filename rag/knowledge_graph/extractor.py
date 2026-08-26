@@ -159,6 +159,8 @@ class GraphExtractor:
         chunk_id: str,
         chunk_content: str,
         metadata: dict | None = None,
+        *,
+        llm=None,
     ) -> ChunkExtraction:
         """从单个 chunk 提取实体关系。失败时抛出异常。"""
         prompt = EXTRACTION_PROMPT.format(
@@ -170,6 +172,7 @@ class GraphExtractor:
         if self.prompt_prefix:
             prompt = self.prompt_prefix.strip() + "\n\n" + prompt
 
+        active_llm = llm or self.llm
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             current_prompt = prompt
@@ -178,7 +181,7 @@ class GraphExtractor:
                     f"\n\n上一次输出解析失败：{last_error}。请只输出有效 JSON。"
                 )
             try:
-                raw = self.llm.generate(current_prompt)
+                raw = active_llm.generate(current_prompt)
                 return parse_extraction_response(
                     raw,
                     chunk_id,
@@ -194,10 +197,13 @@ class GraphExtractor:
     def extract_batch(
         self,
         chunks: list[dict],
+        *,
+        llm=None,
     ) -> list[ChunkExtraction]:
         """Extract multiple chunks with one LLM request."""
         if not chunks:
             return []
+        active_llm = llm or self.llm
 
         payload = [
             {
@@ -230,7 +236,7 @@ class GraphExtractor:
                     f"\n\n上一次输出解析失败：{last_error}。请只输出有效 JSON。"
                 )
             try:
-                raw = self.llm.generate(current_prompt)
+                raw = active_llm.generate(current_prompt)
                 cleaned = _strip_markdown_and_think(raw)
                 data = json.loads(cleaned)
                 raw_chunks = data.get("chunks")

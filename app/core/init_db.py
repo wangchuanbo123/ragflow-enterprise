@@ -53,3 +53,5 @@ def init_app() -> None:
     start_worker()
     from app.services.connector_scheduler import start_connector_scheduler
     start_connector_scheduler()
+    from app.services.graph_maintenance import start_graph_maintenance_scheduler
+    start_graph_maintenance_scheduler()

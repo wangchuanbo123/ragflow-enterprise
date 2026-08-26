@@ -16,6 +16,14 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _due(now: datetime):
+    """Jobs without a visible_at gate are due immediately; others wait for it."""
+    return or_(
+        IndexJob.visible_at.is_(None),
+        IndexJob.visible_at <= now,
+    )
+
+
 class IndexJobRepository:
     def __init__(
         self,
@@ -80,10 +88,12 @@ class IndexJobRepository:
         worker_id: str = "inline-worker",
         lease_seconds: int = 300,
     ) -> IndexJob | None:
+        now = _utcnow()
         pending = select(IndexJob.id).where(
             IndexJob.status == "pending",
             IndexJob.cancel_requested.is_(False),
             IndexJob.attempt_count < IndexJob.max_attempts,
+            _due(now),
         )
         if self.knowledge_base_id is not None:
             pending = pending.where(
@@ -111,6 +121,7 @@ class IndexJobRepository:
                 IndexJob.status == "pending",
                 IndexJob.cancel_requested.is_(False),
                 IndexJob.attempt_count < IndexJob.max_attempts,
+                _due(now),
             )
             .values(
                 status="running",
@@ -173,6 +184,7 @@ class IndexJobRepository:
                     "sync", "rebuild", "connector_sync", "code_index",
                     "graph_rebuild", "entity_vector_rebuild",
                     "relation_vector_rebuild", "code_vector_rebuild",
+                    "graph_maintenance",
                 ]),
             )
         )
@@ -274,10 +286,12 @@ class IndexJobRepository:
         return self.recover_expired_leases()
 
     def list_pending_ids(self, limit: int = 500) -> list[str]:
+        now = _utcnow()
         stmt = select(IndexJob.id).where(
             IndexJob.status == "pending",
             IndexJob.cancel_requested.is_(False),
             IndexJob.attempt_count < IndexJob.max_attempts,
+            _due(now),
         )
         if self.knowledge_base_id is not None:
             stmt = stmt.where(

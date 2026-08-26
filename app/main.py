@@ -72,7 +72,9 @@ async def lifespan(app: FastAPI):
     finally:
         from app.services.index_worker import stop_worker
         from app.services.connector_scheduler import stop_connector_scheduler
+        from app.services.graph_maintenance import stop_graph_maintenance_scheduler
 
+        stop_graph_maintenance_scheduler()
         stop_connector_scheduler()
         stop_worker()
 

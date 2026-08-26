@@ -78,6 +78,22 @@ def get_llm_profile(purpose: str) -> ModelProfile:
             config.GRAPH_EXTRACTION_BASE_URL,
             ("generate",),
         )
+    if purpose == "graph_escalation":
+        # High-quality fallback model for empty or low-confidence extractions.
+        extraction = get_llm_profile("extraction")
+        provider = (
+            config.GRAPH_ESCALATION_PROVIDER
+            if config.GRAPH_ESCALATION_PROVIDER != "current"
+            else extraction.provider
+        )
+        return ModelProfile(
+            purpose="graph_escalation",
+            provider=provider,
+            model=config.GRAPH_ESCALATION_MODEL or extraction.model,
+            api_key=config.GRAPH_ESCALATION_API_KEY or extraction.api_key,
+            base_url=config.GRAPH_ESCALATION_BASE_URL or extraction.base_url,
+            required_capabilities=("generate",),
+        )
     if purpose not in values:
         raise ValueError(f"Unsupported model purpose: {purpose}")
     provider, model, api_key, base_url, capabilities = values[purpose]

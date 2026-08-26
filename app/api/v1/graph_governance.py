@@ -11,6 +11,7 @@ from app.repositories.knowledge_base_repository import KnowledgeBaseRepository
 from app.schemas.document import IndexJobOut
 from app.schemas.graph_governance import (
     CommunityOut,
+    CommunityStateOut,
     EntityMergeCreate,
     EntityMergeOut,
     EntityVectorStateOut,
@@ -18,6 +19,7 @@ from app.schemas.graph_governance import (
     GraphBuildRequest,
     GraphQualityOut,
     GraphSchemaCreate,
+    GraphSchemaImpactOut,
     GraphSchemaOut,
     GraphSchemaUpdate,
     RelationMergeCreate,
@@ -103,10 +105,31 @@ def update_graph_automation_settings(knowledge_base_id: str, payload: GraphAutom
         raise bad_request(str(exc)) from exc
 
 
-@router.post("/{knowledge_base_id}/knowledge-graph/schemas/{schema_id}/activate", response_model=GraphSchemaOut)
-def activate_graph_schema(knowledge_base_id: str, schema_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+@router.get("/{knowledge_base_id}/knowledge-graph/schemas/{schema_id}/impact", response_model=GraphSchemaImpactOut)
+def estimate_graph_schema_impact(knowledge_base_id: str, schema_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """激活前的差异化重建影响估算：受影响文档/Chunk 与预计 LLM 请求。"""
     _require(db, knowledge_base_id, current_user, edit=True)
-    schema = GraphGovernanceService(db, knowledge_base_id).activate_schema(schema_id)
+    estimate = GraphGovernanceService(db, knowledge_base_id).estimate_schema_rebuild(schema_id)
+    if estimate is None:
+        raise not_found("图谱 Schema 不存在")
+    return estimate
+
+
+@router.post("/{knowledge_base_id}/knowledge-graph/schemas/{schema_id}/activate", response_model=GraphSchemaOut)
+def activate_graph_schema(
+    knowledge_base_id: str,
+    schema_id: str,
+    reprocess: str = Query(default="auto", pattern="^(auto|incremental|full)$"),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require(db, knowledge_base_id, current_user, edit=True)
+    try:
+        schema = GraphGovernanceService(db, knowledge_base_id).activate_schema(
+            schema_id, reprocess=reprocess
+        )
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
     if schema is None:
         raise not_found("图谱 Schema 不存在")
     return schema
@@ -115,14 +138,24 @@ def activate_graph_schema(knowledge_base_id: str, schema_id: str, current_user: 
 @router.post("/{knowledge_base_id}/knowledge-graph/build", response_model=IndexJobOut, status_code=status.HTTP_202_ACCEPTED)
 def request_graph_build(knowledge_base_id: str, payload: GraphBuildRequest, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     _require(db, knowledge_base_id, current_user, edit=True)
-    return GraphGovernanceService(db, knowledge_base_id).request_build(
+    service = GraphGovernanceService(db, knowledge_base_id)
+    if payload.profile is not None:
+        return service.request_build(requested_by=current_user.id, profile=payload.profile)
+    vector_update = None
+    if payload.rebuild_entity_vectors is not None or payload.rebuild_relation_vectors is not None:
+        full_vectors = bool(
+            (payload.rebuild_entity_vectors if payload.rebuild_entity_vectors is not None else True)
+            and (payload.rebuild_relation_vectors if payload.rebuild_relation_vectors is not None else True)
+        )
+        vector_update = "full" if full_vectors else "none"
+    community_update = None
+    if payload.rebuild_communities is not None:
+        community_update = "full" if payload.rebuild_communities else "defer"
+    return service.request_build(
         payload.mode,
         current_user.id,
-        {
-            "rebuild_entity_vectors": payload.rebuild_entity_vectors,
-            "rebuild_relation_vectors": payload.rebuild_relation_vectors,
-            "rebuild_communities": payload.rebuild_communities,
-        },
+        vector_update=vector_update,
+        community_update=community_update,
     )
 
 
@@ -255,6 +288,13 @@ def revert_relation_merge(knowledge_base_id: str, merge_id: str, current_user: U
 def list_graph_communities(knowledge_base_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     _require(db, knowledge_base_id, current_user)
     return GraphGovernanceService(db, knowledge_base_id).list_communities()
+
+
+@router.get("/{knowledge_base_id}/knowledge-graph/community-status", response_model=CommunityStateOut)
+def graph_community_status(knowledge_base_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require(db, knowledge_base_id, current_user)
+    state = GraphGovernanceService(db, knowledge_base_id).community_state(create=False)
+    return state or CommunityStateOut()
 
 
 @router.post("/{knowledge_base_id}/knowledge-graph/communities/rebuild")

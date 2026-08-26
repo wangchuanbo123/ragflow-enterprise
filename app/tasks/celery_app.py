@@ -11,12 +11,14 @@ except ImportError as exc:  # pragma: no cover - enterprise dependency guard
 
 from app.core.config import (
     CELERY_BROKER_URL,
+    CELERY_CONNECTOR_SCHEDULE_TASK_NAME,
+    CELERY_GRAPH_MAINTENANCE_TASK_NAME,
     CELERY_INDEX_QUEUE,
     CELERY_INDEX_TASK_NAME,
-    CELERY_CONNECTOR_SCHEDULE_TASK_NAME,
     CELERY_RECONCILE_TASK_NAME,
     CELERY_RESULT_BACKEND,
     CONNECTOR_SCHEDULER_INTERVAL_SECONDS,
+    GRAPH_COMMUNITY_MAINTENANCE_INTERVAL_SECONDS,
     INDEX_JOB_RECONCILE_SECONDS,
 )
 
@@ -35,6 +37,7 @@ celery_app.conf.update(
         CELERY_INDEX_TASK_NAME: {"queue": CELERY_INDEX_QUEUE},
         CELERY_RECONCILE_TASK_NAME: {"queue": CELERY_INDEX_QUEUE},
         CELERY_CONNECTOR_SCHEDULE_TASK_NAME: {"queue": CELERY_INDEX_QUEUE},
+        CELERY_GRAPH_MAINTENANCE_TASK_NAME: {"queue": CELERY_INDEX_QUEUE},
     },
     beat_schedule={
         "reconcile-index-jobs": {
@@ -44,6 +47,10 @@ celery_app.conf.update(
         "schedule-due-connectors": {
             "task": CELERY_CONNECTOR_SCHEDULE_TASK_NAME,
             "schedule": CONNECTOR_SCHEDULER_INTERVAL_SECONDS,
+        },
+        "schedule-graph-maintenance": {
+            "task": CELERY_GRAPH_MAINTENANCE_TASK_NAME,
+            "schedule": GRAPH_COMMUNITY_MAINTENANCE_INTERVAL_SECONDS,
         },
     },
     broker_connection_retry_on_startup=True,

@@ -38,6 +38,7 @@ from app.models.knowledge_graph import (
 from app.models.graph_governance import (
     GraphCommunity,
     GraphCommunityMember,
+    GraphCommunityState,
     GraphExtractionCache,
     GraphQualityReport,
     GraphReviewItem,
@@ -85,4 +86,5 @@ __all__ = [
     "GraphReviewItem",
     "GraphCommunity",
     "GraphCommunityMember",
+    "GraphCommunityState",
 ]

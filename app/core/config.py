@@ -10,6 +10,7 @@
 """
 
 import os
+import re
 import secrets
 from pathlib import Path
 
@@ -269,6 +270,47 @@ GRAPH_RELATION_VECTOR_ENABLED = _env_bool("GRAPH_RELATION_VECTOR_ENABLED", True)
 GRAPH_ENTITY_MERGE_SIMILARITY = float(os.getenv("GRAPH_ENTITY_MERGE_SIMILARITY", "0.92"))
 GRAPH_MERGE_CANDIDATE_LIMIT = int(os.getenv("GRAPH_MERGE_CANDIDATE_LIMIT", "200"))
 
+# --- Graph incremental build ---
+# Automatic builds debounce small uploads into one merged graph_rebuild job.
+GRAPH_AUTO_BUILD_DEBOUNCE_SECONDS = int(
+    os.getenv("GRAPH_AUTO_BUILD_DEBOUNCE_SECONDS", "60")
+)
+GRAPH_AUTO_BUILD_MIN_PENDING_CHUNKS = int(
+    os.getenv("GRAPH_AUTO_BUILD_MIN_PENDING_CHUNKS", "20")
+)
+GRAPH_AUTO_BUILD_MAX_WAIT_SECONDS = int(
+    os.getenv("GRAPH_AUTO_BUILD_MAX_WAIT_SECONDS", "300")
+)
+GRAPH_AUTO_BUILD_PROFILE = os.getenv("GRAPH_AUTO_BUILD_PROFILE", "fast").lower()
+# Rule-based pre-filter skips chunks that clearly carry no graph facts.
+GRAPH_PREFILTER_ENABLED = _env_bool("GRAPH_PREFILTER_ENABLED", True)
+GRAPH_PREFILTER_MIN_CHARS = int(os.getenv("GRAPH_PREFILTER_MIN_CHARS", "24"))
+# Second-stage escalation model for empty or low-confidence extractions.
+GRAPH_ESCALATION_PROVIDER = os.getenv("GRAPH_ESCALATION_PROVIDER", "current").lower()
+GRAPH_ESCALATION_MODEL = os.getenv("GRAPH_ESCALATION_MODEL", "")
+GRAPH_ESCALATION_API_KEY = os.getenv("GRAPH_ESCALATION_API_KEY", "")
+GRAPH_ESCALATION_BASE_URL = os.getenv("GRAPH_ESCALATION_BASE_URL", "")
+GRAPH_ESCALATION_ENABLED = bool(
+    GRAPH_ESCALATION_MODEL or GRAPH_ESCALATION_PROVIDER != "current"
+)
+GRAPH_ESCALATION_MIN_CONFIDENCE = float(
+    os.getenv("GRAPH_ESCALATION_MIN_CONFIDENCE", "0.75")
+)
+# Deferred community maintenance runs in the background for stale graphs.
+GRAPH_COMMUNITY_MAINTENANCE_ENABLED = _env_bool(
+    "GRAPH_COMMUNITY_MAINTENANCE_ENABLED", True
+)
+GRAPH_COMMUNITY_MAINTENANCE_INTERVAL_SECONDS = int(
+    os.getenv("GRAPH_COMMUNITY_MAINTENANCE_INTERVAL_SECONDS", "600")
+)
+GRAPH_COMMUNITY_MAINTENANCE_WINDOW = os.getenv(
+    "GRAPH_COMMUNITY_MAINTENANCE_WINDOW", ""
+).strip()
+CELERY_GRAPH_MAINTENANCE_TASK_NAME = os.getenv(
+    "CELERY_GRAPH_MAINTENANCE_TASK_NAME",
+    "ragflow.graph.schedule_maintenance",
+)
+
 # --- Code graph ---
 CODE_GRAPH_ENABLED = _env_bool("CODE_GRAPH_ENABLED", True)
 CODE_PARSE_WORKERS = int(os.getenv("CODE_PARSE_WORKERS", "4"))
@@ -339,6 +381,24 @@ if CONNECTOR_SCHEDULER_INTERVAL_SECONDS < 10:
     raise ValueError("CONNECTOR_SCHEDULER_INTERVAL_SECONDS must be at least 10")
 if not 0.0 <= GRAPH_ENTITY_MERGE_SIMILARITY <= 1.0:
     raise ValueError("GRAPH_ENTITY_MERGE_SIMILARITY must be between 0 and 1")
+if GRAPH_AUTO_BUILD_DEBOUNCE_SECONDS < 0:
+    raise ValueError("GRAPH_AUTO_BUILD_DEBOUNCE_SECONDS cannot be negative")
+if GRAPH_AUTO_BUILD_MIN_PENDING_CHUNKS < 1:
+    raise ValueError("GRAPH_AUTO_BUILD_MIN_PENDING_CHUNKS must be at least 1")
+if GRAPH_AUTO_BUILD_MAX_WAIT_SECONDS < GRAPH_AUTO_BUILD_DEBOUNCE_SECONDS:
+    raise ValueError("GRAPH_AUTO_BUILD_MAX_WAIT_SECONDS must be >= debounce seconds")
+if GRAPH_AUTO_BUILD_PROFILE not in {"fast", "standard", "deep"}:
+    raise ValueError("GRAPH_AUTO_BUILD_PROFILE must be fast, standard, or deep")
+if GRAPH_PREFILTER_MIN_CHARS < 0:
+    raise ValueError("GRAPH_PREFILTER_MIN_CHARS cannot be negative")
+if not 0.0 <= GRAPH_ESCALATION_MIN_CONFIDENCE <= 1.0:
+    raise ValueError("GRAPH_ESCALATION_MIN_CONFIDENCE must be between 0 and 1")
+if GRAPH_COMMUNITY_MAINTENANCE_INTERVAL_SECONDS < 60:
+    raise ValueError("GRAPH_COMMUNITY_MAINTENANCE_INTERVAL_SECONDS must be at least 60")
+if GRAPH_COMMUNITY_MAINTENANCE_WINDOW and not re.match(
+    r"^\d{1,2}-\d{1,2}$", GRAPH_COMMUNITY_MAINTENANCE_WINDOW
+):
+    raise ValueError("GRAPH_COMMUNITY_MAINTENANCE_WINDOW must look like '22-6'")
 
 # --- Config validation ---
 if CHUNK_OVERLAP >= CHUNK_SIZE:

@@ -288,7 +288,7 @@ def test_graph_build_reextracts_old_schema_and_filters_low_confidence(
                             subject="e1",
                             predicate="USES",
                             object="e2",
-                            evidence="A uses B",
+                            evidence="Module A uses module B to satisfy the requirement",
                             confidence=0.2,
                         )
                     ],
@@ -312,9 +312,9 @@ def test_graph_build_reextracts_old_schema_and_filters_low_confidence(
             document_id=doc.id,
             file_hash="hash",
             chunk_index=0,
-            content="A uses B",
+            content="Module A uses module B to satisfy the requirement.",
             content_hash="content-hash",
-            token_count=3,
+            token_count=8,
             graph_status="completed",
             graph_schema_version=0,
         )
@@ -362,9 +362,9 @@ def test_graph_build_recovers_interrupted_processing_chunk(db_engine):
             document_id=doc.id,
             file_hash="hash",
             chunk_index=0,
-            content="No graph facts",
+            content="This section describes services, but no graph facts exist here.",
             content_hash="content-hash",
-            token_count=3,
+            token_count=10,
             graph_status="processing",
         )
         db.add(chunk)

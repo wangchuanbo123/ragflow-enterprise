@@ -4,18 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 from collections import defaultdict, deque
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.core.config import (
+    GRAPH_AUTO_BUILD_DEBOUNCE_SECONDS,
+    GRAPH_AUTO_BUILD_MAX_WAIT_SECONDS,
+    GRAPH_AUTO_BUILD_MIN_PENDING_CHUNKS,
+    GRAPH_AUTO_BUILD_PROFILE,
+    GRAPH_EXTRACTION_BATCH_SIZE,
     GRAPH_LOW_CONFIDENCE_REVIEW_THRESHOLD,
     GRAPH_ENTITY_MERGE_SIMILARITY,
     GRAPH_AUTO_BUILD_ENABLED,
     GRAPH_MERGE_CANDIDATE_LIMIT,
+    GRAPH_PARALLEL_WORKERS,
     GRAPH_RELATED_TO_MAX_RATIO,
     GRAPH_SCHEMA_VERSION,
     INDEX_JOB_MAX_ATTEMPTS,
@@ -23,6 +30,7 @@ from app.core.config import (
 from app.models.graph_governance import (
     GraphCommunity,
     GraphCommunityMember,
+    GraphCommunityState,
     GraphExtractionCache,
     GraphQualityReport,
     GraphReviewItem,
@@ -32,6 +40,7 @@ from app.models.graph_governance import (
 from app.models.index_job import IndexJob
 from app.models.knowledge_base import KnowledgeBase
 from app.models.knowledge_chunk import KnowledgeChunk
+from app.models.knowledge_document import KnowledgeDocument
 from app.models.knowledge_graph import KgAlias, KgEntity, KgEntityMention, KgRelation, KgRelationEvidence
 from app.repositories.index_job_repository import IndexJobRepository
 from rag.knowledge_graph.schemas import ChunkExtraction, VALID_ENTITY_TYPES, VALID_PREDICATES
@@ -152,60 +161,383 @@ class GraphGovernanceService:
         self.db.commit()
         return {"auto_build_enabled": auto_build_enabled}
 
-    def activate_schema(self, schema_id: str) -> GraphSchemaDefinition | None:
+    @staticmethod
+    def schema_change_kind(
+        previous: GraphSchemaDefinition | None, schema: GraphSchemaDefinition
+    ) -> str:
+        """Classify a schema activation so rebuild cost matches the actual change."""
+        if previous is None:
+            return "initial"
+        old_entities = set(previous.entity_types_json or [])
+        new_entities = set(schema.entity_types_json or [])
+        old_relations = set(previous.relation_types_json or [])
+        new_relations = set(schema.relation_types_json or [])
+        removed = (old_entities - new_entities) | (old_relations - new_relations)
+        added = (new_entities - old_entities) | (new_relations - old_relations)
+        if (previous.normalization_rules_json or {}) != (schema.normalization_rules_json or {}):
+            return "normalization_change"
+        if old_entities or old_relations:
+            overlap = (
+                len((old_entities & new_entities) | (old_relations & new_relations))
+                / len(old_entities | old_relations)
+            )
+            if overlap <= 0.5:
+                return "domain_change"
+        if removed:
+            return "type_removal"
+        if added:
+            return "type_addition"
+        if (previous.extraction_prompt or "") != (schema.extraction_prompt or ""):
+            return "prompt_change"
+        return "unchanged"
+
+    def _new_type_tokens(self, schema: GraphSchemaDefinition) -> list[str]:
+        previous = self.db.scalar(select(GraphSchemaDefinition).where(
+            GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+            GraphSchemaDefinition.status == "active",
+        ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
+        if previous is None:
+            return []
+        added_entities = set(schema.entity_types_json or []) - set(previous.entity_types_json or [])
+        added_relations = set(schema.relation_types_json or []) - set(previous.relation_types_json or [])
+        tokens: set[str] = set()
+        for item in added_entities | added_relations:
+            lowered = item.lower()
+            tokens.add(lowered)
+            tokens.update(part for part in lowered.split("_") if len(part) >= 3)
+        return sorted(tokens)
+
+    def _chunks_matching_tokens(self, tokens: list[str]) -> tuple[int, int]:
+        """Cheap content match for chunks that may contain the new types."""
+        if not tokens:
+            return 0, 0
+        rows = self.db.execute(
+            select(KnowledgeChunk.document_id, KnowledgeChunk.id).where(
+                KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+                or_(*[
+                    KnowledgeChunk.content.ilike(f"%{token}%")
+                    for token in tokens
+                ]),
+            )
+        ).all()
+        return len({row[0] for row in rows}), len(rows)
+
+    def estimate_schema_rebuild(self, schema_id: str) -> dict | None:
+        """Predict the rebuild impact of activating a draft schema."""
         schema = self.db.scalar(select(GraphSchemaDefinition).where(
             GraphSchemaDefinition.id == schema_id,
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
         ))
         if schema is None:
             return None
+        previous = self.db.scalar(select(GraphSchemaDefinition).where(
+            GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+            GraphSchemaDefinition.status == "active",
+        ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
+        kind = self.schema_change_kind(previous, schema)
+        total_documents = int(self.db.scalar(select(func.count(KnowledgeDocument.id)).where(
+            KnowledgeDocument.knowledge_base_id == self.knowledge_base_id,
+        )) or 0)
+        total_chunks = int(self.db.scalar(select(func.count(KnowledgeChunk.id)).where(
+            KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+        )) or 0)
+        if kind in {"normalization_change", "domain_change", "initial"}:
+            affected_documents, affected_chunks = total_documents, total_chunks
+        elif kind == "type_addition":
+            affected_documents, affected_chunks = self._chunks_matching_tokens(
+                self._new_type_tokens(schema)
+            )
+        elif kind == "type_removal" and previous is not None:
+            removed_entities = set(previous.entity_types_json or []) - set(schema.entity_types_json or [])
+            removed_relations = set(previous.relation_types_json or []) - set(schema.relation_types_json or [])
+            return {
+                "change_kind": kind,
+                "affected_documents": 0,
+                "affected_chunks": 0,
+                "estimated_llm_requests": 0,
+                "estimated_minutes": 0,
+                "removed_entity_types": sorted(removed_entities),
+                "removed_relation_types": sorted(removed_relations),
+            }
+        else:
+            affected_documents, affected_chunks = 0, 0
+        batches = math.ceil(affected_chunks / GRAPH_EXTRACTION_BATCH_SIZE) if affected_chunks else 0
+        estimated_minutes = round(
+            batches * 2.0 / max(GRAPH_PARALLEL_WORKERS, 1) / 60.0, 1
+        )
+        return {
+            "change_kind": kind,
+            "affected_documents": affected_documents,
+            "affected_chunks": affected_chunks,
+            "estimated_llm_requests": batches,
+            "estimated_minutes": estimated_minutes,
+        }
+
+    def _prune_removed_schema_types(
+        self, removed_entity_types: set[str], removed_relation_types: set[str]
+    ) -> dict:
+        """Database-only cleanup for removed schema types; no LLM involved."""
+        pruned_relations = 0
+        pruned_entities = 0
+        if removed_relation_types:
+            relation_ids = list(self.db.scalars(select(KgRelation.id).where(
+                KgRelation.knowledge_base_id == self.knowledge_base_id,
+                KgRelation.predicate.in_(sorted(removed_relation_types)),
+            )))
+            if relation_ids:
+                self.db.execute(delete(KgRelationEvidence).where(
+                    KgRelationEvidence.knowledge_base_id == self.knowledge_base_id,
+                    KgRelationEvidence.relation_id.in_(relation_ids),
+                ))
+                self.db.execute(delete(KgRelation).where(
+                    KgRelation.knowledge_base_id == self.knowledge_base_id,
+                    KgRelation.id.in_(relation_ids),
+                ))
+                pruned_relations += len(relation_ids)
+        if removed_entity_types:
+            entity_ids = list(self.db.scalars(select(KgEntity.id).where(
+                KgEntity.knowledge_base_id == self.knowledge_base_id,
+                KgEntity.entity_type.in_(sorted(removed_entity_types)),
+            )))
+            if entity_ids:
+                touching = list(self.db.scalars(select(KgRelation.id).where(
+                    KgRelation.knowledge_base_id == self.knowledge_base_id,
+                    or_(
+                        KgRelation.subject_entity_id.in_(entity_ids),
+                        KgRelation.object_entity_id.in_(entity_ids),
+                    ),
+                )))
+                if touching:
+                    self.db.execute(delete(KgRelationEvidence).where(
+                        KgRelationEvidence.knowledge_base_id == self.knowledge_base_id,
+                        KgRelationEvidence.relation_id.in_(touching),
+                    ))
+                    self.db.execute(delete(KgRelation).where(
+                        KgRelation.knowledge_base_id == self.knowledge_base_id,
+                        KgRelation.id.in_(touching),
+                    ))
+                    pruned_relations += len(touching)
+                self.db.execute(delete(KgEntityMention).where(
+                    KgEntityMention.knowledge_base_id == self.knowledge_base_id,
+                    KgEntityMention.entity_id.in_(entity_ids),
+                ))
+                self.db.execute(delete(KgAlias).where(
+                    KgAlias.knowledge_base_id == self.knowledge_base_id,
+                    KgAlias.entity_id.in_(entity_ids),
+                ))
+                self.db.execute(delete(KgEntity).where(
+                    KgEntity.knowledge_base_id == self.knowledge_base_id,
+                    KgEntity.id.in_(entity_ids),
+                ))
+                pruned_entities += len(entity_ids)
+        return {"pruned_entities": pruned_entities, "pruned_relations": pruned_relations}
+
+    def activate_schema(
+        self,
+        schema_id: str,
+        *,
+        reprocess: str = "auto",
+    ) -> GraphSchemaDefinition | None:
+        if reprocess not in {"auto", "incremental", "full"}:
+            raise ValueError("无效的重处理策略")
+        schema = self.db.scalar(select(GraphSchemaDefinition).where(
+            GraphSchemaDefinition.id == schema_id,
+            GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+        ))
+        if schema is None:
+            return None
+        previous = self.db.scalar(select(GraphSchemaDefinition).where(
+            GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+            GraphSchemaDefinition.status == "active",
+        ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
+        kind = self.schema_change_kind(previous, schema)
+        # 差异必须在切换 active 状态之前计算，否则会与新 Schema 自身求差。
+        addition_tokens = (
+            self._new_type_tokens(schema) if kind == "type_addition" else []
+        )
+
         self.db.execute(update(GraphSchemaDefinition).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
             GraphSchemaDefinition.status == "active",
         ).values(status="superseded"))
         schema.status = "active"
         schema.activated_at = datetime.utcnow()
-        self.db.execute(update(KnowledgeChunk).where(
-            KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
-            KnowledgeChunk.graph_schema_version != schema.version,
-        ).values(graph_status="pending"))
+
+        chunk_scope = update(KnowledgeChunk).where(
+            KnowledgeChunk.knowledge_base_id == self.knowledge_base_id
+        )
+        if kind in {"normalization_change", "domain_change", "initial"} or reprocess == "full":
+            # Raw names are needed again: re-extract everything.
+            self.db.execute(chunk_scope.where(
+                KnowledgeChunk.graph_schema_version != schema.version
+            ).values(graph_status="pending"))
+        elif kind == "type_removal":
+            removed_entities = set(previous.entity_types_json or []) - set(schema.entity_types_json or [])
+            removed_relations = set(previous.relation_types_json or []) - set(schema.relation_types_json or [])
+            self._prune_removed_schema_types(removed_entities, removed_relations)
+            # Remaining extractions stay valid under the narrower schema.
+            self.db.execute(chunk_scope.values(graph_schema_version=schema.version))
+        elif kind == "type_addition" and reprocess != "incremental":
+            if addition_tokens:
+                affected_ids = list(self.db.scalars(select(KnowledgeChunk.id).where(
+                    KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+                    or_(*[
+                        KnowledgeChunk.content.ilike(f"%{token}%")
+                        for token in addition_tokens
+                    ]),
+                )))
+                if affected_ids:
+                    self.db.execute(chunk_scope.where(
+                        KnowledgeChunk.id.in_(affected_ids)
+                    ).values(graph_status="pending"))
+            self.db.execute(chunk_scope.where(
+                KnowledgeChunk.graph_status != "pending"
+            ).values(graph_schema_version=schema.version))
+        else:
+            # prompt_change or incremental choice: keep facts, adopt the version.
+            self.db.execute(chunk_scope.where(
+                KnowledgeChunk.graph_status != "pending"
+            ).values(graph_schema_version=schema.version))
         self.db.commit()
         self.db.refresh(schema)
+
+        self._after_schema_activation(kind)
         return schema
 
-    def request_build(self, mode: str, requested_by: str | None, options: dict | None = None) -> IndexJob:
+    def _after_schema_activation(self, kind: str) -> None:
+        """Queue the follow-up work that matches the change kind."""
+        if kind == "type_removal":
+            self.mark_communities_stale()
+            from app.services.entity_vector_service import EntityVectorService
+            from app.services.relation_vector_service import RelationVectorService
+
+            EntityVectorService(self.db, self.knowledge_base_id).request_rebuild(
+                None, task_queue=self.task_queue
+            )
+            RelationVectorService(self.db, self.knowledge_base_id).request_rebuild(
+                None, task_queue=self.task_queue
+            )
+            return
+        pending = self._pending_chunk_count()
+        if pending:
+            self.request_build(requested_by=None, profile="standard")
+
+    def request_build(
+        self,
+        mode: str = "pending",
+        requested_by: str | None = None,
+        options: dict | None = None,
+        *,
+        profile: str | None = None,
+        vector_update: str | None = None,
+        community_update: str | None = None,
+        visible_at: datetime | None = None,
+    ) -> IndexJob:
+        """Create one deduplicated graph_rebuild job.
+
+        ``profile`` wins over explicit ``mode``/``vector_update``/``community_update``;
+        the legacy boolean ``options`` map to the same fields for old callers.
+        ``visible_at`` delays worker pickup for debounced automatic builds.
+        """
+        from app.services.graph_build_profiles import (
+            GRAPH_BUILD_PROFILES,
+            VALID_COMMUNITY_UPDATES,
+            VALID_VECTOR_UPDATES,
+        )
+
         if mode not in {"pending", "retry_failed", "full"}:
             raise ValueError("无效的图谱构建模式")
+        if profile is not None:
+            if profile not in GRAPH_BUILD_PROFILES:
+                raise ValueError("无效的图谱构建策略")
+            resolved = dict(GRAPH_BUILD_PROFILES[profile])
+            resolved["profile"] = profile
+        else:
+            legacy = options or {}
+            resolved = {
+                "mode": mode,
+                "vector_update": vector_update or (
+                    "full" if legacy.get("rebuild_entity_vectors", True) else "none"
+                ),
+                "community_update": community_update or (
+                    "full" if legacy.get("rebuild_communities", True) else "defer"
+                ),
+            }
+        if resolved["vector_update"] not in VALID_VECTOR_UPDATES:
+            raise ValueError("无效的向量更新策略")
+        if resolved["community_update"] not in VALID_COMMUNITY_UPDATES:
+            raise ValueError("无效的社区更新策略")
+
         repository = IndexJobRepository(self.db, self.knowledge_base_id)
         existing = repository.find_open("graph_rebuild")
         if existing is not None:
             return existing
-        job = repository.create(IndexJob(
+        job = IndexJob(
             job_type="graph_rebuild",
             status="pending",
             requested_by=requested_by,
             total_items=1,
             max_attempts=INDEX_JOB_MAX_ATTEMPTS,
-            options_json={"mode": mode, **(options or {})},
-        ))
+            visible_at=visible_at,
+            options_json={**resolved, **(options or {})},
+        )
+        repository.create(job)
         self.task_queue.enqueue(job.id)
         return job
+
+    def _pending_chunk_count(self) -> int:
+        return int(self.db.scalar(select(func.count(KnowledgeChunk.id)).where(
+            KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+            KnowledgeChunk.graph_status == "pending",
+        )) or 0)
 
     def request_automatic_build(
         self, requested_by: str | None, source_job_id: str
     ) -> IndexJob | None:
+        """Debounced automatic build: merge nearby uploads into one job.
+
+        - pending < GRAPH_AUTO_BUILD_MIN_PENDING_CHUNKS waits GRAPH_AUTO_BUILD_DEBOUNCE_SECONDS;
+        - reaching the threshold pulls a waiting job forward immediately;
+        - a waiting job never waits longer than GRAPH_AUTO_BUILD_MAX_WAIT_SECONDS.
+        """
         if not self.automation_settings()["auto_build_enabled"]:
             return None
-        pending = int(self.db.scalar(select(func.count(KnowledgeChunk.id)).where(
-            KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
-            KnowledgeChunk.graph_status == "pending",
-        )) or 0)
+        pending = self._pending_chunk_count()
         if pending == 0:
             return None
+
+        now = datetime.utcnow()
+        repository = IndexJobRepository(self.db, self.knowledge_base_id)
+        existing = repository.find_open("graph_rebuild")
+        if existing is not None:
+            waiting = (
+                existing.status == "pending"
+                and existing.visible_at is not None
+                and existing.visible_at > now
+            )
+            if waiting:
+                created = existing.created_at or now
+                threshold_met = pending >= GRAPH_AUTO_BUILD_MIN_PENDING_CHUNKS
+                max_wait_elapsed = (
+                    now - created
+                ).total_seconds() >= GRAPH_AUTO_BUILD_MAX_WAIT_SECONDS
+                if threshold_met or max_wait_elapsed:
+                    existing.visible_at = now
+                    self.db.commit()
+                    self.task_queue.enqueue(existing.id)
+            return existing
+
+        immediate = (
+            GRAPH_AUTO_BUILD_DEBOUNCE_SECONDS <= 0
+            or pending >= GRAPH_AUTO_BUILD_MIN_PENDING_CHUNKS
+        )
         return self.request_build(
-            "pending",
-            requested_by,
-            {
+            requested_by=requested_by,
+            profile=GRAPH_AUTO_BUILD_PROFILE,
+            visible_at=None if immediate else now + timedelta(
+                seconds=GRAPH_AUTO_BUILD_DEBOUNCE_SECONDS
+            ),
+            options={
                 "trigger": "document_index_completed",
                 "source_job_id": source_job_id,
                 "pending_chunks_at_enqueue": pending,
@@ -526,7 +858,29 @@ class GraphGovernanceService:
         self.db.refresh(record)
         return record
 
-    def rebuild_communities(self) -> dict:
+    def community_state(self, *, create: bool = True) -> GraphCommunityState | None:
+        state = self.db.scalar(select(GraphCommunityState).where(
+            GraphCommunityState.knowledge_base_id == self.knowledge_base_id
+        ))
+        if state is None and create:
+            state = GraphCommunityState(
+                knowledge_base_id=self.knowledge_base_id,
+                status="empty",
+            )
+            self.db.add(state)
+            self.db.commit()
+            self.db.refresh(state)
+        return state
+
+    def mark_communities_stale(self) -> GraphCommunityState:
+        """Flag communities for deferred rebuild instead of blocking the graph build."""
+        state = self.community_state()
+        if state.status != "stale":
+            state.status = "stale"
+            self.db.commit()
+        return state
+
+    def _load_graph_adjacency(self) -> tuple[dict[str, object], dict, list]:
         entities = list(self.db.scalars(select(KgEntity).where(
             KgEntity.knowledge_base_id == self.knowledge_base_id
         )))
@@ -539,6 +893,10 @@ class GraphGovernanceService:
             adjacency.setdefault(relation.subject_entity_id, set()).add(relation.object_entity_id)
             adjacency.setdefault(relation.object_entity_id, set()).add(relation.subject_entity_id)
             relation_by_pair[frozenset((relation.subject_entity_id, relation.object_entity_id))].append(relation.id)
+        return adjacency, relation_by_pair, entities
+
+    @staticmethod
+    def _components_from_adjacency(adjacency: dict[str, set[str]]) -> list[list[str]]:
         components: list[list[str]] = []
         remaining = set(adjacency)
         while remaining:
@@ -553,31 +911,79 @@ class GraphGovernanceService:
                     remaining.remove(neighbor)
                     queue.append(neighbor)
             components.append(component)
-        self.db.execute(delete(GraphCommunityMember).where(
-            GraphCommunityMember.knowledge_base_id == self.knowledge_base_id
-        ))
-        self.db.execute(delete(GraphCommunity).where(
-            GraphCommunity.knowledge_base_id == self.knowledge_base_id
-        ))
-        self.db.flush()
+        return components
+
+    def rebuild_communities(self, changed_entity_ids: list[str] | None = None) -> dict:
+        """Rebuild communities; pass changed ids to touch only affected components."""
+        adjacency, relation_by_pair, entities = self._load_graph_adjacency()
+        components = self._components_from_adjacency(adjacency)
         by_id = {entity.id: entity for entity in entities}
-        root = None
-        if components:
+        affected_rebuild = changed_entity_ids is not None
+        affected = set(changed_entity_ids or [])
+
+        if affected_rebuild:
+            affected_components = [
+                component for component in components if affected & set(component)
+            ]
+            affected_entities = {
+                entity_id for component in affected_components
+                for entity_id in component
+            }
+            if affected_entities:
+                stale_community_ids = list(self.db.scalars(
+                    select(GraphCommunityMember.community_id).where(
+                        GraphCommunityMember.knowledge_base_id == self.knowledge_base_id,
+                        GraphCommunityMember.entity_id.in_(sorted(affected_entities)),
+                    ).distinct()
+                ))
+            else:
+                stale_community_ids = []
+            if stale_community_ids:
+                self.db.execute(delete(GraphCommunityMember).where(
+                    GraphCommunityMember.knowledge_base_id == self.knowledge_base_id,
+                    GraphCommunityMember.community_id.in_(stale_community_ids),
+                ))
+                self.db.execute(delete(GraphCommunity).where(
+                    GraphCommunity.knowledge_base_id == self.knowledge_base_id,
+                    GraphCommunity.id.in_(stale_community_ids),
+                ))
+                self.db.flush()
+            targets = affected_components
+        else:
+            self.db.execute(delete(GraphCommunityMember).where(
+                GraphCommunityMember.knowledge_base_id == self.knowledge_base_id
+            ))
+            self.db.execute(delete(GraphCommunity).where(
+                GraphCommunity.knowledge_base_id == self.knowledge_base_id
+            ))
+            self.db.flush()
+            targets = components
+
+        root = self.db.scalar(select(GraphCommunity).where(
+            GraphCommunity.knowledge_base_id == self.knowledge_base_id,
+            GraphCommunity.level == 1,
+        ).limit(1))
+        if not affected_rebuild and not targets:
+            root = None
+        if targets and root is None:
             root = GraphCommunity(
                 knowledge_base_id=self.knowledge_base_id,
                 level=1,
                 title="知识库全局图谱",
-                summary=f"包含 {len(entities)} 个实体、{len(relations)} 条关系、{len(components)} 个主题子图。",
-                evidence_json=[relation.id for relation in relations[:100]],
+                summary="",
+                evidence_json=[],
             )
             self.db.add(root)
             self.db.flush()
-        for index, component in enumerate(sorted(components, key=lambda values: (-len(values), values[0])), start=1):
+
+        for index, component in enumerate(sorted(
+            targets, key=lambda values: (-len(values), values[0])
+        ), start=1):
             names = [by_id[item].canonical_name for item in component if item in by_id]
             evidence = sorted({
                 relation_id
                 for entity_id in component
-                for neighbor in adjacency[entity_id]
+                for neighbor in adjacency.get(entity_id, ())
                 for relation_id in relation_by_pair[frozenset((entity_id, neighbor))]
             })[:100]
             community = GraphCommunity(
@@ -597,8 +1003,48 @@ class GraphGovernanceService:
                     entity_id=entity_id,
                 ) for entity_id in component
             ])
+
+        if not targets and root is not None and affected_rebuild:
+            # Graph emptied; remove the stale global root as well.
+            self.db.execute(delete(GraphCommunityMember).where(
+                GraphCommunityMember.community_id == root.id
+            ))
+            self.db.delete(root)
+            root = None
+        if root is not None:
+            relation_count = int(self.db.scalar(select(func.count(
+                KgRelation.id
+            )).where(
+                KgRelation.knowledge_base_id == self.knowledge_base_id
+            )) or 0)
+            community_count = int(self.db.scalar(select(func.count(
+                GraphCommunity.id
+            )).where(
+                GraphCommunity.knowledge_base_id == self.knowledge_base_id,
+                GraphCommunity.level == 0,
+            )) or 0)
+            root.summary = (
+                f"包含 {len(entities)} 个实体、{relation_count} 条关系、"
+                f"{community_count} 个主题子图。"
+            )
+            root.evidence_json = [
+                relation_id
+                for pair in relation_by_pair
+                for relation_id in relation_by_pair[pair]
+            ][:100]
+
+        state = self.community_state()
+        state.status = "ready"
+        state.communities = int(self.db.scalar(select(func.count(
+            GraphCommunity.id
+        )).where(
+            GraphCommunity.knowledge_base_id == self.knowledge_base_id,
+            GraphCommunity.level == 0,
+        )) or 0)
+        state.entities = len(entities)
+        state.built_at = datetime.utcnow()
         self.db.commit()
-        return {"communities": len(components), "entities": len(entities)}
+        return {"communities": state.communities, "entities": len(entities)}
 
     def list_communities(self) -> list[dict]:
         communities = list(self.db.scalars(select(GraphCommunity).where(

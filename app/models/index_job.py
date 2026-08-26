@@ -65,6 +65,7 @@ class IndexJob(Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    visible_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

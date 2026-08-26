@@ -206,3 +206,9 @@ def get_graph_store(db, knowledge_base_id=None):
 def get_graph_extraction_llm_provider() -> LLMProvider:
     """获取图谱抽取 LLM。"""
     return get_llm_provider("extraction")
+
+
+@lru_cache(maxsize=1)
+def get_graph_escalation_llm_provider() -> LLMProvider:
+    """获取图谱抽取升级 LLM（空结果/低置信度重试）。"""
+    return get_llm_provider("graph_escalation")

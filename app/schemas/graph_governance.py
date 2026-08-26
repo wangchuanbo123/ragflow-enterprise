@@ -38,10 +38,33 @@ class GraphSchemaOut(BaseModel):
 
 
 class GraphBuildRequest(BaseModel):
+    """三档策略优先；旧布尔字段保留兼容（None 表示未指定）。"""
+
+    profile: Literal["fast", "standard", "deep"] | None = None
     mode: Literal["pending", "retry_failed", "full"] = "pending"
-    rebuild_entity_vectors: bool = True
-    rebuild_relation_vectors: bool = True
-    rebuild_communities: bool = True
+    rebuild_entity_vectors: bool | None = None
+    rebuild_relation_vectors: bool | None = None
+    rebuild_communities: bool | None = None
+
+
+class GraphSchemaImpactOut(BaseModel):
+    change_kind: str
+    affected_documents: int
+    affected_chunks: int
+    estimated_llm_requests: int
+    estimated_minutes: float
+    removed_entity_types: list[str] = Field(default_factory=list)
+    removed_relation_types: list[str] = Field(default_factory=list)
+
+
+class CommunityStateOut(BaseModel):
+    status: str = "empty"
+    communities: int = 0
+    entities: int = 0
+    built_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
 
 
 class GraphQualityOut(BaseModel):
