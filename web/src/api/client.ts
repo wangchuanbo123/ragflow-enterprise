@@ -374,8 +374,18 @@ export function createGraphSchema(
   })
 }
 
-export function activateGraphSchema(knowledgeBaseId: string, schemaId: string): Promise<GraphSchema> {
-  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/${schemaId}/activate`, { method: 'POST' })
+export function activateGraphSchema(knowledgeBaseId: string, schemaId: string, reprocess: 'auto' | 'incremental' | 'full' = 'auto'): Promise<GraphSchema> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/${schemaId}/activate?reprocess=${reprocess}`, { method: 'POST' })
+}
+
+export function generateGraphSchema(knowledgeBaseId: string, instructions = '', documentIds: string[] = []): Promise<IndexJob> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/generate`, {
+    method: 'POST', body: JSON.stringify({ instructions: instructions || null, document_ids: documentIds }),
+  })
+}
+
+export function getGraphSchemaImpact(knowledgeBaseId: string, schemaId: string): Promise<import('../types').GraphSchemaImpact> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/${schemaId}/impact`)
 }
 
 export function updateGraphSchema(
@@ -392,16 +402,20 @@ export function getGraphAutomation(knowledgeBaseId: string): Promise<import('../
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/automation`)
 }
 
-export function updateGraphAutomation(knowledgeBaseId: string, autoBuildEnabled: boolean): Promise<import('../types').GraphAutomationSettings> {
+export function updateGraphAutomation(knowledgeBaseId: string, autoBuildEnabled: boolean, autoSchemaGenerationEnabled: boolean): Promise<import('../types').GraphAutomationSettings> {
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/automation`, {
-    method: 'PUT', body: JSON.stringify({ auto_build_enabled: autoBuildEnabled }),
+    method: 'PUT', body: JSON.stringify({ auto_build_enabled: autoBuildEnabled, auto_schema_generation_enabled: autoSchemaGenerationEnabled }),
   })
 }
 
-export function requestGraphBuild(knowledgeBaseId: string, mode: 'pending' | 'retry_failed' | 'full'): Promise<IndexJob> {
+export function requestGraphBuild(knowledgeBaseId: string, profile: 'fast' | 'standard' | 'deep'): Promise<IndexJob> {
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/build`, {
-    method: 'POST', body: JSON.stringify({ mode, rebuild_entity_vectors: true, rebuild_communities: true }),
+    method: 'POST', body: JSON.stringify({ profile }),
   })
+}
+
+export function getDocumentGraphCoverage(knowledgeBaseId: string): Promise<import('../types').DocumentGraphCoverage> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/coverage`)
 }
 
 export function getGraphQuality(knowledgeBaseId: string): Promise<GraphQuality | null> {
@@ -414,6 +428,18 @@ export function assessGraphQuality(knowledgeBaseId: string): Promise<GraphQualit
 
 export function getEntityVectorState(knowledgeBaseId: string): Promise<EntityVectorState> {
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/entity-vector`)
+}
+
+export function getRelationVectorState(knowledgeBaseId: string): Promise<import('../types').RelationVectorState> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/relation-vector`)
+}
+
+export function rebuildRelationVectors(knowledgeBaseId: string): Promise<IndexJob> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/relation-vector/rebuild`, { method: 'POST' })
+}
+
+export function getGraphCommunityState(knowledgeBaseId: string): Promise<import('../types').GraphCommunityState> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/community-status`)
 }
 
 export function rebuildEntityVectors(knowledgeBaseId: string): Promise<IndexJob> {

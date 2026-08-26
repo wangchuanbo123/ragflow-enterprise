@@ -184,7 +184,7 @@ class IndexJobRepository:
                     "sync", "rebuild", "connector_sync", "code_index",
                     "graph_rebuild", "entity_vector_rebuild",
                     "relation_vector_rebuild", "code_vector_rebuild",
-                    "graph_maintenance",
+                    "graph_maintenance", "schema_generation",
                 ]),
             )
         )

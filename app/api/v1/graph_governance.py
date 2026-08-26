@@ -12,6 +12,7 @@ from app.schemas.document import IndexJobOut
 from app.schemas.graph_governance import (
     CommunityOut,
     CommunityStateOut,
+    DocumentGraphCoverageOut,
     EntityMergeCreate,
     EntityMergeOut,
     EntityVectorStateOut,
@@ -19,6 +20,7 @@ from app.schemas.graph_governance import (
     GraphBuildRequest,
     GraphQualityOut,
     GraphSchemaCreate,
+    GraphSchemaGenerateRequest,
     GraphSchemaImpactOut,
     GraphSchemaOut,
     GraphSchemaUpdate,
@@ -70,6 +72,29 @@ def create_graph_schema(knowledge_base_id: str, payload: GraphSchemaCreate, curr
         raise bad_request(str(exc)) from exc
 
 
+@router.post(
+    "/{knowledge_base_id}/knowledge-graph/schemas/generate",
+    response_model=IndexJobOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def generate_graph_schema(
+    knowledge_base_id: str,
+    payload: GraphSchemaGenerateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Generate a reviewable draft from ready documents; never auto-activate it."""
+    _require(db, knowledge_base_id, current_user, edit=True)
+    try:
+        return GraphGovernanceService(db, knowledge_base_id).request_schema_generation(
+            requested_by=current_user.id,
+            document_ids=payload.document_ids or None,
+            instructions=payload.instructions,
+        )
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
+
+
 @router.put("/{knowledge_base_id}/knowledge-graph/schemas/{schema_id}", response_model=GraphSchemaOut)
 def update_graph_schema(knowledge_base_id: str, schema_id: str, payload: GraphSchemaUpdate, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     _require(db, knowledge_base_id, current_user, edit=True)
@@ -99,7 +124,8 @@ def update_graph_automation_settings(knowledge_base_id: str, payload: GraphAutom
     _require(db, knowledge_base_id, current_user, edit=True)
     try:
         return GraphGovernanceService(db, knowledge_base_id).update_automation_settings(
-            auto_build_enabled=payload.auto_build_enabled
+            auto_build_enabled=payload.auto_build_enabled,
+            auto_schema_generation_enabled=payload.auto_schema_generation_enabled,
         )
     except ValueError as exc:
         raise bad_request(str(exc)) from exc
@@ -163,6 +189,20 @@ def request_graph_build(knowledge_base_id: str, payload: GraphBuildRequest, curr
 def latest_graph_quality(knowledge_base_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     _require(db, knowledge_base_id, current_user)
     return GraphGovernanceService(db, knowledge_base_id).latest_quality()
+
+
+@router.get(
+    "/{knowledge_base_id}/knowledge-graph/coverage",
+    response_model=DocumentGraphCoverageOut,
+)
+def graph_document_coverage(
+    knowledge_base_id: str,
+    document_id: str | None = Query(default=None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require(db, knowledge_base_id, current_user)
+    return GraphGovernanceService(db, knowledge_base_id).document_coverage(document_id)
 
 
 @router.post("/{knowledge_base_id}/knowledge-graph/quality", response_model=GraphQualityOut)

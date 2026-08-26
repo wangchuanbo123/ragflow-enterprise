@@ -25,6 +25,11 @@ class GraphSchemaDefinition(Base):
     relation_types_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     normalization_rules_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     extraction_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generation_method: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="manual", server_default="manual"
+    )
+    source_document_ids_json: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    generation_summary_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     created_by: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
     activated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

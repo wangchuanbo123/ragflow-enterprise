@@ -393,6 +393,33 @@ def _process_job(
                             None if report.status == "ready" else "图谱质量门禁未全部通过"
                         ),
                     )
+                elif job.job_type == "schema_generation":
+                    from app.services.graph_schema_induction_service import (
+                        GraphSchemaInductionService,
+                    )
+
+                    options = job.options_json or {}
+                    schema = GraphSchemaInductionService(
+                        db,
+                        job.knowledge_base_id,
+                        llm=container.extraction_llm,
+                    ).generate_draft(
+                        created_by=job.requested_by,
+                        document_ids=options.get("document_ids") or None,
+                        instructions=options.get("instructions") or None,
+                    )
+                    options = dict(options)
+                    options["generated_schema_id"] = schema.id
+                    options["generated_schema_version"] = schema.version
+                    job.options_json = options
+                    job_repo.update(
+                        job,
+                        status="completed",
+                        total_items=len(schema.source_document_ids_json or []) or 1,
+                        processed_items=len(schema.source_document_ids_json or []) or 1,
+                        succeeded_items=len(schema.source_document_ids_json or []) or 1,
+                        failed_items=0,
+                    )
                 else:
                     raise ValueError(f"Unsupported index job type: {job.job_type}")
 
@@ -405,6 +432,15 @@ def _process_job(
                     ):
                         from app.services.graph_governance_service import GraphGovernanceService
 
+                        if job.job_type in {"sync", "rebuild", "file"}:
+                            GraphGovernanceService(
+                                db,
+                                job.knowledge_base_id,
+                                task_queue=container.task_queue,
+                            ).request_automatic_schema_generation(
+                                job.requested_by,
+                                source_job_id=job.id,
+                            )
                         GraphGovernanceService(
                             db,
                             job.knowledge_base_id,

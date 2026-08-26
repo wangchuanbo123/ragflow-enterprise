@@ -326,11 +326,25 @@ export interface GraphSchema {
   relation_types_json: string[]
   normalization_rules_json: Record<string, unknown> | null
   extraction_prompt: string | null
+  generation_method: 'manual' | 'document_llm' | string
+  source_document_ids_json: string[] | null
+  generation_summary_json: Record<string, any> | null
   created_at: string
+}
+
+export interface GraphSchemaImpact {
+  change_kind: string
+  affected_documents: number
+  affected_chunks: number
+  estimated_llm_requests: number
+  estimated_minutes: number
+  removed_entity_types: string[]
+  removed_relation_types: string[]
 }
 
 export interface GraphAutomationSettings {
   auto_build_enabled: boolean
+  auto_schema_generation_enabled: boolean
 }
 
 export interface GraphQuality {
@@ -379,6 +393,55 @@ export interface EntityVectorState {
   entity_count: number
   status: string
   updated_at: string | null
+}
+
+export interface RelationVectorState {
+  index_name: string | null
+  embedding_fingerprint: string
+  graph_fingerprint: string
+  relation_count: number
+  status: string
+  updated_at: string | null
+}
+
+export interface GraphCommunityState {
+  status: 'empty' | 'stale' | 'ready' | string
+  communities: number
+  entities: number
+  built_at: string | null
+  updated_at: string | null
+}
+
+export interface DocumentGraphCoverageItem {
+  document_id: string
+  filename: string
+  document_status: string
+  coverage_status: 'covered' | 'no_facts' | 'processing' | 'attention' | 'no_chunks' | string
+  total_chunks: number
+  completed_chunks: number
+  failed_chunks: number
+  pending_chunks: number
+  fact_chunks: number
+  entity_mentions: number
+  unique_entities: number
+  relation_evidence: number
+  unique_relations: number
+  processing_rate: number
+  fact_coverage_rate: number
+  schema_versions: number[]
+  errors: string[]
+}
+
+export interface DocumentGraphCoverage {
+  summary: {
+    documents: number
+    chunks: number
+    processed_chunks: number
+    fact_chunks: number
+    processing_rate: number
+    fact_coverage_rate: number
+  }
+  documents: DocumentGraphCoverageItem[]
 }
 
 export interface ApiError {

@@ -180,7 +180,10 @@ class GraphBuildService:
             else:
                 filtered.append(chunk)
         for chunk in filtered:
-            had_facts = bool(before_touch.get(chunk.id, ({}, {}))[1])
+            previous_entities, previous_relations = before_touch.get(
+                chunk.id, (set(), set())
+            )
+            had_facts = bool(previous_entities or previous_relations)
             if had_facts:
                 # 清掉旧 Schema/旧模型留下的图谱数据，等价于空抽取替换。
                 self.store.upsert_extraction(

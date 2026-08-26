@@ -19,6 +19,7 @@ class GraphSchemaUpdate(GraphSchemaCreate):
 
 class GraphAutomationSettings(BaseModel):
     auto_build_enabled: bool = True
+    auto_schema_generation_enabled: bool = True
 
 
 class GraphSchemaOut(BaseModel):
@@ -30,6 +31,9 @@ class GraphSchemaOut(BaseModel):
     relation_types_json: list
     normalization_rules_json: dict | None = None
     extraction_prompt: str | None = None
+    generation_method: str = "manual"
+    source_document_ids_json: list[str] | None = None
+    generation_summary_json: dict | None = None
     created_by: str | None = None
     created_at: datetime
     activated_at: datetime | None = None
@@ -45,6 +49,36 @@ class GraphBuildRequest(BaseModel):
     rebuild_entity_vectors: bool | None = None
     rebuild_relation_vectors: bool | None = None
     rebuild_communities: bool | None = None
+
+
+class GraphSchemaGenerateRequest(BaseModel):
+    document_ids: list[str] = Field(default_factory=list, max_length=100)
+    instructions: str | None = Field(default=None, max_length=2000)
+
+
+class DocumentGraphCoverageItem(BaseModel):
+    document_id: str
+    filename: str
+    document_status: str
+    coverage_status: str
+    total_chunks: int
+    completed_chunks: int
+    failed_chunks: int
+    pending_chunks: int
+    fact_chunks: int
+    entity_mentions: int
+    unique_entities: int
+    relation_evidence: int
+    unique_relations: int
+    processing_rate: float
+    fact_coverage_rate: float
+    schema_versions: list[int] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
+class DocumentGraphCoverageOut(BaseModel):
+    summary: dict
+    documents: list[DocumentGraphCoverageItem]
 
 
 class GraphSchemaImpactOut(BaseModel):

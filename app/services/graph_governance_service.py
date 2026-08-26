@@ -24,6 +24,7 @@ from app.core.config import (
     GRAPH_MERGE_CANDIDATE_LIMIT,
     GRAPH_PARALLEL_WORKERS,
     GRAPH_RELATED_TO_MAX_RATIO,
+    GRAPH_SCHEMA_AUTO_GENERATE_ENABLED,
     GRAPH_SCHEMA_VERSION,
     INDEX_JOB_MAX_ATTEMPTS,
 )
@@ -98,7 +99,10 @@ class GraphGovernanceService:
 
     def create_schema(
         self, *, entity_types: list[str], relation_types: list[str],
-        normalization_rules: dict, extraction_prompt: str | None, created_by: str,
+        normalization_rules: dict, extraction_prompt: str | None, created_by: str | None,
+        generation_method: str = "manual",
+        source_document_ids: list[str] | None = None,
+        generation_summary: dict | None = None,
     ) -> GraphSchemaDefinition:
         entity_types, relation_types = self._validate_schema_types(
             entity_types, relation_types
@@ -115,6 +119,9 @@ class GraphGovernanceService:
             normalization_rules_json=normalization_rules,
             extraction_prompt=extraction_prompt,
             created_by=created_by,
+            generation_method=generation_method,
+            source_document_ids_json=source_document_ids,
+            generation_summary_json=generation_summary,
         )
         self.db.add(schema)
         self.db.commit()
@@ -148,18 +155,40 @@ class GraphGovernanceService:
         return {
             "auto_build_enabled": bool(
                 settings.get("graph_auto_build_enabled", GRAPH_AUTO_BUILD_ENABLED)
-            )
+            ),
+            "auto_schema_generation_enabled": bool(
+                settings.get(
+                    "graph_schema_auto_generate_enabled",
+                    GRAPH_SCHEMA_AUTO_GENERATE_ENABLED,
+                )
+            ),
         }
 
-    def update_automation_settings(self, *, auto_build_enabled: bool) -> dict:
+    def update_automation_settings(
+        self,
+        *,
+        auto_build_enabled: bool,
+        auto_schema_generation_enabled: bool | None = None,
+    ) -> dict:
         knowledge_base = self.db.get(KnowledgeBase, self.knowledge_base_id)
         if knowledge_base is None:
             raise ValueError("知识库不存在")
         settings = dict(knowledge_base.settings_json or {})
         settings["graph_auto_build_enabled"] = auto_build_enabled
+        if auto_schema_generation_enabled is None:
+            auto_schema_generation_enabled = bool(
+                settings.get(
+                    "graph_schema_auto_generate_enabled",
+                    GRAPH_SCHEMA_AUTO_GENERATE_ENABLED,
+                )
+            )
+        settings["graph_schema_auto_generate_enabled"] = auto_schema_generation_enabled
         knowledge_base.settings_json = settings
         self.db.commit()
-        return {"auto_build_enabled": auto_build_enabled}
+        return {
+            "auto_build_enabled": auto_build_enabled,
+            "auto_schema_generation_enabled": auto_schema_generation_enabled,
+        }
 
     @staticmethod
     def schema_change_kind(
@@ -183,6 +212,8 @@ class GraphGovernanceService:
             )
             if overlap <= 0.5:
                 return "domain_change"
+        if removed and added:
+            return "domain_change"
         if removed:
             return "type_removal"
         if added:
@@ -377,7 +408,7 @@ class GraphGovernanceService:
             self._prune_removed_schema_types(removed_entities, removed_relations)
             # Remaining extractions stay valid under the narrower schema.
             self.db.execute(chunk_scope.values(graph_schema_version=schema.version))
-        elif kind == "type_addition" and reprocess != "incremental":
+        elif kind == "type_addition":
             if addition_tokens:
                 affected_ids = list(self.db.scalars(select(KnowledgeChunk.id).where(
                     KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
@@ -403,6 +434,55 @@ class GraphGovernanceService:
 
         self._after_schema_activation(kind)
         return schema
+
+    def request_schema_generation(
+        self,
+        *,
+        requested_by: str | None,
+        document_ids: list[str] | None = None,
+        instructions: str | None = None,
+    ) -> IndexJob:
+        """Queue one deduplicated, auditable Schema induction job."""
+        repository = IndexJobRepository(self.db, self.knowledge_base_id)
+        existing = repository.find_open("schema_generation")
+        if existing is not None:
+            return existing
+        job = IndexJob(
+            job_type="schema_generation",
+            status="pending",
+            requested_by=requested_by,
+            total_items=len(document_ids or []) or 1,
+            max_attempts=INDEX_JOB_MAX_ATTEMPTS,
+            options_json={
+                "document_ids": list(dict.fromkeys(document_ids or []))[:100],
+                "instructions": (instructions or "").strip()[:2000],
+            },
+        )
+        repository.create(job)
+        self.task_queue.enqueue(job.id)
+        return job
+
+    def request_automatic_schema_generation(
+        self, requested_by: str | None, source_job_id: str
+    ) -> IndexJob | None:
+        """Generate the first document-derived draft after successful indexing."""
+        if not self.automation_settings()["auto_schema_generation_enabled"]:
+            return None
+        existing_schema = self.db.scalar(select(GraphSchemaDefinition.id).where(
+            GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+            GraphSchemaDefinition.generation_method == "document_llm",
+        ).limit(1))
+        if existing_schema is not None:
+            return None
+        job = self.request_schema_generation(requested_by=requested_by)
+        options = dict(job.options_json or {})
+        options.update({
+            "trigger": "document_index_completed",
+            "source_job_id": source_job_id,
+        })
+        job.options_json = options
+        self.db.commit()
+        return job
 
     def _after_schema_activation(self, kind: str) -> None:
         """Queue the follow-up work that matches the change kind."""
@@ -525,6 +605,26 @@ class GraphGovernanceService:
                     existing.visible_at = now
                     self.db.commit()
                     self.task_queue.enqueue(existing.id)
+                else:
+                    # Sliding debounce: each new completed document postpones the
+                    # build, but never beyond the hard deadline from job creation.
+                    hard_deadline = created + timedelta(
+                        seconds=GRAPH_AUTO_BUILD_MAX_WAIT_SECONDS
+                    )
+                    existing.visible_at = min(
+                        now + timedelta(seconds=GRAPH_AUTO_BUILD_DEBOUNCE_SECONDS),
+                        hard_deadline,
+                    )
+                    options = dict(existing.options_json or {})
+                    sources = list(options.get("source_job_ids") or [])
+                    if not sources and options.get("source_job_id"):
+                        sources.append(options["source_job_id"])
+                    if source_job_id not in sources:
+                        sources.append(source_job_id)
+                    options["source_job_ids"] = sources[-100:]
+                    options["pending_chunks_at_enqueue"] = pending
+                    existing.options_json = options
+                    self.db.commit()
             return existing
 
         immediate = (
@@ -548,6 +648,148 @@ class GraphGovernanceService:
         return self.db.scalar(select(GraphQualityReport).where(
             GraphQualityReport.knowledge_base_id == self.knowledge_base_id
         ).order_by(GraphQualityReport.created_at.desc()).limit(1))
+
+    def document_coverage(self, document_id: str | None = None) -> dict:
+        """Return document-level processing and graph-fact coverage metrics."""
+        document_stmt = select(KnowledgeDocument).where(
+            KnowledgeDocument.knowledge_base_id == self.knowledge_base_id
+        )
+        if document_id:
+            document_stmt = document_stmt.where(KnowledgeDocument.id == document_id)
+        documents = list(self.db.scalars(
+            document_stmt.order_by(KnowledgeDocument.updated_at.desc())
+        ))
+        document_ids = [document.id for document in documents]
+        if not document_ids:
+            return {
+                "summary": {
+                    "documents": 0,
+                    "chunks": 0,
+                    "processed_chunks": 0,
+                    "fact_chunks": 0,
+                    "processing_rate": 0.0,
+                    "fact_coverage_rate": 0.0,
+                },
+                "documents": [],
+            }
+
+        chunks = list(self.db.execute(select(
+            KnowledgeChunk.id,
+            KnowledgeChunk.document_id,
+            KnowledgeChunk.graph_status,
+            KnowledgeChunk.graph_schema_version,
+            KnowledgeChunk.graph_error,
+        ).where(
+            KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+            KnowledgeChunk.document_id.in_(document_ids),
+        )))
+        mention_rows = list(self.db.execute(select(
+            KgEntityMention.document_id,
+            KgEntityMention.chunk_id,
+            KgEntityMention.entity_id,
+        ).where(
+            KgEntityMention.knowledge_base_id == self.knowledge_base_id,
+            KgEntityMention.document_id.in_(document_ids),
+        )))
+        evidence_rows = list(self.db.execute(select(
+            KgRelationEvidence.document_id,
+            KgRelationEvidence.chunk_id,
+            KgRelationEvidence.relation_id,
+        ).where(
+            KgRelationEvidence.knowledge_base_id == self.knowledge_base_id,
+            KgRelationEvidence.document_id.in_(document_ids),
+        )))
+
+        stats = defaultdict(lambda: {
+            "chunks": 0,
+            "completed": 0,
+            "failed": 0,
+            "pending": 0,
+            "processing": 0,
+            "schema_versions": set(),
+            "errors": [],
+            "fact_chunks": set(),
+            "entities": set(),
+            "relations": set(),
+            "mentions": 0,
+            "evidence": 0,
+        })
+        for chunk in chunks:
+            item = stats[chunk.document_id]
+            item["chunks"] += 1
+            status = chunk.graph_status if chunk.graph_status in {
+                "completed", "failed", "pending", "processing"
+            } else "pending"
+            item[status] += 1
+            if chunk.graph_schema_version:
+                item["schema_versions"].add(chunk.graph_schema_version)
+            if chunk.graph_error and len(item["errors"]) < 3:
+                item["errors"].append(chunk.graph_error)
+        for row in mention_rows:
+            item = stats[row.document_id]
+            item["mentions"] += 1
+            item["fact_chunks"].add(row.chunk_id)
+            item["entities"].add(row.entity_id)
+        for row in evidence_rows:
+            item = stats[row.document_id]
+            item["evidence"] += 1
+            item["fact_chunks"].add(row.chunk_id)
+            item["relations"].add(row.relation_id)
+
+        rows = []
+        for document in documents:
+            item = stats[document.id]
+            total = int(item["chunks"])
+            processed = int(item["completed"] + item["failed"])
+            fact_chunks = len(item["fact_chunks"])
+            if total == 0:
+                coverage_status = "no_chunks"
+            elif item["failed"]:
+                coverage_status = "attention"
+            elif processed < total:
+                coverage_status = "processing"
+            elif fact_chunks == 0:
+                coverage_status = "no_facts"
+            else:
+                coverage_status = "covered"
+            rows.append({
+                "document_id": document.id,
+                "filename": document.original_filename,
+                "document_status": document.status,
+                "coverage_status": coverage_status,
+                "total_chunks": total,
+                "completed_chunks": int(item["completed"]),
+                "failed_chunks": int(item["failed"]),
+                "pending_chunks": int(item["pending"] + item["processing"]),
+                "fact_chunks": fact_chunks,
+                "entity_mentions": int(item["mentions"]),
+                "unique_entities": len(item["entities"]),
+                "relation_evidence": int(item["evidence"]),
+                "unique_relations": len(item["relations"]),
+                "processing_rate": round(processed / total, 4) if total else 0.0,
+                "fact_coverage_rate": round(fact_chunks / total, 4) if total else 0.0,
+                "schema_versions": sorted(item["schema_versions"]),
+                "errors": item["errors"],
+            })
+
+        total_chunks = sum(row["total_chunks"] for row in rows)
+        processed_chunks = sum(
+            row["completed_chunks"] + row["failed_chunks"] for row in rows
+        )
+        fact_chunks = sum(row["fact_chunks"] for row in rows)
+        return {
+            "summary": {
+                "documents": len(rows),
+                "chunks": total_chunks,
+                "processed_chunks": processed_chunks,
+                "fact_chunks": fact_chunks,
+                "processing_rate": round(processed_chunks / total_chunks, 4)
+                if total_chunks else 0.0,
+                "fact_coverage_rate": round(fact_chunks / total_chunks, 4)
+                if total_chunks else 0.0,
+            },
+            "documents": rows,
+        }
 
     def assess_quality(self, created_by: str | None = None) -> GraphQualityReport:
         entities = list(self.db.scalars(select(KgEntity).where(
@@ -915,6 +1157,13 @@ class GraphGovernanceService:
 
     def rebuild_communities(self, changed_entity_ids: list[str] | None = None) -> dict:
         """Rebuild communities; pass changed ids to touch only affected components."""
+        if changed_entity_ids is not None and not changed_entity_ids:
+            state = self.community_state(create=False)
+            return {
+                "communities": int(state.communities if state else 0),
+                "entities": int(state.entities if state else 0),
+                "unchanged": True,
+            }
         adjacency, relation_by_pair, entities = self._load_graph_adjacency()
         components = self._components_from_adjacency(adjacency)
         by_id = {entity.id: entity for entity in entities}

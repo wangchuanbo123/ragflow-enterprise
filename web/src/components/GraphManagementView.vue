@@ -2,21 +2,27 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import * as api from '../api/client'
 import type {
+  DocumentGraphCoverage,
   EntityMerge, GraphAutomationSettings, GraphCommunity, GraphCorrection,
-  GraphEntity, GraphQuality, GraphReviewItem, GraphSchema, SubgraphEdge,
-  SubgraphNode, EntityVectorState,
+  GraphCommunityState, GraphEntity, GraphQuality, GraphReviewItem, GraphSchema,
+  GraphSchemaImpact, RelationVectorState, SubgraphEdge, SubgraphNode,
+  EntityVectorState,
 } from '../types'
 
 const props = defineProps<{ knowledgeBaseId: string }>()
 const quality = ref<GraphQuality | null>(null)
 const schemas = ref<GraphSchema[]>([])
-const automation = ref<GraphAutomationSettings>({ auto_build_enabled: true })
+const automation = ref<GraphAutomationSettings>({ auto_build_enabled: true, auto_schema_generation_enabled: true })
 const reviews = ref<GraphReviewItem[]>([])
 const merges = ref<EntityMerge[]>([])
 const relationMerges = ref<GraphCorrection[]>([])
 const corrections = ref<GraphCorrection[]>([])
 const communities = ref<GraphCommunity[]>([])
 const vectorState = ref<EntityVectorState | null>(null)
+const relationVectorState = ref<RelationVectorState | null>(null)
+const communityState = ref<GraphCommunityState | null>(null)
+const coverage = ref<DocumentGraphCoverage>({ summary: { documents: 0, chunks: 0, processed_chunks: 0, fact_chunks: 0, processing_rate: 0, fact_coverage_rate: 0 }, documents: [] })
+const schemaImpacts = ref<Record<string, GraphSchemaImpact>>({})
 const entities = ref<GraphEntity[]>([])
 const graphNodes = ref<SubgraphNode[]>([])
 const graphEdges = ref<SubgraphEdge[]>([])
@@ -29,6 +35,7 @@ const selectedEdgeId = ref('')
 const defaultEntities = ['SYSTEM','MODULE','INTERFACE','REQUIREMENT','TEST_CASE','ROLE','ENVIRONMENT','DOCUMENT','VERSION','TERM','OTHER']
 const defaultRelations = ['CONTAINS','PART_OF','DEPENDS_ON','CALLS','PROVIDES','IMPLEMENTS','SATISFIES','VERIFIED_BY','DEPLOYED_ON','OWNED_BY','USES','RELATED_TO']
 const schemaForm = reactive({ id: '', entities: defaultEntities.join(', '), relations: defaultRelations.join(', '), prompt: '' })
+const schemaGenerationInstructions = ref('')
 const mergeForm = reactive({ canonical: '', merged: '', reason: '' })
 const relationMergeForm = reactive({ canonical: '', merged: '', reason: '' })
 const entityEditForm = reactive({ name: '', description: '', reason: '' })
@@ -52,10 +59,11 @@ function fail(e: unknown): void { error.value = (e as Error).message; message.va
 async function load(): Promise<void> {
   loading.value = true
   try {
-    ;[quality.value, schemas.value, automation.value, reviews.value, merges.value, relationMerges.value, corrections.value, communities.value, vectorState.value] = await Promise.all([
+    ;[quality.value, schemas.value, automation.value, reviews.value, merges.value, relationMerges.value, corrections.value, communities.value, vectorState.value, relationVectorState.value, communityState.value, coverage.value] = await Promise.all([
       api.getGraphQuality(props.knowledgeBaseId), api.listGraphSchemas(props.knowledgeBaseId), api.getGraphAutomation(props.knowledgeBaseId),
       api.listGraphReviews(props.knowledgeBaseId), api.listEntityMerges(props.knowledgeBaseId), api.listRelationMerges(props.knowledgeBaseId),
       api.listGraphCorrections(props.knowledgeBaseId), api.listGraphCommunities(props.knowledgeBaseId), api.getEntityVectorState(props.knowledgeBaseId),
+      api.getRelationVectorState(props.knowledgeBaseId), api.getGraphCommunityState(props.knowledgeBaseId), api.getDocumentGraphCoverage(props.knowledgeBaseId),
     ])
     error.value = ''
   } catch (e) { fail(e) }
@@ -63,16 +71,23 @@ async function load(): Promise<void> {
 }
 
 async function toggleAutomation(): Promise<void> {
-  try { automation.value = await api.updateGraphAutomation(props.knowledgeBaseId, !automation.value.auto_build_enabled); flash(automation.value.auto_build_enabled ? '文档解析后将自动增量构图' : '已关闭自动构图') }
+  try { automation.value = await api.updateGraphAutomation(props.knowledgeBaseId, !automation.value.auto_build_enabled, automation.value.auto_schema_generation_enabled); flash(automation.value.auto_build_enabled ? '文档解析后将自动增量构图' : '已关闭自动构图') }
   catch (e) { fail(e) }
 }
-async function runBuild(mode: 'pending'|'retry_failed'|'full'): Promise<void> {
-  if (mode === 'full' && !window.confirm('全量重建会重新调用 LLM 抽取所有 Chunk，确定继续吗？')) return
-  try { const job = await api.requestGraphBuild(props.knowledgeBaseId, mode); flash(`图谱任务已创建：${job.id.slice(0, 8)}`) } catch (e) { fail(e) }
+async function toggleSchemaAutomation(): Promise<void> {
+  try { automation.value = await api.updateGraphAutomation(props.knowledgeBaseId, automation.value.auto_build_enabled, !automation.value.auto_schema_generation_enabled); flash(automation.value.auto_schema_generation_enabled ? '首次文档解析后将自动生成 Schema 草稿' : '已关闭自动生成 Schema 草稿') }
+  catch (e) { fail(e) }
+}
+async function runBuild(profile: 'fast'|'standard'|'deep'): Promise<void> {
+  if (profile === 'deep' && !window.confirm('深度构建会全量调用 LLM、重建全部向量和社区，确定继续吗？')) return
+  try { const job = await api.requestGraphBuild(props.knowledgeBaseId, profile); flash(`${profile === 'fast' ? '快速' : profile === 'standard' ? '标准' : '深度'}图谱任务已创建：${job.id.slice(0, 8)}`) } catch (e) { fail(e) }
 }
 async function assess(): Promise<void> { try { quality.value = await api.assessGraphQuality(props.knowledgeBaseId) } catch(e) { fail(e) } }
 async function rebuildVectors(): Promise<void> { try { const job=await api.rebuildEntityVectors(props.knowledgeBaseId); flash(`实体向量任务已创建：${job.id.slice(0,8)}`) } catch(e){ fail(e) } }
-async function rebuildCommunities(): Promise<void> { try { const result=await api.rebuildGraphCommunities(props.knowledgeBaseId); flash(`已生成 ${result.communities} 个主题子图`); communities.value=await api.listGraphCommunities(props.knowledgeBaseId) } catch(e){ fail(e) } }
+async function rebuildRelationVectors(): Promise<void> { try { const job=await api.rebuildRelationVectors(props.knowledgeBaseId); flash(`关系向量任务已创建：${job.id.slice(0,8)}`) } catch(e){ fail(e) } }
+async function rebuildCommunities(): Promise<void> { try { const result=await api.rebuildGraphCommunities(props.knowledgeBaseId); flash(`已生成 ${result.communities} 个主题子图`); [communities.value, communityState.value]=await Promise.all([api.listGraphCommunities(props.knowledgeBaseId), api.getGraphCommunityState(props.knowledgeBaseId)]) } catch(e){ fail(e) } }
+async function generateSchema(): Promise<void> { try { const job=await api.generateGraphSchema(props.knowledgeBaseId,schemaGenerationInstructions.value); flash(`已提交文档 Schema 生成任务：${job.id.slice(0,8)}。完成后刷新页面审核草稿。`) } catch(e){ fail(e) } }
+async function previewImpact(schema: GraphSchema): Promise<GraphSchemaImpact | null> { try { const impact=await api.getGraphSchemaImpact(props.knowledgeBaseId,schema.id); schemaImpacts.value={...schemaImpacts.value,[schema.id]:impact}; return impact } catch(e){ fail(e); return null } }
 async function resolve(review: GraphReviewItem, decision: 'accepted'|'rejected'): Promise<void> { try { await api.resolveGraphReview(props.knowledgeBaseId,review.id,decision); reviews.value=await api.listGraphReviews(props.knowledgeBaseId) } catch(e){ fail(e) } }
 async function prepareReview(review: GraphReviewItem): Promise<void> {
   try {
@@ -94,7 +109,7 @@ async function prepareReview(review: GraphReviewItem): Promise<void> {
     }
   } catch(e) { fail(e) }
 }
-async function activate(schema: GraphSchema): Promise<void> { try { await api.activateGraphSchema(props.knowledgeBaseId,schema.id); schemas.value=await api.listGraphSchemas(props.knowledgeBaseId); flash('Schema 已激活，旧 Chunk 已标记为待重建') } catch(e){ fail(e) } }
+async function activate(schema: GraphSchema): Promise<void> { const impact=schemaImpacts.value[schema.id] || await previewImpact(schema); if(!impact) return; if(!window.confirm(`激活 v${schema.version} 将影响 ${impact.affected_documents} 个文档、${impact.affected_chunks} 个 Chunk，预计 ${impact.estimated_llm_requests} 次 LLM 请求。确定继续吗？`)) return; try { await api.activateGraphSchema(props.knowledgeBaseId,schema.id,'auto'); schemas.value=await api.listGraphSchemas(props.knowledgeBaseId); flash('Schema 已激活，系统将按影响范围增量重建') } catch(e){ fail(e) } }
 function editSchema(schema: GraphSchema): void {
   schemaForm.id = schema.status === 'draft' ? schema.id : ''
   schemaForm.entities = schema.entity_types_json.join(', ')
@@ -160,20 +175,28 @@ watch(()=>props.knowledgeBaseId,()=>void load()); onMounted(load)
   <div class="management-page">
     <p v-if="error" class="notice error">{{ error }}</p><p v-if="message" class="notice message">{{ message }}</p>
     <section class="actions card">
-      <div><strong>图谱构建</strong><small>文档解析后按活动 Schema 自动调用 LLM 增量抽取，并重建实体/关系向量与社区</small></div>
+      <div><strong>图谱构建策略</strong><small>快速：只处理新增内容；标准：含失败重试与受影响社区；深度：全量抽取和派生索引</small></div>
       <button :class="{enabled:automation.auto_build_enabled}" @click="toggleAutomation">自动构图：{{ automation.auto_build_enabled?'开':'关' }}</button>
-      <button @click="runBuild('pending')">处理待构建</button><button @click="runBuild('retry_failed')">重试失败</button><button class="danger" @click="runBuild('full')">全量重建</button>
+      <button :class="{enabled:automation.auto_schema_generation_enabled}" @click="toggleSchemaAutomation">自动 Schema：{{ automation.auto_schema_generation_enabled?'开':'关' }}</button>
+      <button @click="runBuild('fast')">快速</button><button @click="runBuild('standard')">标准</button><button class="danger" @click="runBuild('deep')">深度</button>
     </section>
 
     <div class="overview">
       <section class="card quality"><header><strong>质量门禁</strong><button @click="assess">立即检查</button></header><div v-if="!quality" class="empty">尚无质量报告</div><template v-else><p class="status" :class="quality.status">{{quality.status}}</p><div class="metric-grid"><article v-for="(value,key) in quality.metrics_json" :key="key"><span>{{key}}</span><strong>{{typeof value==='object'?JSON.stringify(value):value}}</strong></article></div><ul><li v-for="(gate,key) in quality.gate_results_json" :key="key" :class="{passed:gate.passed}">{{gate.passed?'✓':'!'}} {{key}}</li></ul></template></section>
-      <section class="card indexes"><header><strong>派生索引</strong></header><article><div><b>实体语义向量</b><small>{{vectorState?.status||'empty'}} · {{vectorState?.entity_count||0}} entities</small></div><button @click="rebuildVectors">重建</button></article><article><div><b>社区层级图谱</b><small>{{communities.filter(c=>c.level===0).length}} 个主题子图</small></div><button @click="rebuildCommunities">重建</button></article></section>
+      <section class="card indexes"><header><strong>派生索引</strong></header><article><div><b>实体语义向量</b><small>{{vectorState?.status||'empty'}} · {{vectorState?.entity_count||0}} entities</small></div><button @click="rebuildVectors">重建</button></article><article><div><b>关系语义向量</b><small>{{relationVectorState?.status||'empty'}} · {{relationVectorState?.relation_count||0}} relations</small></div><button @click="rebuildRelationVectors">重建</button></article><article><div><b>社区层级图谱</b><small>{{communityState?.status||'empty'}} · {{communities.filter(c=>c.level===0).length}} 个主题子图</small></div><button @click="rebuildCommunities">重建</button></article></section>
     </div>
 
     <section class="card schema-section">
       <header><div><strong>Schema 与抽取约束</strong><small>活动 Schema 会进入 LLM Prompt，并用于输出和人工关系校验</small></div><span>{{schemas.length}} 个版本</span></header>
-      <div v-if="activeSchema" class="active-schema"><b>活动版本 v{{activeSchema.version}}</b><div><span v-for="item in activeSchema.entity_types_json" :key="item" class="chip entity">{{item}}</span></div><div><span v-for="item in activeSchema.relation_types_json" :key="item" class="chip relation">{{item}}</span></div><p v-if="activeSchema.extraction_prompt">{{activeSchema.extraction_prompt}}</p></div>
-      <div class="schema-layout"><form @submit.prevent="saveSchema"><b>{{schemaForm.id?'修改 Schema 草稿':'新建 Schema 版本'}}</b><label>实体类型（逗号分隔）<textarea v-model="schemaForm.entities" required /></label><label>关系类型（逗号分隔）<textarea v-model="schemaForm.relations" required /></label><label>LLM 抽取规则<textarea v-model="schemaForm.prompt" placeholder="领域定义、边界、反例等" /></label><div><button>{{schemaForm.id?'保存修改':'创建草稿'}}</button><button type="button" @click="resetSchemaForm">重置</button></div></form><div class="version-list"><article v-for="schema in schemas" :key="schema.id"><div><b>v{{schema.version}}</b><small>{{schema.entity_types_json.length}} 实体类型 · {{schema.relation_types_json.length}} 关系类型</small></div><span :class="schema.status">{{schema.status}}</span><button @click="editSchema(schema)">{{schema.status==='draft'?'编辑':'复制编辑'}}</button><button v-if="schema.status!=='active'" @click="activate(schema)">激活</button></article></div></div>
+      <div class="schema-generator"><div><b>从文档自动生成草稿</b><small>系统从最多 30 份已解析文档中分层采样 Chunk，LLM 归纳类型；生成后必须人工审核并激活。</small></div><input v-model="schemaGenerationInstructions" placeholder="可选：补充领域边界或重点概念"/><button @click="generateSchema">生成 Schema 草稿</button></div>
+      <div v-if="activeSchema" class="active-schema"><b>活动版本 v{{activeSchema.version}}</b><small>{{activeSchema.generation_method==='document_llm'?'文档自动归纳':'人工创建'}}<template v-if="activeSchema.generation_summary_json"> · {{activeSchema.generation_summary_json.source_documents||0}} 份来源文档</template></small><div><span v-for="item in activeSchema.entity_types_json" :key="item" class="chip entity">{{item}}</span></div><div><span v-for="item in activeSchema.relation_types_json" :key="item" class="chip relation">{{item}}</span></div><p v-if="activeSchema.extraction_prompt">{{activeSchema.extraction_prompt}}</p></div>
+      <div class="schema-layout"><form @submit.prevent="saveSchema"><b>{{schemaForm.id?'修改 Schema 草稿':'新建 Schema 版本'}}</b><label>实体类型（逗号分隔）<textarea v-model="schemaForm.entities" required /></label><label>关系类型（逗号分隔）<textarea v-model="schemaForm.relations" required /></label><label>LLM 抽取规则<textarea v-model="schemaForm.prompt" placeholder="领域定义、边界、反例等" /></label><div><button>{{schemaForm.id?'保存修改':'创建草稿'}}</button><button type="button" @click="resetSchemaForm">重置</button></div></form><div class="version-list"><article v-for="schema in schemas" :key="schema.id"><div><b>v{{schema.version}} · {{schema.generation_method==='document_llm'?'文档生成':'人工'}}</b><small>{{schema.entity_types_json.length}} 实体类型 · {{schema.relation_types_json.length}} 关系类型<template v-if="schemaImpacts[schema.id]"> · 影响 {{schemaImpacts[schema.id].affected_chunks}} Chunk</template></small></div><span :class="schema.status">{{schema.status}}</span><button @click="editSchema(schema)">{{schema.status==='draft'?'编辑':'复制编辑'}}</button><button v-if="schema.status!=='active'" @click="previewImpact(schema)">评估</button><button v-if="schema.status!=='active'" @click="activate(schema)">激活</button></article></div></div>
+    </section>
+
+    <section class="card coverage-section">
+      <header><div><strong>文档级图谱覆盖报告</strong><small>处理完成率表示构图任务是否结束；事实覆盖率表示产生实体或关系证据的 Chunk 占比。</small></div><button @click="load">刷新报告</button></header>
+      <div class="coverage-summary"><article><span>文档</span><strong>{{coverage.summary.documents}}</strong></article><article><span>处理完成率</span><strong>{{Math.round(coverage.summary.processing_rate*100)}}%</strong></article><article><span>事实覆盖率</span><strong>{{Math.round(coverage.summary.fact_coverage_rate*100)}}%</strong></article><article><span>事实 Chunk</span><strong>{{coverage.summary.fact_chunks}} / {{coverage.summary.chunks}}</strong></article></div>
+      <div class="coverage-table"><table><thead><tr><th>文档</th><th>状态</th><th>处理完成</th><th>事实覆盖</th><th>实体</th><th>关系</th><th>Schema</th></tr></thead><tbody><tr v-for="item in coverage.documents" :key="item.document_id"><td><b>{{item.filename}}</b><small v-if="item.errors.length">{{item.errors[0]}}</small></td><td><span class="coverage-status" :class="item.coverage_status">{{item.coverage_status}}</span></td><td>{{Math.round(item.processing_rate*100)}}% <small>{{item.completed_chunks+item.failed_chunks}}/{{item.total_chunks}}</small></td><td>{{Math.round(item.fact_coverage_rate*100)}}% <small>{{item.fact_chunks}}/{{item.total_chunks}}</small></td><td>{{item.unique_entities}} <small>{{item.entity_mentions}} 次提及</small></td><td>{{item.unique_relations}} <small>{{item.relation_evidence}} 条证据</small></td><td>{{item.schema_versions.join(', ')||'-'}}</td></tr><tr v-if="!coverage.documents.length"><td colspan="7" class="empty">暂无文档数据</td></tr></tbody></table></div>
     </section>
 
     <section class="card graph-editor">
@@ -197,4 +220,5 @@ watch(()=>props.knowledgeBaseId,()=>void load()); onMounted(load)
 
 <style scoped>
 .management-page{height:100%;overflow:auto;padding:18px;color:#344159;background:#f7f9fc}.notice{padding:9px 11px;border-radius:8px;font-size:12px}.error{color:#b42318;background:#fff1f0}.message{color:#18794e;background:#ecf9f1}.card{border:1px solid #e1e7f0;border-radius:12px;background:#fff;box-shadow:0 2px 8px #23395d0a}.actions{display:flex;align-items:center;gap:8px;padding:14px}.actions>div{flex:1}.actions strong,.actions small,header strong,header small{display:block}.actions small,header small{margin-top:4px;color:#8794a7;font-size:10px}button{padding:7px 10px;border:1px solid #d7e0ff;border-radius:7px;color:#4762df;background:#f5f7ff;cursor:pointer;font-size:10px}button:hover{background:#eaf0ff}button.enabled{color:#18794e;border-color:#b9e4ca;background:#ecf9f1}button.danger{color:#b42318;border-color:#f2cbc7;background:#fff6f5}button:disabled{opacity:.5;cursor:not-allowed}.overview{display:grid;grid-template-columns:1.6fr 1fr;gap:12px;margin-top:12px}.overview>section,.schema-section,.graph-editor,.governance-grid>section{padding:14px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}.quality .status{display:inline-block;padding:3px 8px;border-radius:8px;background:#fff4e5;color:#b54708;font-size:9px}.quality .status.ready{background:#e9f8ef;color:#18794e}.metric-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.metric-grid article{padding:8px;border:1px solid #edf1f6;border-radius:7px}.metric-grid span,.metric-grid strong{display:block;overflow:hidden;text-overflow:ellipsis}.metric-grid span{color:#8895a7;font-size:8px}.metric-grid strong{margin-top:3px;font-size:11px}.quality ul{display:flex;gap:7px;flex-wrap:wrap;padding:0;list-style:none}.quality li{padding:3px 7px;border-radius:7px;color:#b54708;background:#fff4e5;font-size:9px}.quality li.passed{color:#18794e;background:#e9f8ef}.indexes article,.version-list article,.governance-grid article{display:flex;align-items:center;gap:7px;padding:8px 0;border-top:1px solid #edf1f6}.indexes article div,.version-list article div,.governance-grid article div{flex:1}.indexes b,.indexes small,.version-list b,.version-list small,.governance-grid b,.governance-grid small{display:block}.indexes small,.version-list small,.governance-grid small{margin-top:3px;color:#8b97a8;font-size:9px}.schema-section,.graph-editor{margin-top:12px}.active-schema{padding:10px;border-radius:9px;background:linear-gradient(120deg,#f2f6ff,#f5fbff)}.active-schema>div{margin-top:6px}.active-schema p{margin:7px 0 0;color:#64738a;font-size:10px}.chip{display:inline-block;margin:2px;padding:3px 6px;border-radius:8px;font-size:8px}.chip.entity{color:#3155c6;background:#e8eeff}.chip.relation{color:#8756b3;background:#f4eaff}.schema-layout{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}.schema-layout form,.editors form{display:grid;gap:7px;padding:10px;border:1px solid #edf1f6;border-radius:9px}.schema-layout label{font-size:9px;color:#6f7d90}input,select,textarea{box-sizing:border-box;width:100%;padding:8px;border:1px solid #dce3ed;border-radius:7px;background:#fff;color:#344159;font-size:10px}textarea{min-height:55px;resize:vertical}.search{display:flex;gap:7px}.search input{flex:1}.search-results{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.graph-layout{display:grid;grid-template-columns:1.7fr 1fr;gap:12px;margin-top:10px}.subgraph{min-height:280px;padding:12px;border:1px solid #e6ebf2;border-radius:10px;background:radial-gradient(circle at 50% 20%,#f4f7ff,#fbfcfe)}.nodes{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;padding:12px}.nodes button{min-width:100px;border-color:#cbd8ff;background:#fff;box-shadow:0 2px 7px #526ba91a}.nodes button b,.nodes button small,.edges button b,.edges button small{display:block}.nodes button small,.edges button small{margin-top:3px;color:#8895a7}.nodes button.selected,.edges button.selected{outline:2px solid #7088ee}.edges{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}.edges button{text-align:left;background:#fff}.editors{display:grid;gap:9px}.editors form b{font-size:11px}.governance-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}.merge-section{grid-column:1/-1}.merge-form{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:7px;margin:8px 0}.governance-grid article>span,.version-list article>span{padding:3px 6px;border-radius:7px;background:#eef2f7;font-size:8px}.governance-grid article>span.active,.version-list article>span.active{color:#18794e;background:#e9f8ef}.empty{display:grid;place-items:center;min-height:90px;color:#99a5b5;font-size:10px}@media(max-width:1000px){.overview,.schema-layout,.graph-layout,.governance-grid{grid-template-columns:1fr}.merge-section{grid-column:auto}.actions{align-items:stretch;flex-direction:column}.merge-form{grid-template-columns:1fr}.edges{grid-template-columns:1fr}}
+.schema-generator{display:grid;grid-template-columns:1.1fr 1fr auto;align-items:center;gap:9px;padding:10px;margin-bottom:10px;border:1px solid #d9e4ff;border-radius:9px;background:#f7f9ff}.schema-generator b,.schema-generator small{display:block}.schema-generator small{margin-top:3px;color:#75839a;font-size:9px}.active-schema>small{display:block;margin-top:3px;color:#718096;font-size:9px}.coverage-section{margin-top:12px;padding:14px}.coverage-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px}.coverage-summary article{padding:10px;border:1px solid #e5ebf4;border-radius:8px;background:#fafcff}.coverage-summary span,.coverage-summary strong{display:block}.coverage-summary span{color:#8290a4;font-size:9px}.coverage-summary strong{margin-top:4px;font-size:15px}.coverage-table{overflow:auto}.coverage-table table{width:100%;border-collapse:collapse;font-size:10px}.coverage-table th,.coverage-table td{padding:8px;border-top:1px solid #edf1f6;text-align:left;white-space:nowrap}.coverage-table th{color:#7c899d;font-weight:600}.coverage-table td:first-child{max-width:280px;overflow:hidden;text-overflow:ellipsis}.coverage-table td b,.coverage-table td small{display:block}.coverage-table td small{margin-top:2px;color:#8a97aa;font-size:8px}.coverage-status{display:inline-block;padding:3px 6px;border-radius:7px;background:#eef2f7}.coverage-status.covered{color:#18794e;background:#e9f8ef}.coverage-status.no_facts{color:#8b5e00;background:#fff7df}.coverage-status.attention{color:#b42318;background:#fff1f0}.coverage-status.processing{color:#3155c6;background:#e8eeff}@media(max-width:1000px){.schema-generator{grid-template-columns:1fr}.coverage-summary{grid-template-columns:repeat(2,1fr)}}
 </style>

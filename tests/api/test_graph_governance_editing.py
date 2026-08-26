@@ -25,7 +25,21 @@ def test_graph_automation_and_custom_schema_editing_api(client):
     assert settings.json()["auto_build_enabled"] is True
     disabled = client.put(f"{base}/automation", json={"auto_build_enabled": False})
     assert disabled.status_code == 200
-    assert disabled.json() == {"auto_build_enabled": False}
+    assert disabled.json() == {
+        "auto_build_enabled": False,
+        "auto_schema_generation_enabled": True,
+    }
+
+    generated = client.post(
+        f"{base}/schemas/generate",
+        json={"document_ids": [], "instructions": "识别核心业务系统"},
+    )
+    assert generated.status_code == 202
+    assert generated.json()["job_type"] == "schema_generation"
+
+    coverage = client.get(f"{base}/coverage")
+    assert coverage.status_code == 200
+    assert coverage.json()["summary"]["documents"] == 0
 
     created = client.post(
         f"{base}/schemas",
