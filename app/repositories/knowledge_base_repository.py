@@ -6,7 +6,7 @@ import re
 
 from datetime import datetime
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
@@ -15,7 +15,10 @@ from app.models.knowledge_base import (
     KnowledgeBaseMember,
     KnowledgeDataSource,
 )
+from app.models.graph_governance import GraphSchemaDefinition
 from app.models.user import User
+from app.core.config import GRAPH_SCHEMA_VERSION
+from rag.knowledge_graph.schemas import VALID_ENTITY_TYPES, VALID_PREDICATES
 
 _SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
 
@@ -23,6 +26,30 @@ _SLUG_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
 class KnowledgeBaseRepository:
     def __init__(self, db: Session):
         self.db = db
+
+    def _ensure_active_schema(self, knowledge_base_id: str) -> None:
+        existing = self.db.scalar(select(GraphSchemaDefinition.id).where(
+            GraphSchemaDefinition.knowledge_base_id == knowledge_base_id,
+            GraphSchemaDefinition.status == "active",
+        ).limit(1))
+        if existing is not None:
+            return
+        latest = self.db.scalar(select(func.max(GraphSchemaDefinition.version)).where(
+            GraphSchemaDefinition.knowledge_base_id == knowledge_base_id
+        )) or 0
+        self.db.add(GraphSchemaDefinition(
+            knowledge_base_id=knowledge_base_id,
+            version=max(int(latest) + 1, GRAPH_SCHEMA_VERSION),
+            status="active",
+            entity_types_json=sorted(VALID_ENTITY_TYPES),
+            relation_types_json=sorted(VALID_PREDICATES),
+            normalization_rules_json={
+                "unicode": "NFKC",
+                "case": "lower_ascii",
+                "trim_punctuation": True,
+            },
+            activated_at=datetime.utcnow(),
+        ))
 
     def ensure_default(self, owner_id: str | None = None) -> KnowledgeBase:
         knowledge_base = self.db.get(KnowledgeBase, DEFAULT_KNOWLEDGE_BASE_ID)
@@ -41,6 +68,7 @@ class KnowledgeBaseRepository:
                     role="owner",
                 )
             )
+        self._ensure_active_schema(DEFAULT_KNOWLEDGE_BASE_ID)
         self.db.commit()
         self.db.refresh(knowledge_base)
         return knowledge_base
@@ -113,6 +141,7 @@ class KnowledgeBaseRepository:
                 role="owner",
             )
         )
+        self._ensure_active_schema(knowledge_base.id)
         self.db.commit()
         self.db.refresh(knowledge_base)
         return knowledge_base

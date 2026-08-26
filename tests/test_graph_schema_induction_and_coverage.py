@@ -120,6 +120,118 @@ def test_schema_generation_request_is_deduplicated(db_engine):
         assert queue.ids == [first.id]
 
 
+def test_default_active_schema_uses_next_version_and_is_unique(db_engine):
+    from sqlalchemy.exc import IntegrityError
+
+    from app.core.database import SessionLocal
+    from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
+    from app.models.graph_governance import GraphSchemaDefinition
+    from app.services.graph_governance_service import GraphGovernanceService
+
+    with SessionLocal() as db:
+        _seed_document(db, suffix="active-unique")
+        governance = GraphGovernanceService(
+            db, DEFAULT_KNOWLEDGE_BASE_ID, task_queue=object()
+        )
+        draft = governance.create_schema(
+            entity_types=["SYSTEM", "MODULE", "DOCUMENT"],
+            relation_types=["USES", "CALLS", "CONTAINS"],
+            normalization_rules={},
+            extraction_prompt=None,
+            created_by=None,
+        )
+        active = governance.active_schema()
+
+        assert draft.version == 1
+        assert active.version == 2
+        assert db.query(GraphSchemaDefinition).filter_by(status="active").count() == 1
+
+        db.add(GraphSchemaDefinition(
+            knowledge_base_id=DEFAULT_KNOWLEDGE_BASE_ID,
+            version=3,
+            status="active",
+            entity_types_json=["SYSTEM"],
+            relation_types_json=["USES"],
+        ))
+        try:
+            db.commit()
+            assert False, "database must reject a second active Schema"
+        except IntegrityError:
+            db.rollback()
+
+
+def test_schema_generation_can_overwrite_draft_without_new_version(db_engine):
+    from app.core.database import SessionLocal
+    from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
+    from app.models.graph_governance import GraphSchemaDefinition
+    from app.services.graph_schema_induction_service import GraphSchemaInductionService
+
+    with SessionLocal() as db:
+        document, _ = _seed_document(db, suffix="overwrite")
+        service = GraphSchemaInductionService(
+            db, DEFAULT_KNOWLEDGE_BASE_ID, llm=_SchemaLLM()
+        )
+        draft = service.generate_draft(
+            created_by=None, document_ids=[document.id]
+        )
+        original_version = draft.version
+        original_count = db.query(GraphSchemaDefinition).count()
+
+        overwritten = service.generate_draft(
+            created_by=None,
+            document_ids=[document.id],
+            instructions="覆盖原草稿",
+            target_schema_id=draft.id,
+        )
+
+        assert overwritten.id == draft.id
+        assert overwritten.version == original_version
+        assert db.query(GraphSchemaDefinition).count() == original_count
+        assert overwritten.generation_summary_json["source_documents"] == 1
+
+
+def test_schema_drift_creates_draft_only_for_new_types(db_engine):
+    from app.core.database import SessionLocal
+    from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
+    from app.models.graph_governance import GraphSchemaDefinition
+    from app.services.graph_governance_service import GraphGovernanceService
+    from app.services.graph_schema_induction_service import GraphSchemaInductionService
+
+    class NoDriftLLM:
+        def generate(self, prompt):
+            del prompt
+            return json.dumps({
+                "entity_types": ["SYSTEM", "MODULE", "DOCUMENT"],
+                "relation_types": ["USES", "CALLS", "CONTAINS"],
+                "extraction_prompt": "沿用活动领域定义。",
+                "rationale": "没有出现新概念。",
+            }, ensure_ascii=False)
+
+    with SessionLocal() as db:
+        document, _ = _seed_document(db, suffix="drift")
+        governance = GraphGovernanceService(
+            db, DEFAULT_KNOWLEDGE_BASE_ID, task_queue=object()
+        )
+        active = governance.active_schema()
+        detected = GraphSchemaInductionService(
+            db, DEFAULT_KNOWLEDGE_BASE_ID, llm=_SchemaLLM()
+        ).detect_drift(created_by=None, document_ids=[document.id])
+
+        assert detected["status"] == "drift_detected"
+        assert "ORDER_SERVICE" in detected["added_entity_types"]
+        suggested = db.get(GraphSchemaDefinition, detected["generated_schema_id"])
+        assert suggested.status == "draft"
+        assert suggested.generation_method == "document_drift"
+        assert governance.active_schema().id == active.id
+
+        draft_count = db.query(GraphSchemaDefinition).filter_by(status="draft").count()
+        no_drift = GraphSchemaInductionService(
+            db, DEFAULT_KNOWLEDGE_BASE_ID, llm=NoDriftLLM()
+        ).detect_drift(created_by=None, document_ids=[document.id])
+        assert no_drift["status"] == "no_drift"
+        assert db.query(GraphSchemaDefinition).filter_by(status="draft").count() == draft_count
+
+
 def test_document_graph_coverage_separates_completion_from_facts(db_engine):
     from app.core.database import SessionLocal
     from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID

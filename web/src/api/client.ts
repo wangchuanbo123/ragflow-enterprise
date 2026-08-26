@@ -191,6 +191,10 @@ export function listDocuments(knowledgeBaseId: string): Promise<KnowledgeDocumen
   return request(`/knowledge-bases/${knowledgeBaseId}/documents`)
 }
 
+export function getDocumentTagMap(knowledgeBaseId: string): Promise<Record<string, string[]>> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/documents/tag-map`)
+}
+
 export async function uploadDocuments(knowledgeBaseId: string, files: File[]): Promise<void> {
   const form = new FormData()
   files.forEach((file) => form.append('files', file))
@@ -378,8 +382,20 @@ export function activateGraphSchema(knowledgeBaseId: string, schemaId: string, r
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/${schemaId}/activate?reprocess=${reprocess}`, { method: 'POST' })
 }
 
-export function generateGraphSchema(knowledgeBaseId: string, instructions = '', documentIds: string[] = []): Promise<IndexJob> {
+export function generateGraphSchema(
+  knowledgeBaseId: string,
+  instructions = '',
+  documentIds: string[] = [],
+  mode: 'new' | 'overwrite' = 'new',
+  targetSchemaId: string | null = null,
+): Promise<IndexJob> {
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/generate`, {
+    method: 'POST', body: JSON.stringify({ instructions: instructions || null, document_ids: documentIds, mode, target_schema_id: targetSchemaId }),
+  })
+}
+
+export function checkGraphSchemaDrift(knowledgeBaseId: string, instructions = '', documentIds: string[] = []): Promise<IndexJob> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/drift-check`, {
     method: 'POST', body: JSON.stringify({ instructions: instructions || null, document_ids: documentIds }),
   })
 }

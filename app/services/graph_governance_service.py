@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from datetime import datetime, timedelta
 
 from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import (
@@ -61,6 +62,12 @@ class GraphGovernanceService:
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id
         ).order_by(GraphSchemaDefinition.version.desc())))
 
+    def _next_schema_version(self) -> int:
+        latest = self.db.scalar(select(func.max(GraphSchemaDefinition.version)).where(
+            GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id
+        )) or 0
+        return max(int(latest) + 1, GRAPH_SCHEMA_VERSION)
+
     @staticmethod
     def _validate_schema_types(entity_types: list[str], relation_types: list[str]) -> tuple[list[str], list[str]]:
         pattern = re.compile(r"^[A-Z][A-Z0-9_]{0,31}$")
@@ -83,7 +90,7 @@ class GraphGovernanceService:
         if schema is None and create_default:
             schema = GraphSchemaDefinition(
                 knowledge_base_id=self.knowledge_base_id,
-                version=GRAPH_SCHEMA_VERSION,
+                version=self._next_schema_version(),
                 status="active",
                 entity_types_json=sorted(VALID_ENTITY_TYPES),
                 relation_types_json=sorted(VALID_PREDICATES),
@@ -93,7 +100,16 @@ class GraphGovernanceService:
                 activated_at=datetime.utcnow(),
             )
             self.db.add(schema)
-            self.db.commit()
+            try:
+                self.db.commit()
+            except IntegrityError:
+                self.db.rollback()
+                schema = self.db.scalar(select(GraphSchemaDefinition).where(
+                    GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+                    GraphSchemaDefinition.status == "active",
+                ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
+                if schema is None:
+                    raise
             self.db.refresh(schema)
         return schema
 
@@ -107,12 +123,9 @@ class GraphGovernanceService:
         entity_types, relation_types = self._validate_schema_types(
             entity_types, relation_types
         )
-        latest = self.db.scalar(select(func.max(GraphSchemaDefinition.version)).where(
-            GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id
-        )) or 0
         schema = GraphSchemaDefinition(
             knowledge_base_id=self.knowledge_base_id,
-            version=max(int(latest) + 1, GRAPH_SCHEMA_VERSION),
+            version=self._next_schema_version(),
             status="draft",
             entity_types_json=entity_types,
             relation_types_json=relation_types,
@@ -441,9 +454,17 @@ class GraphGovernanceService:
         requested_by: str | None,
         document_ids: list[str] | None = None,
         instructions: str | None = None,
+        target_schema_id: str | None = None,
     ) -> IndexJob:
         """Queue one deduplicated, auditable Schema induction job."""
         repository = IndexJobRepository(self.db, self.knowledge_base_id)
+        if target_schema_id:
+            target = self.db.scalar(select(GraphSchemaDefinition).where(
+                GraphSchemaDefinition.id == target_schema_id,
+                GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+            ))
+            if target is None or target.status != "draft":
+                raise ValueError("只能覆盖当前知识库中的 Schema 草稿")
         existing = repository.find_open("schema_generation")
         if existing is not None:
             return existing
@@ -456,6 +477,7 @@ class GraphGovernanceService:
             options_json={
                 "document_ids": list(dict.fromkeys(document_ids or []))[:100],
                 "instructions": (instructions or "").strip()[:2000],
+                "target_schema_id": target_schema_id,
             },
         )
         repository.create(job)
@@ -468,6 +490,9 @@ class GraphGovernanceService:
         """Generate the first document-derived draft after successful indexing."""
         if not self.automation_settings()["auto_schema_generation_enabled"]:
             return None
+        # Establish the immutable default active baseline before a generated
+        # draft receives its version number.
+        self.active_schema()
         existing_schema = self.db.scalar(select(GraphSchemaDefinition.id).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
             GraphSchemaDefinition.generation_method == "document_llm",
@@ -482,6 +507,34 @@ class GraphGovernanceService:
         })
         job.options_json = options
         self.db.commit()
+        return job
+
+    def request_schema_drift_check(
+        self,
+        *,
+        requested_by: str | None,
+        document_ids: list[str] | None = None,
+        instructions: str | None = None,
+    ) -> IndexJob:
+        """Queue a drift check that creates a draft only for new type concepts."""
+        self.active_schema()
+        repository = IndexJobRepository(self.db, self.knowledge_base_id)
+        existing = repository.find_open("schema_drift")
+        if existing is not None:
+            return existing
+        job = IndexJob(
+            job_type="schema_drift",
+            status="pending",
+            requested_by=requested_by,
+            total_items=len(document_ids or []) or 1,
+            max_attempts=INDEX_JOB_MAX_ATTEMPTS,
+            options_json={
+                "document_ids": list(dict.fromkeys(document_ids or []))[:100],
+                "instructions": (instructions or "").strip()[:2000],
+            },
+        )
+        repository.create(job)
+        self.task_queue.enqueue(job.id)
         return job
 
     def _after_schema_activation(self, kind: str) -> None:

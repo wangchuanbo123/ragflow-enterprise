@@ -20,6 +20,7 @@ from app.schemas.graph_governance import (
     GraphBuildRequest,
     GraphQualityOut,
     GraphSchemaCreate,
+    GraphSchemaDriftRequest,
     GraphSchemaGenerateRequest,
     GraphSchemaImpactOut,
     GraphSchemaOut,
@@ -87,6 +88,32 @@ def generate_graph_schema(
     _require(db, knowledge_base_id, current_user, edit=True)
     try:
         return GraphGovernanceService(db, knowledge_base_id).request_schema_generation(
+            requested_by=current_user.id,
+            document_ids=payload.document_ids or None,
+            instructions=payload.instructions,
+            target_schema_id=(
+                payload.target_schema_id if payload.mode == "overwrite" else None
+            ),
+        )
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
+
+
+@router.post(
+    "/{knowledge_base_id}/knowledge-graph/schemas/drift-check",
+    response_model=IndexJobOut,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def check_graph_schema_drift(
+    knowledge_base_id: str,
+    payload: GraphSchemaDriftRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Suggest a new draft only when sampled documents introduce new types."""
+    _require(db, knowledge_base_id, current_user, edit=True)
+    try:
+        return GraphGovernanceService(db, knowledge_base_id).request_schema_drift_check(
             requested_by=current_user.id,
             document_ids=payload.document_ids or None,
             instructions=payload.instructions,

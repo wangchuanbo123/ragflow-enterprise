@@ -407,6 +407,7 @@ def _process_job(
                         created_by=job.requested_by,
                         document_ids=options.get("document_ids") or None,
                         instructions=options.get("instructions") or None,
+                        target_schema_id=options.get("target_schema_id") or None,
                     )
                     options = dict(options)
                     options["generated_schema_id"] = schema.id
@@ -418,6 +419,32 @@ def _process_job(
                         total_items=len(schema.source_document_ids_json or []) or 1,
                         processed_items=len(schema.source_document_ids_json or []) or 1,
                         succeeded_items=len(schema.source_document_ids_json or []) or 1,
+                        failed_items=0,
+                    )
+                elif job.job_type == "schema_drift":
+                    from app.services.graph_schema_induction_service import (
+                        GraphSchemaInductionService,
+                    )
+
+                    options = dict(job.options_json or {})
+                    drift = GraphSchemaInductionService(
+                        db,
+                        job.knowledge_base_id,
+                        llm=container.extraction_llm,
+                    ).detect_drift(
+                        created_by=job.requested_by,
+                        document_ids=options.get("document_ids") or None,
+                        instructions=options.get("instructions") or None,
+                    )
+                    options["drift_result"] = drift
+                    job.options_json = options
+                    source_count = len(drift.get("source_document_ids") or []) or 1
+                    job_repo.update(
+                        job,
+                        status="completed",
+                        total_items=source_count,
+                        processed_items=source_count,
+                        succeeded_items=source_count,
                         failed_items=0,
                     )
                 else:

@@ -12,6 +12,9 @@ def _login(client, username, password):
 
 
 def test_admin_can_create_and_list_knowledge_bases(client):
+    import app.core.database as db_module
+    from app.models.graph_governance import GraphSchemaDefinition
+
     _login(client, INITIAL_ADMIN_USERNAME, INITIAL_ADMIN_PASSWORD)
 
     created = client.post(
@@ -24,6 +27,12 @@ def test_admin_can_create_and_list_knowledge_bases(client):
     listed = client.get("/api/v1/knowledge-bases")
     assert listed.status_code == 200
     assert knowledge_base_id in {item["id"] for item in listed.json()}
+    with db_module.SessionLocal() as db:
+        active = db.query(GraphSchemaDefinition).filter_by(
+            knowledge_base_id=knowledge_base_id,
+            status="active",
+        ).all()
+        assert len(active) == 1
 
 
 def test_non_member_cannot_discover_another_knowledge_base(client):

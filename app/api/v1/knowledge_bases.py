@@ -340,6 +340,18 @@ def list_documents(
     )
 
 
+@router.get("/{knowledge_base_id}/documents/tag-map", response_model=dict[str, list[str]])
+def document_tag_map(
+    knowledge_base_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_read(db, knowledge_base_id, current_user)
+    return DocumentIndexService(
+        db, knowledge_base_id
+    ).management_repo.document_tag_map()
+
+
 @router.get(
     "/{knowledge_base_id}/documents/{document_id}",
     response_model=DocumentOut,

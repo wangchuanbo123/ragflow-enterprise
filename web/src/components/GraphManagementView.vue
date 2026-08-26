@@ -4,9 +4,9 @@ import * as api from '../api/client'
 import type {
   DocumentGraphCoverage,
   EntityMerge, GraphAutomationSettings, GraphCommunity, GraphCorrection,
-  GraphCommunityState, GraphEntity, GraphQuality, GraphReviewItem, GraphSchema,
+  Folder, GraphCommunityState, GraphEntity, GraphQuality, GraphReviewItem, GraphSchema,
   GraphSchemaImpact, RelationVectorState, SubgraphEdge, SubgraphNode,
-  EntityVectorState,
+  EntityVectorState, KnowledgeDocument, Tag,
 } from '../types'
 
 const props = defineProps<{ knowledgeBaseId: string }>()
@@ -23,6 +23,18 @@ const relationVectorState = ref<RelationVectorState | null>(null)
 const communityState = ref<GraphCommunityState | null>(null)
 const coverage = ref<DocumentGraphCoverage>({ summary: { documents: 0, chunks: 0, processed_chunks: 0, fact_chunks: 0, processing_rate: 0, fact_coverage_rate: 0 }, documents: [] })
 const schemaImpacts = ref<Record<string, GraphSchemaImpact>>({})
+const sourceDocuments = ref<KnowledgeDocument[]>([])
+const sourceFolders = ref<Folder[]>([])
+const sourceTags = ref<Tag[]>([])
+const documentTagMap = ref<Record<string, string[]>>({})
+const selectedSourceDocumentIds = ref<string[]>([])
+const sourceSelectionMode = ref<'all' | 'selected'>('all')
+const sourceQuery = ref('')
+const sourceFolderId = ref('')
+const sourceTagId = ref('')
+const schemaGenerationMode = ref<'new' | 'overwrite'>('new')
+const generationTargetSchemaId = ref('')
+const schemaJobRunning = ref(false)
 const entities = ref<GraphEntity[]>([])
 const graphNodes = ref<SubgraphNode[]>([])
 const graphEdges = ref<SubgraphEdge[]>([])
@@ -43,6 +55,14 @@ const relationEditForm = reactive({ predicate: '', confidence: 0.9, reason: '' }
 const relationAddForm = reactive({ subject: '', object: '', predicate: '', evidence: '', reason: '' })
 
 const activeSchema = computed(() => schemas.value.find(item => item.status === 'active') || null)
+const draftSchemas = computed(() => schemas.value.filter(item => item.status === 'draft'))
+const sourceDocumentNameMap = computed(() => new Map(sourceDocuments.value.map(item => [item.id, item.original_filename])))
+const filteredSourceDocuments = computed(() => sourceDocuments.value.filter(document =>
+  document.status === 'ready' &&
+  (!sourceQuery.value || document.original_filename.toLowerCase().includes(sourceQuery.value.toLowerCase())) &&
+  (!sourceFolderId.value || document.folder_id === sourceFolderId.value) &&
+  (!sourceTagId.value || (documentTagMap.value[document.id] || []).includes(sourceTagId.value)),
+))
 const relationDictionary = computed(() => activeSchema.value?.relation_types_json || defaultRelations)
 const selectedNode = computed(() => graphNodes.value.find(item => item.id === selectedNodeId.value) || null)
 const selectedEdge = computed(() => graphEdges.value.find(item => item.id === selectedEdgeId.value) || null)
@@ -59,12 +79,15 @@ function fail(e: unknown): void { error.value = (e as Error).message; message.va
 async function load(): Promise<void> {
   loading.value = true
   try {
-    ;[quality.value, schemas.value, automation.value, reviews.value, merges.value, relationMerges.value, corrections.value, communities.value, vectorState.value, relationVectorState.value, communityState.value, coverage.value] = await Promise.all([
+    ;[quality.value, schemas.value, automation.value, reviews.value, merges.value, relationMerges.value, corrections.value, communities.value, vectorState.value, relationVectorState.value, communityState.value, coverage.value, sourceDocuments.value, sourceFolders.value, sourceTags.value, documentTagMap.value] = await Promise.all([
       api.getGraphQuality(props.knowledgeBaseId), api.listGraphSchemas(props.knowledgeBaseId), api.getGraphAutomation(props.knowledgeBaseId),
       api.listGraphReviews(props.knowledgeBaseId), api.listEntityMerges(props.knowledgeBaseId), api.listRelationMerges(props.knowledgeBaseId),
       api.listGraphCorrections(props.knowledgeBaseId), api.listGraphCommunities(props.knowledgeBaseId), api.getEntityVectorState(props.knowledgeBaseId),
       api.getRelationVectorState(props.knowledgeBaseId), api.getGraphCommunityState(props.knowledgeBaseId), api.getDocumentGraphCoverage(props.knowledgeBaseId),
+      api.listDocuments(props.knowledgeBaseId), api.listFolders(props.knowledgeBaseId), api.listTags(props.knowledgeBaseId), api.getDocumentTagMap(props.knowledgeBaseId),
     ])
+    selectedSourceDocumentIds.value = selectedSourceDocumentIds.value.filter(id => sourceDocuments.value.some(document => document.id === id && document.status === 'ready'))
+    if (generationTargetSchemaId.value && !draftSchemas.value.some(schema => schema.id === generationTargetSchemaId.value)) generationTargetSchemaId.value = ''
     error.value = ''
   } catch (e) { fail(e) }
   finally { loading.value = false }
@@ -86,7 +109,50 @@ async function assess(): Promise<void> { try { quality.value = await api.assessG
 async function rebuildVectors(): Promise<void> { try { const job=await api.rebuildEntityVectors(props.knowledgeBaseId); flash(`实体向量任务已创建：${job.id.slice(0,8)}`) } catch(e){ fail(e) } }
 async function rebuildRelationVectors(): Promise<void> { try { const job=await api.rebuildRelationVectors(props.knowledgeBaseId); flash(`关系向量任务已创建：${job.id.slice(0,8)}`) } catch(e){ fail(e) } }
 async function rebuildCommunities(): Promise<void> { try { const result=await api.rebuildGraphCommunities(props.knowledgeBaseId); flash(`已生成 ${result.communities} 个主题子图`); [communities.value, communityState.value]=await Promise.all([api.listGraphCommunities(props.knowledgeBaseId), api.getGraphCommunityState(props.knowledgeBaseId)]) } catch(e){ fail(e) } }
-async function generateSchema(): Promise<void> { try { const job=await api.generateGraphSchema(props.knowledgeBaseId,schemaGenerationInstructions.value); flash(`已提交文档 Schema 生成任务：${job.id.slice(0,8)}。完成后刷新页面审核草稿。`) } catch(e){ fail(e) } }
+function selectedGenerationDocuments(): string[] | null {
+  if (sourceSelectionMode.value === 'all') return []
+  if (!selectedSourceDocumentIds.value.length) { fail(new Error('请至少选择一份已就绪文档')); return null }
+  if (selectedSourceDocumentIds.value.length > 100) { fail(new Error('一次最多选择 100 份文档')); return null }
+  return selectedSourceDocumentIds.value
+}
+function toggleFilteredSourceDocuments(event: Event): void {
+  const ids = filteredSourceDocuments.value.map(document => document.id)
+  if ((event.target as HTMLInputElement).checked) selectedSourceDocumentIds.value = [...new Set([...selectedSourceDocumentIds.value, ...ids])]
+  else selectedSourceDocumentIds.value = selectedSourceDocumentIds.value.filter(id => !ids.includes(id))
+}
+function schemaSourceNames(schema: GraphSchema): string {
+  const ids = schema.source_document_ids_json || []
+  const names = ids.map(id => sourceDocumentNameMap.value.get(id) || id.slice(0, 8))
+  return names.slice(0, 5).join('、') + (names.length > 5 ? ` 等 ${names.length} 份` : '')
+}
+async function trackSchemaJob(jobId: string, action: string): Promise<void> {
+  schemaJobRunning.value = true
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    await new Promise(resolveDelay => window.setTimeout(resolveDelay, 2000))
+    try {
+      const job = (await api.listIndexJobs(props.knowledgeBaseId)).find(item => item.id === jobId)
+      if (!job || ['pending','running'].includes(job.status)) continue
+      schemaJobRunning.value = false
+      if (job.status === 'completed' || job.status === 'partial') {
+        await load()
+        flash(`${action}已完成；若检测到新概念，版本列表中会出现待审核草稿`)
+      }
+      else fail(new Error(job.error_message || `${action}失败`))
+      return
+    } catch (e) { schemaJobRunning.value = false; fail(e); return }
+  }
+  schemaJobRunning.value = false
+  flash(`${action}仍在后台运行，可在索引任务页查看进度`)
+}
+async function generateSchema(): Promise<void> {
+  const documentIds=selectedGenerationDocuments(); if(documentIds===null) return
+  if(schemaGenerationMode.value==='overwrite' && !generationTargetSchemaId.value){fail(new Error('请选择要覆盖的 Schema 草稿'));return}
+  try { const job=await api.generateGraphSchema(props.knowledgeBaseId,schemaGenerationInstructions.value,documentIds,schemaGenerationMode.value,schemaGenerationMode.value==='overwrite'?generationTargetSchemaId.value:null); flash(`已提交文档 Schema 生成任务：${job.id.slice(0,8)}`); void trackSchemaJob(job.id,'Schema 生成') } catch(e){ fail(e) }
+}
+async function checkSchemaDrift(): Promise<void> {
+  const documentIds=selectedGenerationDocuments(); if(documentIds===null) return
+  try { const job=await api.checkGraphSchemaDrift(props.knowledgeBaseId,schemaGenerationInstructions.value,documentIds); flash(`已提交 Schema 漂移检查：${job.id.slice(0,8)}`); void trackSchemaJob(job.id,'Schema 漂移检查') } catch(e){ fail(e) }
+}
 async function previewImpact(schema: GraphSchema): Promise<GraphSchemaImpact | null> { try { const impact=await api.getGraphSchemaImpact(props.knowledgeBaseId,schema.id); schemaImpacts.value={...schemaImpacts.value,[schema.id]:impact}; return impact } catch(e){ fail(e); return null } }
 async function resolve(review: GraphReviewItem, decision: 'accepted'|'rejected'): Promise<void> { try { await api.resolveGraphReview(props.knowledgeBaseId,review.id,decision); reviews.value=await api.listGraphReviews(props.knowledgeBaseId) } catch(e){ fail(e) } }
 async function prepareReview(review: GraphReviewItem): Promise<void> {
@@ -168,7 +234,7 @@ async function scanRelationCandidates():Promise<void>{try{const result=await api
 async function mergeRelations():Promise<void>{try{await api.createRelationMerge(props.knowledgeBaseId,relationMergeForm.canonical,relationMergeForm.merged,relationMergeForm.reason);Object.assign(relationMergeForm,{canonical:'',merged:'',reason:''});relationMerges.value=await api.listRelationMerges(props.knowledgeBaseId);flash('关系合并已生效')}catch(e){fail(e)}}
 async function revertRelationMerge(id:string):Promise<void>{try{await api.revertRelationMerge(props.knowledgeBaseId,id);relationMerges.value=await api.listRelationMerges(props.knowledgeBaseId);flash('关系合并已回退')}catch(e){fail(e)}}
 
-watch(()=>props.knowledgeBaseId,()=>void load()); onMounted(load)
+watch(()=>props.knowledgeBaseId,()=>{selectedSourceDocumentIds.value=[];void load()}); onMounted(load)
 </script>
 
 <template>
@@ -188,9 +254,17 @@ watch(()=>props.knowledgeBaseId,()=>void load()); onMounted(load)
 
     <section class="card schema-section">
       <header><div><strong>Schema 与抽取约束</strong><small>活动 Schema 会进入 LLM Prompt，并用于输出和人工关系校验</small></div><span>{{schemas.length}} 个版本</span></header>
-      <div class="schema-generator"><div><b>从文档自动生成草稿</b><small>系统从最多 30 份已解析文档中分层采样 Chunk，LLM 归纳类型；生成后必须人工审核并激活。</small></div><input v-model="schemaGenerationInstructions" placeholder="可选：补充领域边界或重点概念"/><button @click="generateSchema">生成 Schema 草稿</button></div>
-      <div v-if="activeSchema" class="active-schema"><b>活动版本 v{{activeSchema.version}}</b><small>{{activeSchema.generation_method==='document_llm'?'文档自动归纳':'人工创建'}}<template v-if="activeSchema.generation_summary_json"> · {{activeSchema.generation_summary_json.source_documents||0}} 份来源文档</template></small><div><span v-for="item in activeSchema.entity_types_json" :key="item" class="chip entity">{{item}}</span></div><div><span v-for="item in activeSchema.relation_types_json" :key="item" class="chip relation">{{item}}</span></div><p v-if="activeSchema.extraction_prompt">{{activeSchema.extraction_prompt}}</p></div>
-      <div class="schema-layout"><form @submit.prevent="saveSchema"><b>{{schemaForm.id?'修改 Schema 草稿':'新建 Schema 版本'}}</b><label>实体类型（逗号分隔）<textarea v-model="schemaForm.entities" required /></label><label>关系类型（逗号分隔）<textarea v-model="schemaForm.relations" required /></label><label>LLM 抽取规则<textarea v-model="schemaForm.prompt" placeholder="领域定义、边界、反例等" /></label><div><button>{{schemaForm.id?'保存修改':'创建草稿'}}</button><button type="button" @click="resetSchemaForm">重置</button></div></form><div class="version-list"><article v-for="schema in schemas" :key="schema.id"><div><b>v{{schema.version}} · {{schema.generation_method==='document_llm'?'文档生成':'人工'}}</b><small>{{schema.entity_types_json.length}} 实体类型 · {{schema.relation_types_json.length}} 关系类型<template v-if="schemaImpacts[schema.id]"> · 影响 {{schemaImpacts[schema.id].affected_chunks}} Chunk</template></small></div><span :class="schema.status">{{schema.status}}</span><button @click="editSchema(schema)">{{schema.status==='draft'?'编辑':'复制编辑'}}</button><button v-if="schema.status!=='active'" @click="previewImpact(schema)">评估</button><button v-if="schema.status!=='active'" @click="activate(schema)">激活</button></article></div></div>
+      <div class="schema-generator">
+        <div class="generator-head"><div><b>从文档生成 Schema 草稿</b><small>每个知识库始终只有一个活动 Schema；生成和漂移检查只产生待审核草稿。</small></div><div class="generator-actions"><button :disabled="schemaJobRunning" @click="checkSchemaDrift">检查 Schema 漂移</button><button :disabled="schemaJobRunning" @click="generateSchema">{{schemaJobRunning?'任务运行中…':'生成 Schema 草稿'}}</button></div></div>
+        <div class="source-mode"><label><input v-model="sourceSelectionMode" type="radio" value="all"/>全部已就绪文档（自动采样最多 30 份）</label><label><input v-model="sourceSelectionMode" type="radio" value="selected"/>手动选择文档</label></div>
+        <template v-if="sourceSelectionMode==='selected'">
+          <div class="source-filters"><input v-model="sourceQuery" placeholder="按文件名筛选"/><select v-model="sourceFolderId"><option value="">全部目录</option><option v-for="folder in sourceFolders" :key="folder.id" :value="folder.id">{{folder.path}}</option></select><select v-model="sourceTagId"><option value="">全部标签</option><option v-for="tag in sourceTags" :key="tag.id" :value="tag.id">{{tag.name}}</option></select></div>
+          <div class="source-list"><label class="select-all"><input type="checkbox" :checked="filteredSourceDocuments.length>0 && filteredSourceDocuments.every(document=>selectedSourceDocumentIds.includes(document.id))" @change="toggleFilteredSourceDocuments"/>选择当前筛选结果 · 已选 {{selectedSourceDocumentIds.length}} 份</label><label v-for="document in filteredSourceDocuments" :key="document.id"><input v-model="selectedSourceDocumentIds" type="checkbox" :value="document.id"/><span>{{document.original_filename}}</span><small>{{document.chunk_count}} Chunk</small></label><p v-if="!filteredSourceDocuments.length">没有符合条件的已就绪文档</p></div>
+        </template>
+        <div class="generation-options"><input v-model="schemaGenerationInstructions" placeholder="可选：补充领域边界或重点概念"/><select v-model="schemaGenerationMode"><option value="new">生成新草稿版本</option><option value="overwrite">覆盖现有草稿</option></select><select v-if="schemaGenerationMode==='overwrite'" v-model="generationTargetSchemaId"><option value="">选择要覆盖的草稿</option><option v-for="schema in draftSchemas" :key="schema.id" :value="schema.id">v{{schema.version}} · {{schema.generation_method}}</option></select></div>
+      </div>
+      <div v-if="activeSchema" class="active-schema"><b>活动版本 v{{activeSchema.version}}</b><small>{{activeSchema.generation_method==='document_llm'?'文档自动归纳':activeSchema.generation_method==='document_drift'?'漂移建议':'人工创建'}}<template v-if="activeSchema.generation_summary_json"> · {{activeSchema.generation_summary_json.source_documents||0}} 份来源文档</template></small><small v-if="activeSchema.source_document_ids_json?.length">来源：{{schemaSourceNames(activeSchema)}}</small><div><span v-for="item in activeSchema.entity_types_json" :key="item" class="chip entity">{{item}}</span></div><div><span v-for="item in activeSchema.relation_types_json" :key="item" class="chip relation">{{item}}</span></div><p v-if="activeSchema.extraction_prompt">{{activeSchema.extraction_prompt}}</p></div>
+      <div class="schema-layout"><form @submit.prevent="saveSchema"><b>{{schemaForm.id?'修改 Schema 草稿':'新建 Schema 版本'}}</b><label>实体类型（逗号分隔）<textarea v-model="schemaForm.entities" required /></label><label>关系类型（逗号分隔）<textarea v-model="schemaForm.relations" required /></label><label>LLM 抽取规则<textarea v-model="schemaForm.prompt" placeholder="领域定义、边界、反例等" /></label><div><button>{{schemaForm.id?'保存修改':'创建草稿'}}</button><button type="button" @click="resetSchemaForm">重置</button></div></form><div class="version-list"><article v-for="schema in schemas" :key="schema.id"><div><b>v{{schema.version}} · {{schema.generation_method==='document_llm'?'文档生成':schema.generation_method==='document_drift'?'漂移建议':'人工'}}</b><small>{{schema.entity_types_json.length}} 实体类型 · {{schema.relation_types_json.length}} 关系类型<template v-if="schemaImpacts[schema.id]"> · 影响 {{schemaImpacts[schema.id].affected_chunks}} Chunk</template></small><small v-if="schema.source_document_ids_json?.length">来源：{{schemaSourceNames(schema)}}</small></div><span :class="schema.status">{{schema.status}}</span><button @click="editSchema(schema)">{{schema.status==='draft'?'编辑':'复制编辑'}}</button><button v-if="schema.status!=='active'" @click="previewImpact(schema)">评估</button><button v-if="schema.status!=='active'" @click="activate(schema)">激活</button></article></div></div>
     </section>
 
     <section class="card coverage-section">
@@ -221,4 +295,5 @@ watch(()=>props.knowledgeBaseId,()=>void load()); onMounted(load)
 <style scoped>
 .management-page{height:100%;overflow:auto;padding:18px;color:#344159;background:#f7f9fc}.notice{padding:9px 11px;border-radius:8px;font-size:12px}.error{color:#b42318;background:#fff1f0}.message{color:#18794e;background:#ecf9f1}.card{border:1px solid #e1e7f0;border-radius:12px;background:#fff;box-shadow:0 2px 8px #23395d0a}.actions{display:flex;align-items:center;gap:8px;padding:14px}.actions>div{flex:1}.actions strong,.actions small,header strong,header small{display:block}.actions small,header small{margin-top:4px;color:#8794a7;font-size:10px}button{padding:7px 10px;border:1px solid #d7e0ff;border-radius:7px;color:#4762df;background:#f5f7ff;cursor:pointer;font-size:10px}button:hover{background:#eaf0ff}button.enabled{color:#18794e;border-color:#b9e4ca;background:#ecf9f1}button.danger{color:#b42318;border-color:#f2cbc7;background:#fff6f5}button:disabled{opacity:.5;cursor:not-allowed}.overview{display:grid;grid-template-columns:1.6fr 1fr;gap:12px;margin-top:12px}.overview>section,.schema-section,.graph-editor,.governance-grid>section{padding:14px}header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}.quality .status{display:inline-block;padding:3px 8px;border-radius:8px;background:#fff4e5;color:#b54708;font-size:9px}.quality .status.ready{background:#e9f8ef;color:#18794e}.metric-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}.metric-grid article{padding:8px;border:1px solid #edf1f6;border-radius:7px}.metric-grid span,.metric-grid strong{display:block;overflow:hidden;text-overflow:ellipsis}.metric-grid span{color:#8895a7;font-size:8px}.metric-grid strong{margin-top:3px;font-size:11px}.quality ul{display:flex;gap:7px;flex-wrap:wrap;padding:0;list-style:none}.quality li{padding:3px 7px;border-radius:7px;color:#b54708;background:#fff4e5;font-size:9px}.quality li.passed{color:#18794e;background:#e9f8ef}.indexes article,.version-list article,.governance-grid article{display:flex;align-items:center;gap:7px;padding:8px 0;border-top:1px solid #edf1f6}.indexes article div,.version-list article div,.governance-grid article div{flex:1}.indexes b,.indexes small,.version-list b,.version-list small,.governance-grid b,.governance-grid small{display:block}.indexes small,.version-list small,.governance-grid small{margin-top:3px;color:#8b97a8;font-size:9px}.schema-section,.graph-editor{margin-top:12px}.active-schema{padding:10px;border-radius:9px;background:linear-gradient(120deg,#f2f6ff,#f5fbff)}.active-schema>div{margin-top:6px}.active-schema p{margin:7px 0 0;color:#64738a;font-size:10px}.chip{display:inline-block;margin:2px;padding:3px 6px;border-radius:8px;font-size:8px}.chip.entity{color:#3155c6;background:#e8eeff}.chip.relation{color:#8756b3;background:#f4eaff}.schema-layout{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:12px}.schema-layout form,.editors form{display:grid;gap:7px;padding:10px;border:1px solid #edf1f6;border-radius:9px}.schema-layout label{font-size:9px;color:#6f7d90}input,select,textarea{box-sizing:border-box;width:100%;padding:8px;border:1px solid #dce3ed;border-radius:7px;background:#fff;color:#344159;font-size:10px}textarea{min-height:55px;resize:vertical}.search{display:flex;gap:7px}.search input{flex:1}.search-results{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}.graph-layout{display:grid;grid-template-columns:1.7fr 1fr;gap:12px;margin-top:10px}.subgraph{min-height:280px;padding:12px;border:1px solid #e6ebf2;border-radius:10px;background:radial-gradient(circle at 50% 20%,#f4f7ff,#fbfcfe)}.nodes{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;padding:12px}.nodes button{min-width:100px;border-color:#cbd8ff;background:#fff;box-shadow:0 2px 7px #526ba91a}.nodes button b,.nodes button small,.edges button b,.edges button small{display:block}.nodes button small,.edges button small{margin-top:3px;color:#8895a7}.nodes button.selected,.edges button.selected{outline:2px solid #7088ee}.edges{display:grid;grid-template-columns:repeat(2,1fr);gap:6px}.edges button{text-align:left;background:#fff}.editors{display:grid;gap:9px}.editors form b{font-size:11px}.governance-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}.merge-section{grid-column:1/-1}.merge-form{display:grid;grid-template-columns:1fr 1fr 1fr auto;gap:7px;margin:8px 0}.governance-grid article>span,.version-list article>span{padding:3px 6px;border-radius:7px;background:#eef2f7;font-size:8px}.governance-grid article>span.active,.version-list article>span.active{color:#18794e;background:#e9f8ef}.empty{display:grid;place-items:center;min-height:90px;color:#99a5b5;font-size:10px}@media(max-width:1000px){.overview,.schema-layout,.graph-layout,.governance-grid{grid-template-columns:1fr}.merge-section{grid-column:auto}.actions{align-items:stretch;flex-direction:column}.merge-form{grid-template-columns:1fr}.edges{grid-template-columns:1fr}}
 .schema-generator{display:grid;grid-template-columns:1.1fr 1fr auto;align-items:center;gap:9px;padding:10px;margin-bottom:10px;border:1px solid #d9e4ff;border-radius:9px;background:#f7f9ff}.schema-generator b,.schema-generator small{display:block}.schema-generator small{margin-top:3px;color:#75839a;font-size:9px}.active-schema>small{display:block;margin-top:3px;color:#718096;font-size:9px}.coverage-section{margin-top:12px;padding:14px}.coverage-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:10px}.coverage-summary article{padding:10px;border:1px solid #e5ebf4;border-radius:8px;background:#fafcff}.coverage-summary span,.coverage-summary strong{display:block}.coverage-summary span{color:#8290a4;font-size:9px}.coverage-summary strong{margin-top:4px;font-size:15px}.coverage-table{overflow:auto}.coverage-table table{width:100%;border-collapse:collapse;font-size:10px}.coverage-table th,.coverage-table td{padding:8px;border-top:1px solid #edf1f6;text-align:left;white-space:nowrap}.coverage-table th{color:#7c899d;font-weight:600}.coverage-table td:first-child{max-width:280px;overflow:hidden;text-overflow:ellipsis}.coverage-table td b,.coverage-table td small{display:block}.coverage-table td small{margin-top:2px;color:#8a97aa;font-size:8px}.coverage-status{display:inline-block;padding:3px 6px;border-radius:7px;background:#eef2f7}.coverage-status.covered{color:#18794e;background:#e9f8ef}.coverage-status.no_facts{color:#8b5e00;background:#fff7df}.coverage-status.attention{color:#b42318;background:#fff1f0}.coverage-status.processing{color:#3155c6;background:#e8eeff}@media(max-width:1000px){.schema-generator{grid-template-columns:1fr}.coverage-summary{grid-template-columns:repeat(2,1fr)}}
+.schema-generator{display:block}.generator-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.generator-actions{display:flex;gap:7px}.source-mode{display:flex;gap:18px;margin-top:10px;padding:8px;border-radius:8px;background:#fff}.source-mode label{display:flex;align-items:center;gap:6px;font-size:10px}.source-mode input,.source-list input{width:auto}.source-filters{display:grid;grid-template-columns:1.2fr 1fr 1fr;gap:7px;margin-top:8px}.source-list{max-height:190px;overflow:auto;margin-top:7px;padding:7px;border:1px solid #e4e9f2;border-radius:8px;background:#fff}.source-list label{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:7px;padding:6px;border-top:1px solid #f0f3f7;font-size:10px}.source-list label:first-child{border-top:0}.source-list label.select-all{color:#4964d7;background:#f7f9ff}.source-list label small{color:#8b97a8}.source-list p{padding:12px;text-align:center;color:#98a4b4;font-size:10px}.generation-options{display:grid;grid-template-columns:1fr auto auto;gap:7px;margin-top:8px}.version-list article>div>small+small{color:#64738a}.active-schema>small+small{color:#64738a}@media(max-width:1000px){.generator-head{align-items:stretch;flex-direction:column}.source-mode{align-items:flex-start;flex-direction:column;gap:7px}.source-filters,.generation-options{grid-template-columns:1fr}}
 </style>

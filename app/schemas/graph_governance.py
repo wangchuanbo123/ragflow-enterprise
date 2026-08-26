@@ -54,6 +54,21 @@ class GraphBuildRequest(BaseModel):
 class GraphSchemaGenerateRequest(BaseModel):
     document_ids: list[str] = Field(default_factory=list, max_length=100)
     instructions: str | None = Field(default=None, max_length=2000)
+    mode: Literal["new", "overwrite"] = "new"
+    target_schema_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_generation_mode(self):
+        if self.mode == "overwrite" and not self.target_schema_id:
+            raise ValueError("覆盖模式必须指定 Schema 草稿")
+        if self.mode == "new" and self.target_schema_id:
+            raise ValueError("新建模式不能指定目标 Schema")
+        return self
+
+
+class GraphSchemaDriftRequest(BaseModel):
+    document_ids: list[str] = Field(default_factory=list, max_length=100)
+    instructions: str | None = Field(default=None, max_length=2000)
 
 
 class DocumentGraphCoverageItem(BaseModel):

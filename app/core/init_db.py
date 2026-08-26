@@ -47,6 +47,15 @@ def init_app() -> None:
         from app.repositories.knowledge_base_repository import KnowledgeBaseRepository
 
         KnowledgeBaseRepository(db).ensure_default(admin.id if admin else None)
+        # Backfill the invariant for knowledge bases created by older releases.
+        from sqlalchemy import select
+        from app.models.knowledge_base import KnowledgeBase
+        from app.services.graph_governance_service import GraphGovernanceService
+
+        for knowledge_base_id in db.scalars(select(KnowledgeBase.id)):
+            GraphGovernanceService(
+                db, knowledge_base_id, task_queue=object()
+            ).active_schema()
 
     # Start index worker
     from app.services.index_worker import start_worker

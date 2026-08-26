@@ -168,6 +168,16 @@ class DocumentManagementRepository:
             )
         )
 
+    def document_tag_map(self) -> dict[str, list[str]]:
+        mapping: dict[str, list[str]] = {}
+        for document_id, tag_id in self.db.execute(
+            select(DocumentTagLink.document_id, DocumentTagLink.tag_id).where(
+                DocumentTagLink.knowledge_base_id == self.knowledge_base_id
+            )
+        ):
+            mapping.setdefault(document_id, []).append(tag_id)
+        return mapping
+
     def move_documents(self, document_ids: list[str], folder_id: str | None) -> int:
         if folder_id and self.get_folder(folder_id) is None:
             raise ValueError("Folder not found")

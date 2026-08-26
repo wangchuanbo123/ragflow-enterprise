@@ -36,10 +36,21 @@ def test_graph_automation_and_custom_schema_editing_api(client):
     )
     assert generated.status_code == 202
     assert generated.json()["job_type"] == "schema_generation"
+    drift = client.post(
+        f"{base}/schemas/drift-check",
+        json={"document_ids": [], "instructions": "检查新增领域类型"},
+    )
+    assert drift.status_code == 202
+    assert drift.json()["job_type"] == "schema_drift"
 
     coverage = client.get(f"{base}/coverage")
     assert coverage.status_code == 200
     assert coverage.json()["summary"]["documents"] == 0
+    tag_map = client.get(
+        f"/api/v1/knowledge-bases/{knowledge_base_id}/documents/tag-map"
+    )
+    assert tag_map.status_code == 200
+    assert tag_map.json() == {}
 
     created = client.post(
         f"{base}/schemas",

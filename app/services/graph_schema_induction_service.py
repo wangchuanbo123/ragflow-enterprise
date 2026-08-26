@@ -123,13 +123,12 @@ class GraphSchemaInductionService:
             raise ValueError("已解析文档尚未生成可采样的 Chunk")
         return sampled
 
-    def generate_draft(
+    def _induce(
         self,
         *,
-        created_by: str | None,
         document_ids: list[str] | None = None,
         instructions: str | None = None,
-    ):
+    ) -> dict:
         documents = self._documents(document_ids)
         chunks = self._sample_chunks(documents)
         names = {document.id: document.original_filename for document in documents}
@@ -161,26 +160,144 @@ class GraphSchemaInductionService:
         extraction_prompt = str(payload.get("extraction_prompt") or "").strip()[:10000]
         rationale = str(payload.get("rationale") or "").strip()[:4000]
 
-        from app.services.graph_governance_service import GraphGovernanceService
-
-        return GraphGovernanceService(
-            self.db, self.knowledge_base_id, task_queue=object()
-        ).create_schema(
-            entity_types=entity_types,
-            relation_types=relation_types,
-            normalization_rules={
-                "unicode": "NFKC",
-                "case": "lower_ascii",
-                "trim_punctuation": True,
-            },
-            extraction_prompt=extraction_prompt or None,
-            created_by=created_by,
-            generation_method="document_llm",
-            source_document_ids=[document.id for document in documents],
-            generation_summary={
+        return {
+            "entity_types": entity_types,
+            "relation_types": relation_types,
+            "extraction_prompt": extraction_prompt or None,
+            "source_document_ids": [document.id for document in documents],
+            "generation_summary": {
                 "source_documents": len(documents),
                 "sampled_chunks": used_chunks,
                 "sampled_characters": used_chars,
                 "rationale": rationale,
             },
+        }
+
+    def _persist_draft(
+        self,
+        induced: dict,
+        *,
+        created_by: str | None,
+        target_schema_id: str | None = None,
+        generation_method: str = "document_llm",
+    ):
+        from app.services.graph_governance_service import GraphGovernanceService
+
+        governance = GraphGovernanceService(
+            self.db, self.knowledge_base_id, task_queue=object()
         )
+        normalization_rules = {
+            "unicode": "NFKC",
+            "case": "lower_ascii",
+            "trim_punctuation": True,
+        }
+        if target_schema_id:
+            schema = governance.update_schema(
+                target_schema_id,
+                entity_types=induced["entity_types"],
+                relation_types=induced["relation_types"],
+                normalization_rules=normalization_rules,
+                extraction_prompt=induced["extraction_prompt"],
+            )
+            if schema is None:
+                raise ValueError("要覆盖的 Schema 草稿不存在")
+            schema.generation_method = generation_method
+            schema.source_document_ids_json = induced["source_document_ids"]
+            schema.generation_summary_json = induced["generation_summary"]
+            self.db.commit()
+            self.db.refresh(schema)
+            return schema
+        return governance.create_schema(
+            entity_types=induced["entity_types"],
+            relation_types=induced["relation_types"],
+            normalization_rules=normalization_rules,
+            extraction_prompt=induced["extraction_prompt"],
+            created_by=created_by,
+            generation_method=generation_method,
+            source_document_ids=induced["source_document_ids"],
+            generation_summary=induced["generation_summary"],
+        )
+
+    def generate_draft(
+        self,
+        *,
+        created_by: str | None,
+        document_ids: list[str] | None = None,
+        instructions: str | None = None,
+        target_schema_id: str | None = None,
+    ):
+        induced = self._induce(
+            document_ids=document_ids,
+            instructions=instructions,
+        )
+        return self._persist_draft(
+            induced,
+            created_by=created_by,
+            target_schema_id=target_schema_id,
+        )
+
+    def detect_drift(
+        self,
+        *,
+        created_by: str | None,
+        document_ids: list[str] | None = None,
+        instructions: str | None = None,
+    ) -> dict:
+        """Compare document-induced concepts to the active schema.
+
+        A reviewable draft is created only when at least one new entity or
+        relation type appears. Existing active types are retained in the
+        suggested draft so drift detection cannot accidentally narrow a domain.
+        """
+        from app.services.graph_governance_service import GraphGovernanceService
+
+        governance = GraphGovernanceService(
+            self.db, self.knowledge_base_id, task_queue=object()
+        )
+        active = governance.active_schema()
+        induced = self._induce(
+            document_ids=document_ids,
+            instructions=instructions,
+        )
+        added_entities = sorted(
+            set(induced["entity_types"]) - set(active.entity_types_json or [])
+        )
+        added_relations = sorted(
+            set(induced["relation_types"]) - set(active.relation_types_json or [])
+        )
+        result = {
+            "status": "no_drift",
+            "active_schema_id": active.id,
+            "active_schema_version": active.version,
+            "added_entity_types": added_entities,
+            "added_relation_types": added_relations,
+            "source_document_ids": induced["source_document_ids"],
+        }
+        if not added_entities and not added_relations:
+            return result
+
+        induced["entity_types"] = sorted(
+            set(active.entity_types_json or []) | set(added_entities)
+        )
+        induced["relation_types"] = sorted(
+            set(active.relation_types_json or []) | set(added_relations)
+        )
+        summary = dict(induced["generation_summary"])
+        summary.update({
+            "drift_from_schema_id": active.id,
+            "drift_from_schema_version": active.version,
+            "added_entity_types": added_entities,
+            "added_relation_types": added_relations,
+        })
+        induced["generation_summary"] = summary
+        draft = self._persist_draft(
+            induced,
+            created_by=created_by,
+            generation_method="document_drift",
+        )
+        result.update({
+            "status": "drift_detected",
+            "generated_schema_id": draft.id,
+            "generated_schema_version": draft.version,
+        })
+        return result
