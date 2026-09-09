@@ -12,6 +12,7 @@ from app.models.code_graph import (
     EntityVectorIndexState,
     RelationVectorIndexState,
 )
+from app.models.backup import KnowledgeBackup
 from app.models.conversation import Conversation
 from app.models.document_management import (
     DocumentTag,
@@ -45,11 +46,12 @@ from app.models.graph_governance import (
     GraphSchemaDefinition,
     KgEntityMerge,
 )
-from app.models.message import Message
+from app.models.message import Message, MessageFeedback
 from app.models.user import User
 
 __all__ = [
     "Base",
+    "KnowledgeBackup",
     "CodeSnapshot",
     "CodeFile",
     "CodeSymbol",
@@ -60,6 +62,7 @@ __all__ = [
     "User",
     "Conversation",
     "Message",
+    "MessageFeedback",
     "KnowledgeFolder",
     "DocumentTag",
     "DocumentTagLink",

@@ -8,7 +8,13 @@ from pydantic import BaseModel, Field, field_validator
 
 class KnowledgeBaseCreate(BaseModel):
     name: str = Field(min_length=1, max_length=128)
-    slug: str = Field(min_length=3, max_length=64)
+    slug: str | None = Field(default=None, max_length=64)
+    description: str | None = Field(default=None, max_length=1000)
+
+
+class KnowledgeBaseUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=128)
+    slug: str | None = Field(default=None, min_length=3, max_length=64)
     description: str | None = Field(default=None, max_length=1000)
 
 

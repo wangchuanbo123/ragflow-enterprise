@@ -67,12 +67,14 @@ class GraphSubgraphEdgeOut(BaseModel):
 
 class DocumentSubgraphOut(BaseModel):
     document_id: str
+    graph_kind: str | None = None
     nodes: list[GraphSubgraphNodeOut] = Field(default_factory=list)
     edges: list[GraphSubgraphEdgeOut] = Field(default_factory=list)
 
 
 class EntitySubgraphOut(BaseModel):
     seed_entity_ids: list[str]
+    graph_kind: str | None = None
     nodes: list[GraphSubgraphNodeOut] = Field(default_factory=list)
     edges: list[GraphSubgraphEdgeOut] = Field(default_factory=list)
     offset: int = 0
@@ -81,6 +83,7 @@ class EntitySubgraphOut(BaseModel):
 
 class GraphCorrectionCreate(BaseModel):
     action: Literal[
+        "add_entity",
         "add_relation",
         "hide_relation",
         "update_relation",
@@ -93,8 +96,18 @@ class GraphCorrectionCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_action_payload(self):
-        if self.action == "add_relation":
-            required = {"subject_entity_id", "object_entity_id", "predicate", "evidence"}
+        if self.action == "add_entity":
+            required = {
+                "canonical_name", "entity_type", "document_id", "chunk_id", "evidence"
+            }
+            missing = required - set(self.payload)
+            if missing:
+                raise ValueError(f"新增实体缺少字段：{', '.join(sorted(missing))}")
+        elif self.action == "add_relation":
+            required = {
+                "subject_entity_id", "object_entity_id", "predicate",
+                "document_id", "chunk_id", "evidence",
+            }
             missing = required - set(self.payload)
             if missing:
                 raise ValueError(f"新增关系缺少字段：{', '.join(sorted(missing))}")

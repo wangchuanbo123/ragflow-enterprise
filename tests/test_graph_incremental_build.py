@@ -21,8 +21,10 @@ class _FakeVectorStore:
     def __init__(self):
         self.documents: list[Document] = []
         self.ids: list[str] = []
+        self.batch_sizes: list[int] = []
 
     def add_documents(self, documents, ids=None):
+        self.batch_sizes.append(len(documents))
         for document, vector_id in zip(documents, ids or []):
             if vector_id in self.ids:
                 position = self.ids.index(vector_id)
@@ -405,11 +407,13 @@ def test_claim_respects_visible_at(db_engine):
 # ---------------------------------------------------------------------------
 
 
-def test_entity_vectors_apply_changes_incrementally(db_engine):
+def test_entity_vectors_apply_changes_incrementally(db_engine, monkeypatch):
     from app.core.database import SessionLocal
     from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
+    from app.services import entity_vector_service
     from app.services.entity_vector_service import EntityVectorService
 
+    monkeypatch.setattr(entity_vector_service, "INGEST_BATCH_SIZE", 2)
     container = _container()
     with SessionLocal() as db:
         document = _make_document(db, path="entity-vector.txt")
@@ -425,6 +429,7 @@ def test_entity_vectors_apply_changes_incrementally(db_engine):
         index_name = baseline["index_name"]
         store = container.vector_store.indexes[index_name]
         assert len(store.ids) == 4
+        assert store.batch_sizes == [2, 2]
 
         # 新增一个实体：只增量写入，不重建索引。
         chunk_c = _make_chunk(db, document, 2, "清结算服务使用账务服务完成资金清算，并生成流水凭证。")
@@ -499,6 +504,86 @@ def test_relation_vectors_apply_changes_incrementally(db_engine):
         # 空变化：直接返回 unchanged，不触碰向量库。
         unchanged = service.apply_changes([], [])
         assert unchanged["status"] == "unchanged"
+
+
+def test_vector_rebuild_uses_governance_overlays_and_merge_map(db_engine):
+    from app.core.database import SessionLocal
+    from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
+    from app.services.entity_vector_service import EntityVectorService
+    from app.services.graph_governance_service import GraphGovernanceService
+    from app.services.relation_vector_service import RelationVectorService
+    from rag.knowledge_graph.sqlite_store import SqliteGraphStore
+
+    container = _container()
+    with SessionLocal() as db:
+        document = _make_document(db, path="overlay-vector.txt")
+        chunk = _make_chunk(
+            db, document, 0,
+            "订单服务依赖库存服务，并调用告警中心处理超时。",
+        )
+        db.commit()
+        _upsert_fact(
+            db, chunk, "订单服务", "库存服务", "订单服务依赖库存服务",
+            predicate="DEPENDS_ON",
+        )
+        store = SqliteGraphStore(db, DEFAULT_KNOWLEDGE_BASE_ID)
+        by_name = {
+            item["canonical_name"]: item["id"]
+            for item in store.search_entities("服务", 10)
+        }
+        governance = GraphGovernanceService(
+            db, DEFAULT_KNOWLEDGE_BASE_ID, task_queue=object()
+        )
+        governance.active_schema()
+        governance.create_correction(
+            action="update_entity", target_id=by_name["订单服务"],
+            payload={"canonical_name": "订单调度服务"},
+            reason="采用当前标准名称", created_by="test-user",
+        )
+        alert = governance.create_correction(
+            action="add_entity", target_id=None,
+            payload={
+                "canonical_name": "告警中心", "entity_type": "SYSTEM",
+                "document_id": document.id, "chunk_id": chunk.id,
+                "evidence": "告警中心",
+            },
+            reason="补充人工确认实体", created_by="test-user",
+        )
+        manual_relation = governance.create_correction(
+            action="add_relation", target_id=None,
+            payload={
+                "subject_entity_id": by_name["订单服务"], "predicate": "CALLS",
+                "object_entity_id": alert.target_id,
+                "document_id": document.id, "chunk_id": chunk.id,
+                "evidence": "调用告警中心",
+            },
+            reason="补充人工确认关系", created_by="test-user",
+        )
+        governance.merge_entities(
+            alert.target_id, by_name["库存服务"],
+            "两者统一归并到告警能力", "test-user",
+        )
+
+        entity_result = EntityVectorService(
+            db, DEFAULT_KNOWLEDGE_BASE_ID, container=container
+        ).rebuild()
+        entity_store = container.vector_store.indexes[entity_result["index_name"]]
+        entity_docs = {doc.metadata["entity_id"]: doc for doc in entity_store.documents}
+        assert by_name["库存服务"] not in entity_docs
+        assert "订单调度服务" in entity_docs[by_name["订单服务"]].page_content
+        assert "库存服务" in entity_docs[alert.target_id].page_content
+
+        relation_result = RelationVectorService(
+            db, DEFAULT_KNOWLEDGE_BASE_ID, container=container
+        ).rebuild()
+        relation_store = container.vector_store.indexes[relation_result["index_name"]]
+        relation_docs = {
+            doc.metadata["relation_id"]: doc for doc in relation_store.documents
+        }
+        manual_id = f"manual:{manual_relation.id}"
+        assert manual_id in relation_docs
+        assert "订单调度服务" in relation_docs[manual_id].page_content
+        assert relation_docs[manual_id].metadata["object_id"] == alert.target_id
 
 
 # ---------------------------------------------------------------------------

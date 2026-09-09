@@ -21,8 +21,9 @@ class GraphSchemaDefinition(Base):
             "knowledge_base_id", "version", name="uq_graph_schema_kb_version"
         ),
         Index(
-            "uq_graph_schema_one_active_per_kb",
+            "uq_graph_schema_one_active_per_kind",
             "knowledge_base_id",
+            "graph_kind",
             unique=True,
             sqlite_where=text("status = 'active'"),
             postgresql_where=text("status = 'active'"),
@@ -30,10 +31,12 @@ class GraphSchemaDefinition(Base):
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     knowledge_base_id: Mapped[str] = mapped_column(String(36), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False)
+    graph_kind: Mapped[str] = mapped_column(String(24), nullable=False, default="general", server_default="general")
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
     entity_types_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     relation_types_json: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
+    graph_profiles_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     normalization_rules_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     extraction_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     generation_method: Mapped[str] = mapped_column(

@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, func
+from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
@@ -35,3 +35,39 @@ class Message(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
 
     conversation: Mapped["Conversation"] = relationship("Conversation", back_populates="messages")
+    feedback: Mapped["MessageFeedback | None"] = relationship(
+        "MessageFeedback", back_populates="message", cascade="all, delete-orphan", uselist=False
+    )
+
+    @property
+    def images(self) -> list[dict]:
+        from rag.artifacts import collect_source_artifacts
+
+        return collect_source_artifacts(self.sources_json)[0]
+
+    @property
+    def code_snippets(self) -> list[dict]:
+        from rag.artifacts import collect_source_artifacts
+
+        return collect_source_artifacts(self.sources_json)[1]
+
+
+class MessageFeedback(Base):
+    __tablename__ = "message_feedback"
+    __table_args__ = (UniqueConstraint("message_id", name="uq_message_feedback_message"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    message_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("messages.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    rating: Mapped[str] = mapped_column(String(16), nullable=False)
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    message: Mapped["Message"] = relationship("Message", back_populates="feedback")

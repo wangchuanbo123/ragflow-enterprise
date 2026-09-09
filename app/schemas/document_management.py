@@ -74,6 +74,44 @@ class ChunkOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ChunkNeighborOut(BaseModel):
+    chunk_id: str
+    chunk_index: int
+    content: str
+    page: int | None = None
+    section: str | None = None
+
+
+class ChunkDetailOut(BaseModel):
+    """片段详情：全量内容 + 前后相邻片段，用于前端原文定位预览。"""
+
+    chunk_id: str
+    document_id: str
+    document_name: str
+    chunk_index: int
+    content: str
+    page: int | None = None
+    section: str | None = None
+    images: list[dict] = Field(default_factory=list)
+    previous: list[ChunkNeighborOut] = Field(default_factory=list)
+    next: list[ChunkNeighborOut] = Field(default_factory=list)
+
+
+class SearchHitOut(BaseModel):
+    """全文搜索命中：片段原文 + 摘要 + 定位信息。"""
+
+    chunk_id: str
+    document_id: str
+    document_name: str
+    chunk_index: int
+    page: int | None = None
+    section: str | None = None
+    score: float
+    snippet: str
+    content: str
+    images: list[dict] = Field(default_factory=list)
+
+
 class DocumentTagsUpdate(BaseModel):
     tag_ids: list[str] = Field(default_factory=list, max_length=100)
 

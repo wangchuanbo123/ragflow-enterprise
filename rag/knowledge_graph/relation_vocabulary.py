@@ -81,27 +81,37 @@ def normalize_relation_text(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def relation_terms(predicate: str) -> list[str]:
-    item = RELATION_VOCABULARY.get(predicate, {})
+def relation_terms(
+    predicate: str,
+    vocabulary: dict[str, dict[str, object]] | None = None,
+) -> list[str]:
+    item = (vocabulary or RELATION_VOCABULARY).get(predicate, {})
     values = [predicate.replace("_", " "), str(item.get("label", ""))]
     values.extend(str(value) for value in item.get("aliases", ()))
     return list(dict.fromkeys(value for value in values if value))
 
 
-def relation_description(predicate: str) -> str:
-    return str(RELATION_VOCABULARY.get(predicate, {}).get("description", ""))
+def relation_description(
+    predicate: str,
+    vocabulary: dict[str, dict[str, object]] | None = None,
+) -> str:
+    return str((vocabulary or RELATION_VOCABULARY).get(predicate, {}).get("description", ""))
 
 
-def relation_query_scores(query: str) -> dict[str, float]:
+def relation_query_scores(
+    query: str,
+    vocabulary: dict[str, dict[str, object]] | None = None,
+) -> dict[str, float]:
     """Return predicates explicitly expressed by a multilingual query."""
     normalized_query = normalize_relation_text(query)
     if not normalized_query:
         return {}
 
     scores: dict[str, float] = {}
-    for predicate in RELATION_VOCABULARY:
+    resolved_vocabulary = vocabulary or RELATION_VOCABULARY
+    for predicate in resolved_vocabulary:
         best = 0.0
-        for term in relation_terms(predicate):
+        for term in relation_terms(predicate, resolved_vocabulary):
             normalized_term = normalize_relation_text(term)
             if not normalized_term:
                 continue

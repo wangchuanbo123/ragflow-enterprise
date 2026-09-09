@@ -1,6 +1,6 @@
 import { reactive, ref } from 'vue'
 import * as api from '../api/client'
-import type { Conversation, ConversationDetail, Message, RetrievalStrategy, SourceItem } from '../types'
+import type { CodeSnippet, Conversation, ConversationDetail, Message, RetrievalScope, RetrievalStrategy, SourceImage, SourceItem } from '../types'
 
 const conversations = ref<Conversation[]>([])
 const activeId = ref<string | null>(null)
@@ -9,6 +9,7 @@ const sending = ref(false)
 const errorMsg = ref('')
 const loadingList = ref(false)
 const loadingDetail = ref(false)
+let activeController: AbortController | null = null
 
 function resetDetail(): void {
   messages.value = []
@@ -61,10 +62,11 @@ async function remove(id: string): Promise<void> {
   }
 }
 
-async function send(content: string, strategy: RetrievalStrategy = 'standard'): Promise<void> {
+async function send(content: string, strategy: RetrievalStrategy = 'standard', scope?: Partial<RetrievalScope>): Promise<void> {
   if (!activeId.value || sending.value) return
   const convId = activeId.value
   sending.value = true
+  activeController = new AbortController()
   errorMsg.value = ''
 
   // 立即显示用户消息
@@ -77,13 +79,30 @@ async function send(content: string, strategy: RetrievalStrategy = 'standard'): 
   }
   const assistantMsg: Message = reactive({
     id: '',
+    conversation_id: convId,
     role: 'assistant',
     content: '',
     status: 'streaming',
     sources: [] as SourceItem[],
+    images: [] as SourceImage[],
+    code_snippets: [] as CodeSnippet[],
     created_at: new Date().toISOString(),
   })
   messages.value.push(userMsg, assistantMsg)
+  let deltaBuffer = ''
+  let deltaFrame: number | null = null
+  const flushDelta = (): void => {
+    if (!deltaBuffer) return
+    assistantMsg.content += deltaBuffer
+    deltaBuffer = ''
+  }
+  const scheduleDelta = (): void => {
+    if (deltaFrame != null) return
+    deltaFrame = window.requestAnimationFrame(() => {
+      deltaFrame = null
+      flushDelta()
+    })
+  }
 
   try {
     await api.streamMessage(
@@ -94,15 +113,21 @@ async function send(content: string, strategy: RetrievalStrategy = 'standard'): 
           assistantMsg.id = id
         },
         onDelta: (chunk) => {
-          assistantMsg.content += chunk
+          deltaBuffer += chunk
+          scheduleDelta()
         },
         onRoute: (route) => {
           assistantMsg.route = route
         },
-        onSources: (sources) => {
+        onSources: (sources, images, codeSnippets) => {
           assistantMsg.sources = sources
+          assistantMsg.images = images
+          assistantMsg.code_snippets = codeSnippets
         },
         onDone: (status) => {
+          if (deltaFrame != null) window.cancelAnimationFrame(deltaFrame)
+          deltaFrame = null
+          flushDelta()
           assistantMsg.status = status
         },
         onError: (code, message) => {
@@ -112,15 +137,37 @@ async function send(content: string, strategy: RetrievalStrategy = 'standard'): 
           errorMsg.value = message
         },
       },
-      strategy,
+      { strategy, scope },
+      activeController.signal,
     )
   } catch (e) {
-    assistantMsg.status = 'failed'
-    assistantMsg.error_message = (e as Error).message
-    errorMsg.value = (e as Error).message
+    if (deltaFrame != null) window.cancelAnimationFrame(deltaFrame)
+    deltaFrame = null
+    flushDelta()
+    if ((e as Error).name === 'AbortError') {
+      assistantMsg.status = 'stopped'
+      assistantMsg.error_message = null
+    } else {
+      assistantMsg.status = 'failed'
+      assistantMsg.error_message = (e as Error).message
+      errorMsg.value = (e as Error).message
+    }
   } finally {
+    flushDelta()
     sending.value = false
+    activeController = null
   }
+}
+
+function stop(): void {
+  activeController?.abort()
+}
+
+async function feedback(messageId:string, rating:'helpful'|'unhelpful', comment?:string):Promise<void> {
+  const message = messages.value.find(item=>item.id===messageId)
+  if (!message?.conversation_id || !message.id) return
+  await api.saveMessageFeedback(message.conversation_id, message.id, rating, comment)
+  message.feedback = rating
 }
 
 export function useConversations() {
@@ -138,6 +185,8 @@ export function useConversations() {
     rename,
     remove,
     send,
+    stop,
+    feedback,
     resetDetail,
   }
 }

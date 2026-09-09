@@ -35,6 +35,45 @@ def test_admin_can_create_and_list_knowledge_bases(client):
         assert len(active) == 1
 
 
+def test_knowledge_base_can_be_edited_and_archived(client):
+    _login(client, INITIAL_ADMIN_USERNAME, INITIAL_ADMIN_PASSWORD)
+    created = client.post(
+        "/api/v1/knowledge-bases",
+        json={"name": "Lifecycle", "slug": "lifecycle-kb"},
+    ).json()
+
+    updated = client.patch(
+        f"/api/v1/knowledge-bases/{created['id']}",
+        json={"name": "Lifecycle Updated", "description": "用于生命周期测试"},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["name"] == "Lifecycle Updated"
+    assert updated.json()["description"] == "用于生命周期测试"
+
+    archived = client.delete(f"/api/v1/knowledge-bases/{created['id']}")
+    assert archived.status_code == 204
+    listed_ids = {item["id"] for item in client.get("/api/v1/knowledge-bases").json()}
+    assert created["id"] not in listed_ids
+
+
+def test_knowledge_base_internal_slug_is_generated_automatically(client):
+    _login(client, INITIAL_ADMIN_USERNAME, INITIAL_ADMIN_PASSWORD)
+
+    generated = client.post(
+        "/api/v1/knowledge-bases",
+        json={"name": "613"},
+    )
+    legacy_short_slug = client.post(
+        "/api/v1/knowledge-bases",
+        json={"name": "中文知识空间", "slug": "6"},
+    )
+
+    assert generated.status_code == 201
+    assert len(generated.json()["slug"]) >= 3
+    assert legacy_short_slug.status_code == 201
+    assert legacy_short_slug.json()["slug"].startswith("kb-")
+
+
 def test_non_member_cannot_discover_another_knowledge_base(client):
     import app.core.database as db_module
 

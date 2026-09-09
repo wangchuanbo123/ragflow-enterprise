@@ -56,6 +56,28 @@ export interface DataSourceSyncResult {
   rejected: Array<{ path?: string; filename?: string; error: string }>
 }
 
+export interface KnowledgeBackup {
+  id: string
+  knowledge_base_id: string
+  backup_type: 'knowledge_base' | 'document_graph'
+  scope_key: string
+  document_id: string | null
+  version_no: number
+  label: string | null
+  file_size: number
+  status: string
+  trigger: 'manual' | 'monthly' | 'pre_restore'
+  manifest_json: { table_counts?: Record<string, number>; object_count?: number } | null
+  created_at: string
+  restored_at: string | null
+}
+
+export interface BackupSettings {
+  monthly_enabled: boolean
+  interval_days: number
+  retention_versions: number
+}
+
 export interface Conversation {
   id: string
   knowledge_base_id: string
@@ -66,6 +88,7 @@ export interface Conversation {
 }
 
 export interface RetrievalScope {
+  knowledge_base_ids: string[]
   document_ids: string[]
   tag_ids: string[]
   folder_id: string | null
@@ -88,6 +111,7 @@ export interface RouteDecision {
   strategy: RetrievalStrategy
   rewrite?: { applied?: boolean; requested?: boolean; reason?: string }
   query_embedding?: { status?: string; shared?: boolean; dimensions?: number; elapsed_ms?: number }
+  knowledge_bases?: Array<{ id: string; name: string; status?: string }>
 }
 
 export interface Message {
@@ -98,14 +122,101 @@ export interface Message {
   content: string
   status: string
   sources?: SourceItem[]
+  images?: SourceImage[]
+  code_snippets?: CodeSnippet[]
   route?: RouteDecision | null
   error_message?: string | null
+  feedback?: 'helpful' | 'unhelpful' | null
   created_at: string
+}
+
+export interface SourceImage {
+  marker: string
+  url: string
+  caption: string
+  mime_type: string
+  page: number | string | null
+  width: number | null
+  height: number | null
+  filename: string
+  knowledge_base_id?: string
+  knowledge_base_name?: string
+  document_id?: string
+  chunk_id?: string
+  citation_id?: string
+}
+
+export interface CodeSnippet {
+  content: string
+  language: string
+  path: string
+  start_line: number | null
+  end_line: number | null
+  line_scope: 'file' | 'chunk'
+  revision: string
+  origin: 'document' | 'repository' | 'generated'
+  is_verbatim: boolean
+  symbol_id?: string
+  qualified_name?: string
+  chunk_index?: number | null
+  knowledge_base_id?: string
+  knowledge_base_name?: string
+  document_id?: string
+  chunk_id?: string
+  citation_id?: string
 }
 
 export interface SourceItem {
   source: string
   preview: string
+  citation_id?: string
+  document_id?: string
+  chunk_id?: string
+  page?: number | string | null
+  section?: string | null
+  retrieval_channels?: string[]
+  graph_facts?: string[]
+  fusion_score?: number
+  relevance_score?: number | null
+  knowledge_base_id?: string
+  knowledge_base_name?: string
+  images?: SourceImage[]
+  code_snippets?: CodeSnippet[]
+  contains_code?: boolean
+}
+
+export interface SearchHit {
+  chunk_id: string
+  document_id: string
+  document_name: string
+  chunk_index: number
+  page: number | null
+  section: string | null
+  score: number
+  snippet: string
+  content: string
+  images: SourceImage[]
+}
+
+export interface ChunkNeighbor {
+  chunk_id: string
+  chunk_index: number
+  content: string
+  page: number | null
+  section: string | null
+}
+
+export interface ChunkDetail {
+  chunk_id: string
+  document_id: string
+  document_name: string
+  chunk_index: number
+  content: string
+  page: number | null
+  section: string | null
+  images: SourceImage[]
+  previous: ChunkNeighbor[]
+  next: ChunkNeighbor[]
 }
 
 export interface ConversationDetail extends Conversation {
@@ -139,6 +250,7 @@ export interface DocumentChunk {
   token_count: number
   page: number | null
   section: string | null
+  metadata_json?: Record<string, unknown> | null
   graph_status: string
   graph_schema_version: number
 }
@@ -223,6 +335,7 @@ export interface SubgraphEdge {
 
 export interface DocumentSubgraph {
   document_id: string
+  graph_kind?: GraphKind | null
   nodes: SubgraphNode[]
   edges: SubgraphEdge[]
 }
@@ -230,7 +343,7 @@ export interface DocumentSubgraph {
 export interface GraphCorrection {
   id: string
   knowledge_base_id: string
-  action: 'add_relation' | 'hide_relation' | 'update_relation' | 'update_entity' | 'merge_relation'
+  action: 'add_entity' | 'add_relation' | 'hide_relation' | 'update_relation' | 'update_entity' | 'merge_relation'
   target_type: string
   target_id: string | null
   payload: Record<string, any>
@@ -246,6 +359,7 @@ export interface GraphCorrection {
 
 export interface EntitySubgraph {
   seed_entity_ids: string[]
+  graph_kind?: GraphKind | null
   nodes: SubgraphNode[]
   edges: SubgraphEdge[]
   offset: number
@@ -286,6 +400,22 @@ export interface CodeSnapshot {
   activated_at: string | null
 }
 
+export interface CodeSnapshotDiff {
+  base_snapshot_id: string
+  target_snapshot_id: string
+  added_files: string[]
+  modified_files: string[]
+  deleted_files: string[]
+  unchanged_files: number
+}
+
+export interface CodeFileIssue {
+  path: string
+  language: string
+  status: string
+  errors: string[]
+}
+
 export interface CodeSymbol {
   id: string
   snapshot_id: string
@@ -320,16 +450,51 @@ export interface CodeSubgraph { nodes: CodeSymbol[]; edges: CodeRelation[] }
 
 export interface GraphSchema {
   id: string
+  graph_kind: GraphKind
   version: number
   status: string
   entity_types_json: string[]
   relation_types_json: string[]
+  graph_profiles_json: Record<string, GraphProfile> | null
   normalization_rules_json: Record<string, unknown> | null
   extraction_prompt: string | null
   generation_method: 'manual' | 'document_llm' | string
   source_document_ids_json: string[] | null
   generation_summary_json: Record<string, any> | null
   created_at: string
+}
+
+export type GraphKind = 'general' | 'concept' | 'functional' | 'configuration' | 'standard'
+
+export interface GraphProfileEntityType {
+  name: string
+  label: string
+  color: string
+}
+
+export interface GraphProfileRelationType {
+  name: string
+  label: string
+  source_types: string[]
+  target_types: string[]
+}
+
+export interface GraphProfile {
+  key: GraphKind
+  label: string
+  short_label: string
+  purpose: string
+  positioning: string
+  recommended_layout: 'cose' | 'concentric' | 'breadthfirst'
+  color: string
+  document_hints: string[]
+  extraction_rules: string[]
+  entity_types: GraphProfileEntityType[]
+  relation_types: GraphProfileRelationType[]
+  entity_count: number
+  relation_count: number
+  schema_entity_coverage: number
+  schema_relation_coverage: number
 }
 
 export interface GraphSchemaImpact {

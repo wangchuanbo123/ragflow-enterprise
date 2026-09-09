@@ -88,3 +88,31 @@ def test_graph_automation_and_custom_schema_editing_api(client):
         },
     )
     assert immutable.status_code == 400
+
+
+def test_general_and_business_graph_profiles_use_independent_schema_templates(client):
+    knowledge_base_id = _login_and_default_kb(client)
+    base = f"/api/v1/knowledge-bases/{knowledge_base_id}/knowledge-graph"
+
+    response = client.get(f"{base}/profiles")
+    assert response.status_code == 200
+    profiles = response.json()
+    assert [item["key"] for item in profiles] == [
+        "general", "concept", "functional", "configuration", "standard"
+    ]
+    assert all(item["extraction_rules"] for item in profiles)
+    assert all(item["entity_types"] and item["relation_types"] for item in profiles[1:])
+
+    created = client.post(
+        f"{base}/schemas/profile-template",
+        json={"graph_kind": "concept"},
+    )
+    assert created.status_code == 201
+    schema = created.json()
+    assert schema["status"] == "draft"
+    assert schema["generation_method"] == "profile_template"
+    assert schema["graph_kind"] == "concept"
+    assert set(schema["graph_profiles_json"]) == {"concept"}
+    assert "AVIONICS_SYSTEM" in schema["entity_types_json"]
+    assert "CONCEPT_CONTAINS" in schema["relation_types_json"]
+    assert "仅按【概念图谱】" in schema["extraction_prompt"]

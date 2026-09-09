@@ -42,7 +42,7 @@ class RelationVectorService:
     ) -> IndexJob:
         repository = IndexJobRepository(self.db, self.knowledge_base_id)
         existing = repository.find_open("relation_vector_rebuild")
-        if existing is not None:
+        if existing is not None and existing.status == "pending":
             return existing
         job = repository.create(IndexJob(
             job_type="relation_vector_rebuild",
@@ -58,25 +58,37 @@ class RelationVectorService:
     def _relation_document(self, relation, subject, obj, quotes: list[str]):
         from langchain_core.documents import Document
 
+        def value(item, name: str):
+            return item.get(name) if isinstance(item, dict) else getattr(item, name)
+
+        relation_id = value(relation, "relation_id") if isinstance(relation, dict) else relation.id
+        subject_id = value(subject, "id")
+        object_id = value(obj, "id")
+        predicate = value(relation, "predicate")
+        description = value(relation, "description") if (
+            isinstance(relation, dict) and "description" in relation
+        ) or hasattr(relation, "description") else None
+        vocabulary = getattr(self, "_active_relation_vocabulary", None)
+
         return Document(
             page_content="\n".join(filter(None, [
-                f"{subject.canonical_name} --{relation.predicate}--> {obj.canonical_name}",
-                f"关系：{'、'.join(relation_terms(relation.predicate))}",
-                relation_description(relation.predicate),
-                relation.description,
+                f"{value(subject, 'canonical_name')} --{predicate}--> {value(obj, 'canonical_name')}",
+                f"关系：{'、'.join(relation_terms(predicate, vocabulary))}",
+                relation_description(predicate, vocabulary),
+                description,
                 *quotes,
             ])),
             metadata={
-                "relation_id": relation.id,
+                "relation_id": relation_id,
                 "knowledge_base_id": self.knowledge_base_id,
-                "subject_id": subject.id,
-                "subject_name": subject.canonical_name,
-                "subject_type": subject.entity_type,
-                "predicate": relation.predicate,
-                "object_id": obj.id,
-                "object_name": obj.canonical_name,
-                "object_type": obj.entity_type,
-                "confidence": float(relation.confidence),
+                "subject_id": subject_id,
+                "subject_name": value(subject, "canonical_name"),
+                "subject_type": value(subject, "entity_type"),
+                "predicate": predicate,
+                "object_id": object_id,
+                "object_name": value(obj, "canonical_name"),
+                "object_type": value(obj, "entity_type"),
+                "confidence": float(value(relation, "confidence")),
             },
         )
 
@@ -177,14 +189,18 @@ class RelationVectorService:
         }
 
     def rebuild(self) -> dict:
-        repository = KnowledgeGraphRepository(self.db, self.knowledge_base_id)
-        relations = repository.list_relations()
-        entities = {entity.id: entity for entity in repository.list_entities()}
+        from rag.knowledge_graph.sqlite_store import SqliteGraphStore
+
+        store = SqliteGraphStore(self.db, self.knowledge_base_id)
+        relations = store.list_effective_relations()
+        entities = {
+            entity["id"]: entity for entity in store.list_effective_entities()
+        }
         evidence_by_relation = defaultdict(list)
-        for evidence in repository.list_relation_evidence(
-            [relation.id for relation in relations]
-        ):
-            evidence_by_relation[evidence.relation_id].append(evidence)
+        relation_ids = [relation["relation_id"] for relation in relations]
+        for evidence in store.get_relation_evidence(relation_ids):
+            evidence_by_relation[evidence["relation_id"]].append(evidence)
+        self._active_relation_vocabulary = store._relation_vocabulary()
 
         embedding_identity = self.container.embedding.identity().as_dict()
         embedding_fingerprint = json.dumps(
@@ -192,18 +208,18 @@ class RelationVectorService:
         )
         fingerprint_rows = []
         for relation in relations:
-            subject = entities.get(relation.subject_entity_id)
-            obj = entities.get(relation.object_entity_id)
+            subject = entities.get(relation["subject_id"])
+            obj = entities.get(relation["object_id"])
             fingerprint_rows.append(": ".join([
-                relation.id,
-                str(relation.updated_at),
-                relation.predicate,
-                subject.canonical_name if subject else "",
-                str(subject.updated_at) if subject else "",
-                obj.canonical_name if obj else "",
-                str(obj.updated_at) if obj else "",
+                relation["relation_id"],
+                relation["predicate"],
+                subject["canonical_name"] if subject else "",
+                subject["updated_at"] if subject else "",
+                obj["canonical_name"] if obj else "",
+                obj["updated_at"] if obj else "",
                 ",".join(
-                    item.quote_hash for item in evidence_by_relation[relation.id]
+                    hashlib.sha256(item["quote"].encode("utf-8")).hexdigest()
+                    for item in evidence_by_relation[relation["relation_id"]]
                 ),
             ]))
         graph_fingerprint = hashlib.sha256(
@@ -260,15 +276,15 @@ class RelationVectorService:
         documents = []
         ids = []
         for relation in relations:
-            subject = entities.get(relation.subject_entity_id)
-            obj = entities.get(relation.object_entity_id)
+            subject = entities.get(relation["subject_id"])
+            obj = entities.get(relation["object_id"])
             if subject is None or obj is None:
                 continue
             quotes = [
-                item.quote for item in evidence_by_relation[relation.id][:3]
+                item["quote"] for item in evidence_by_relation[relation["relation_id"]][:3]
             ]
             documents.append(self._relation_document(relation, subject, obj, quotes))
-            ids.append(f"relation:{relation.id}")
+            ids.append(f"relation:{relation['relation_id']}")
 
         try:
             for start in range(0, len(documents), INGEST_BATCH_SIZE):

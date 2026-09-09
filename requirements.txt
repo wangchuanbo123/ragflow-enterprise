@@ -24,6 +24,8 @@ jieba==0.42.1
 
 unstructured[all-docs]==0.14.9
 pdfminer.six==20221105
+# pypdf: 文档图片提取（PDF 内嵌图片）；也是 unstructured 的传递依赖，显式固定
+pypdf>=4.0,<7.0
 tiktoken==0.7.0
 chardet==5.2.0
 docx2txt==0.9

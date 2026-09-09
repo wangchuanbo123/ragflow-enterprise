@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from app.core.config import (
     INDEX_JOB_HEARTBEAT_SECONDS,
     INDEX_JOB_LEASE_SECONDS,
+    INDEX_JOB_MAX_ATTEMPTS,
     INDEX_WORKER_ENABLED,
 )
 from app.repositories.index_job_repository import IndexJobRepository
@@ -69,6 +70,40 @@ class _LeaseHeartbeat:
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout=2)
+
+
+def _request_document_code_rebuild(db, knowledge_base_id: str, container) -> None:
+    """文档索引完成后，排一个文档内代码图谱重建任务（幂等）。
+
+    只在该知识库没有活动代码目录源时触发；目录源重建时已通过
+    ``merge_document_code=True`` 合并文档代码，无需重复任务。
+    """
+    from app.core.config import DOCUMENT_CODE_GRAPH_ENABLED
+    from app.models.index_job import IndexJob
+    from app.repositories.code_graph_repository import CodeGraphRepository
+    from app.repositories.index_job_repository import IndexJobRepository
+
+    if not DOCUMENT_CODE_GRAPH_ENABLED:
+        return
+    repository = CodeGraphRepository(db, knowledge_base_id)
+    active = repository.active_snapshot()
+    if active is not None and active.data_source_id is not None:
+        return
+    job_repository = IndexJobRepository(db, knowledge_base_id)
+    existing = job_repository.find_open(
+        "code_index", option_key="data_source_id", option_value="documents"
+    )
+    if existing is not None:
+        return
+    job = job_repository.create(IndexJob(
+        job_type="code_index",
+        status="pending",
+        requested_by="system:document-code",
+        total_items=1,
+        max_attempts=INDEX_JOB_MAX_ATTEMPTS,
+        options_json={"data_source_id": "documents"},
+    ))
+    container.task_queue.enqueue(job.id)
 
 
 def _process_job(
@@ -243,19 +278,32 @@ def _process_job(
                     from app.repositories.knowledge_base_repository import KnowledgeBaseRepository
 
                     source_id = str((job.options_json or {}).get("data_source_id", ""))
-                    source = KnowledgeBaseRepository(db).get_data_source(job.knowledge_base_id, source_id)
-                    if source is None:
-                        raise ValueError("数据源不存在")
                     service = CodeIndexService(db, job.knowledge_base_id)
-                    if source.source_type == "local_directory":
-                        root = DataSourceService._resolve_local_directory(str((source.config_json or {}).get("location", "")))
-                        result = service.index_directory(root, data_source_id=source.id)
-                    elif source.source_type == "git":
-                        with tempfile.TemporaryDirectory(prefix="rag-code-git-") as temp_dir:
-                            root, revision = DataSourceService(db, job.knowledge_base_id)._checkout_git(source, Path(temp_dir))
-                            result = service.index_directory(root, data_source_id=source.id, revision=revision)
+                    if not source_id or source_id == "documents":
+                        # 文档内代码图谱：直接从已入库 chunk 提取代码块。
+                        result = service.index_document_code()
                     else:
-                        raise ValueError("代码索引仅支持本地目录和 Git 数据源")
+                        source = KnowledgeBaseRepository(db).get_data_source(job.knowledge_base_id, source_id)
+                        if source is None:
+                            raise ValueError("数据源不存在")
+                        if source.source_type == "local_directory":
+                            root = DataSourceService._resolve_local_directory(str((source.config_json or {}).get("location", "")))
+                            result = service.index_directory(
+                                root,
+                                data_source_id=source.id,
+                                merge_document_code=True,
+                            )
+                        elif source.source_type == "git":
+                            with tempfile.TemporaryDirectory(prefix="rag-code-git-") as temp_dir:
+                                root, revision = DataSourceService(db, job.knowledge_base_id)._checkout_git(source, Path(temp_dir))
+                                result = service.index_directory(
+                                    root,
+                                    data_source_id=source.id,
+                                    revision=revision,
+                                    merge_document_code=True,
+                                )
+                        else:
+                            raise ValueError("代码索引仅支持本地目录和 Git 数据源")
                     from app.core.config import CODE_VECTOR_ENABLED
                     if CODE_VECTOR_ENABLED:
                         from app.services.code_vector_service import CodeVectorService
@@ -362,12 +410,13 @@ def _process_job(
                             exc,
                         )
                     failed = int(result.get("failed", 0))
+                    skipped = int(result.get("skipped", 0))
                     job_repo.update(
                         job,
                         status="partial" if failed or report.status != "ready" else "completed",
                         total_items=int(result.get("total_chunks", 0)),
-                        processed_items=int(result.get("succeeded", 0)) + failed,
-                        succeeded_items=int(result.get("succeeded", 0)),
+                        processed_items=int(result.get("succeeded", 0)) + failed + skipped,
+                        succeeded_items=int(result.get("succeeded", 0)) + skipped,
                         failed_items=failed,
                         error_message=("图谱质量门禁未全部通过" if report.status != "ready" else None),
                     )
@@ -408,6 +457,7 @@ def _process_job(
                         document_ids=options.get("document_ids") or None,
                         instructions=options.get("instructions") or None,
                         target_schema_id=options.get("target_schema_id") or None,
+                        graph_kind=options.get("graph_kind") or "general",
                     )
                     options = dict(options)
                     options["generated_schema_id"] = schema.id
@@ -435,6 +485,7 @@ def _process_job(
                         created_by=job.requested_by,
                         document_ids=options.get("document_ids") or None,
                         instructions=options.get("instructions") or None,
+                        graph_kind=options.get("graph_kind") or "general",
                     )
                     options["drift_result"] = drift
                     job.options_json = options
@@ -476,6 +527,9 @@ def _process_job(
                             job.requested_by,
                             source_job_id=job.id,
                         )
+                        _request_document_code_rebuild(
+                            db, job.knowledge_base_id, container
+                        )
 
             from app.services.rag_service import invalidate_rag_caches
 
@@ -503,6 +557,7 @@ def _worker_loop() -> None:
     logger.info("Index worker started as %s", _WORKER_ID)
     while not _worker_stop.is_set():
         try:
+            claimed_job_id: str | None = None
             with container.metadata.session() as db:
                 job_repo = IndexJobRepository(db, knowledge_base_id=None)
                 job_repo.recover_expired_leases()
@@ -513,13 +568,16 @@ def _worker_loop() -> None:
                     worker_id=_WORKER_ID,
                     lease_seconds=INDEX_JOB_LEASE_SECONDS,
                 )
+                # 会话即将关闭；commit 后 ORM 对象属性已过期，
+                # 必须在 with 块内把需要的标量读出来，只向块外传递 job_id。
+                claimed_job_id = job.id if job is not None else None
 
-            if job is None:
+            if claimed_job_id is None:
                 container.task_queue.wait(5)
                 continue
 
-            logger.info("Processing index job: %s (type=%s)", job.id, job.job_type)
-            _process_job(job.id, worker_id=_WORKER_ID, already_claimed=True)
+            logger.info("Processing index job: %s", claimed_job_id)
+            _process_job(claimed_job_id, worker_id=_WORKER_ID, already_claimed=True)
         except Exception as exc:
             logger.error("Worker error: %s", exc)
             _worker_stop.wait(10)

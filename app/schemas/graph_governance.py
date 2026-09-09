@@ -6,11 +6,52 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 
+GraphKind = Literal["general", "concept", "functional", "configuration", "standard"]
+BusinessGraphKind = Literal["concept", "functional", "configuration", "standard"]
+
+
+class GraphProfileEntityType(BaseModel):
+    name: str
+    label: str
+    color: str
+
+
+class GraphProfileRelationType(BaseModel):
+    name: str
+    label: str
+    source_types: list[str] = Field(default_factory=list)
+    target_types: list[str] = Field(default_factory=list)
+
+
+class GraphProfileOut(BaseModel):
+    key: GraphKind
+    label: str
+    short_label: str
+    purpose: str
+    positioning: str
+    recommended_layout: Literal["cose", "concentric", "breadthfirst"]
+    color: str
+    document_hints: list[str] = Field(default_factory=list)
+    extraction_rules: list[str] = Field(default_factory=list)
+    entity_types: list[GraphProfileEntityType] = Field(default_factory=list)
+    relation_types: list[GraphProfileRelationType] = Field(default_factory=list)
+    entity_count: int = 0
+    relation_count: int = 0
+    schema_entity_coverage: int = 0
+    schema_relation_coverage: int = 0
+
+
+class GraphProfileTemplateRequest(BaseModel):
+    graph_kind: BusinessGraphKind
+
+
 class GraphSchemaCreate(BaseModel):
+    graph_kind: GraphKind = "general"
     entity_types: list[str] = Field(min_length=1)
     relation_types: list[str] = Field(min_length=1)
     normalization_rules: dict = Field(default_factory=dict)
     extraction_prompt: str | None = Field(default=None, max_length=10000)
+    graph_profiles: dict | None = None
 
 
 class GraphSchemaUpdate(GraphSchemaCreate):
@@ -25,10 +66,12 @@ class GraphAutomationSettings(BaseModel):
 class GraphSchemaOut(BaseModel):
     id: str
     knowledge_base_id: str
+    graph_kind: GraphKind = "general"
     version: int
     status: str
     entity_types_json: list
     relation_types_json: list
+    graph_profiles_json: dict | None = None
     normalization_rules_json: dict | None = None
     extraction_prompt: str | None = None
     generation_method: str = "manual"
@@ -46,12 +89,14 @@ class GraphBuildRequest(BaseModel):
 
     profile: Literal["fast", "standard", "deep"] | None = None
     mode: Literal["pending", "retry_failed", "full"] = "pending"
+    graph_kind: GraphKind = "general"
     rebuild_entity_vectors: bool | None = None
     rebuild_relation_vectors: bool | None = None
     rebuild_communities: bool | None = None
 
 
 class GraphSchemaGenerateRequest(BaseModel):
+    graph_kind: GraphKind = "general"
     document_ids: list[str] = Field(default_factory=list, max_length=100)
     instructions: str | None = Field(default=None, max_length=2000)
     mode: Literal["new", "overwrite"] = "new"
@@ -67,6 +112,7 @@ class GraphSchemaGenerateRequest(BaseModel):
 
 
 class GraphSchemaDriftRequest(BaseModel):
+    graph_kind: GraphKind = "general"
     document_ids: list[str] = Field(default_factory=list, max_length=100)
     instructions: str | None = Field(default=None, max_length=2000)
 

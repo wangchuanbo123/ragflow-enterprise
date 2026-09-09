@@ -66,23 +66,29 @@ class ChunkBM25Retriever:
                 self._tokenized = []
 
                 for chunk in chunks:
+                    metadata = {
+                        "chunk_id": chunk.id,
+                        "knowledge_base_id": self.knowledge_base_id,
+                        "document_id": chunk.document_id,
+                        "source": _get_source_path(
+                            db,
+                            chunk.document_id,
+                            self.knowledge_base_id,
+                        ),
+                        "file_hash": chunk.file_hash,
+                        "chunk_index": chunk.chunk_index,
+                        "page": chunk.page,
+                        "section": chunk.section,
+                        "content_hash": chunk.content_hash,
+                    }
+                    # 图片引用、contains_code 等富元数据存在 metadata_json 里；
+                    # BM25 通道也要带出来，context_builder 才能还原图片。
+                    for key, value in (chunk.metadata_json or {}).items():
+                        if key not in metadata:
+                            metadata[key] = value
                     doc = Document(
                         page_content=chunk.content,
-                        metadata={
-                            "chunk_id": chunk.id,
-                            "knowledge_base_id": self.knowledge_base_id,
-                            "document_id": chunk.document_id,
-                            "source": _get_source_path(
-                                db,
-                                chunk.document_id,
-                                self.knowledge_base_id,
-                            ),
-                            "file_hash": chunk.file_hash,
-                            "chunk_index": chunk.chunk_index,
-                            "page": chunk.page,
-                            "section": chunk.section,
-                            "content_hash": chunk.content_hash,
-                        },
+                        metadata=metadata,
                     )
                     self._docs.append(doc)
                     self._tokenized.append(_tokenize(chunk.content))

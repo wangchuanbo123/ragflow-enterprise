@@ -106,6 +106,10 @@ class OpenAICompatibleEmbeddingProvider:
             base_url=self.base_url,
             request_timeout=self.timeout,
             max_retries=2,
+            # Compatible BGE endpoints own their input limits and do not use
+            # OpenAI tokenization. Disabling this also prevents an unnecessary
+            # first-run download of cl100k_base in offline deployments.
+            check_embedding_ctx_length=False,
         )
 
     def get_model(self):

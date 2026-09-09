@@ -246,6 +246,30 @@ class DocumentManagementRepository:
         self.db.refresh(version)
         return version
 
+    def get_chunk_by_id(self, chunk_id: str) -> KnowledgeChunk | None:
+        return self.db.get(KnowledgeChunk, chunk_id)
+
+    def list_chunks_around_index(
+        self,
+        document_id: str,
+        chunk_index: int,
+        *,
+        before: int = 1,
+        after: int = 1,
+    ) -> list[KnowledgeChunk]:
+        return list(
+            self.db.scalars(
+                select(KnowledgeChunk)
+                .where(
+                    KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+                    KnowledgeChunk.document_id == document_id,
+                    KnowledgeChunk.chunk_index >= chunk_index - before,
+                    KnowledgeChunk.chunk_index <= chunk_index + after,
+                )
+                .order_by(KnowledgeChunk.chunk_index)
+            )
+        )
+
     def list_chunks(
         self,
         document_id: str,

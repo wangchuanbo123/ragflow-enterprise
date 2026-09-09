@@ -18,6 +18,8 @@ from app.schemas.graph_governance import (
     EntityVectorStateOut,
     GraphAutomationSettings,
     GraphBuildRequest,
+    GraphProfileOut,
+    GraphProfileTemplateRequest,
     GraphQualityOut,
     GraphSchemaCreate,
     GraphSchemaDriftRequest,
@@ -51,11 +53,26 @@ def _require(db: Session, knowledge_base_id: str, user: User, *, edit: bool = Fa
 
 
 @router.get("/{knowledge_base_id}/knowledge-graph/schemas", response_model=list[GraphSchemaOut])
-def list_graph_schemas(knowledge_base_id: str, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def list_graph_schemas(knowledge_base_id: str, graph_kind: str | None = Query(default=None), current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     _require(db, knowledge_base_id, current_user)
     service = GraphGovernanceService(db, knowledge_base_id)
-    service.active_schema()
-    return service.list_schemas()
+    for kind in ("general", "concept", "functional", "configuration", "standard"):
+        service.active_schema(graph_kind=kind)
+    return service.list_schemas(graph_kind=graph_kind)
+
+
+@router.get(
+    "/{knowledge_base_id}/knowledge-graph/profiles",
+    response_model=list[GraphProfileOut],
+)
+def list_graph_profiles(
+    knowledge_base_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return the general document graph and four professional graph contracts."""
+    _require(db, knowledge_base_id, current_user)
+    return GraphGovernanceService(db, knowledge_base_id).list_graph_profiles()
 
 
 @router.post("/{knowledge_base_id}/knowledge-graph/schemas", response_model=GraphSchemaOut, status_code=201)
@@ -67,6 +84,30 @@ def create_graph_schema(knowledge_base_id: str, payload: GraphSchemaCreate, curr
             relation_types=payload.relation_types,
             normalization_rules=payload.normalization_rules,
             extraction_prompt=payload.extraction_prompt,
+            graph_profiles=payload.graph_profiles,
+            graph_kind=payload.graph_kind,
+            created_by=current_user.id,
+        )
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
+
+
+@router.post(
+    "/{knowledge_base_id}/knowledge-graph/schemas/profile-template",
+    response_model=GraphSchemaOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_profile_schema_template(
+    knowledge_base_id: str,
+    payload: GraphProfileTemplateRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a draft for one professional graph; activation remains explicit."""
+    _require(db, knowledge_base_id, current_user, edit=True)
+    try:
+        return GraphGovernanceService(db, knowledge_base_id).create_profile_schema(
+            graph_kind=payload.graph_kind,
             created_by=current_user.id,
         )
     except ValueError as exc:
@@ -94,6 +135,7 @@ def generate_graph_schema(
             target_schema_id=(
                 payload.target_schema_id if payload.mode == "overwrite" else None
             ),
+            graph_kind=payload.graph_kind,
         )
     except ValueError as exc:
         raise bad_request(str(exc)) from exc
@@ -117,6 +159,7 @@ def check_graph_schema_drift(
             requested_by=current_user.id,
             document_ids=payload.document_ids or None,
             instructions=payload.instructions,
+            graph_kind=payload.graph_kind,
         )
     except ValueError as exc:
         raise bad_request(str(exc)) from exc
@@ -132,6 +175,7 @@ def update_graph_schema(knowledge_base_id: str, schema_id: str, payload: GraphSc
             relation_types=payload.relation_types,
             normalization_rules=payload.normalization_rules,
             extraction_prompt=payload.extraction_prompt,
+            graph_profiles=payload.graph_profiles,
         )
     except ValueError as exc:
         raise bad_request(str(exc)) from exc
@@ -193,7 +237,11 @@ def request_graph_build(knowledge_base_id: str, payload: GraphBuildRequest, curr
     _require(db, knowledge_base_id, current_user, edit=True)
     service = GraphGovernanceService(db, knowledge_base_id)
     if payload.profile is not None:
-        return service.request_build(requested_by=current_user.id, profile=payload.profile)
+        return service.request_build(
+            requested_by=current_user.id,
+            profile=payload.profile,
+            options={"graph_kind": payload.graph_kind},
+        )
     vector_update = None
     if payload.rebuild_entity_vectors is not None or payload.rebuild_relation_vectors is not None:
         full_vectors = bool(
@@ -209,6 +257,7 @@ def request_graph_build(knowledge_base_id: str, payload: GraphBuildRequest, curr
         current_user.id,
         vector_update=vector_update,
         community_update=community_update,
+        options={"graph_kind": payload.graph_kind},
     )
 
 

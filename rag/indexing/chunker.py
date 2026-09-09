@@ -10,11 +10,9 @@ semantic 策略可选，但默认不启用以避免 Embedding 构建速度过慢
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass, field
 from typing import Sequence
 
-import tiktoken
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
@@ -22,31 +20,21 @@ from app.core.config import (
     CHUNK_OVERLAP,
     CHUNK_SIZE,
     CHUNK_STRATEGY,
+    CODE_AWARE_MIN_BLOCK_LINES,
     INDEX_SCHEMA_VERSION,
     MIN_CHUNK_SIZE,
 )
+from rag.indexing.code_aware_splitter import split_documents_code_aware
+from rag.indexing.tokens import count_tokens
+from rag.loaders.image_extractor import IMAGE_PLACEHOLDER_PATTERN
 
-_ENCODER: tiktoken.Encoding | None = None
-
-
-def _get_encoder() -> tiktoken.Encoding:
-    global _ENCODER
-    if _ENCODER is None:
-        try:
-            _ENCODER = tiktoken.get_encoding("cl100k_base")
-        except Exception:
-            _ENCODER = None
-    return _ENCODER
-
-
-def count_tokens(text: str) -> int:
-    enc = _get_encoder()
-    if enc is not None:
-        try:
-            return len(enc.encode(text))
-        except Exception:
-            pass
-    return max(1, len(text) // 2)
+__all__ = [
+    "ChunkResult",
+    "content_hash",
+    "count_tokens",
+    "deterministic_chunk_id",
+    "split_documents",
+]
 
 
 def content_hash(text: str) -> str:
@@ -70,6 +58,27 @@ class ChunkResult:
     content_hashes: list[str] = field(default_factory=list)
 
 
+def _scope_images_to_chunks(chunks: list[Document]) -> None:
+    """只保留真正落在该片段内的图片。
+
+    文档级 metadata 会被切分器复制到每个片段；这里依据 ``[[img-N]]`` 占位符
+    是否在片段正文中出现，把图片列表收敛到该片段自己的那几张。
+    """
+    for chunk in chunks:
+        images = chunk.metadata.get("images")
+        if not images:
+            continue
+        wanted = {
+            f"img-{number}"
+            for number in IMAGE_PLACEHOLDER_PATTERN.findall(chunk.page_content)
+        }
+        kept = [item for item in images if item.get("marker") in wanted]
+        if kept:
+            chunk.metadata["images"] = kept
+        else:
+            chunk.metadata.pop("images", None)
+
+
 def split_documents(
     docs: Sequence[Document],
     strategy: str = CHUNK_STRATEGY,
@@ -89,8 +98,18 @@ def split_documents(
 
     if strategy == "semantic":
         chunks = _split_semantic(docs, chunk_size, chunk_overlap)
+    elif strategy == "code_aware":
+        chunks = split_documents_code_aware(
+            docs,
+            chunk_size,
+            chunk_overlap,
+            min_chunk_size,
+            min_block_lines=CODE_AWARE_MIN_BLOCK_LINES,
+        )
     else:
         chunks = _split_recursive(docs, chunk_size, chunk_overlap, min_chunk_size)
+
+    _scope_images_to_chunks(chunks)
 
     # Deduplicate exact duplicates within same batch by content_hash
     seen_hashes: set[str] = set()

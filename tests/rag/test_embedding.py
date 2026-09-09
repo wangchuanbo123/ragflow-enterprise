@@ -1,6 +1,9 @@
-"""Ollama batch embedding tests."""
+"""Embedding provider tests."""
 
-from rag.providers.embedding import OllamaBatchEmbeddings
+from rag.providers.embedding import (
+    OllamaBatchEmbeddings,
+    OpenAICompatibleEmbeddingProvider,
+)
 
 
 class _Response:
@@ -48,3 +51,22 @@ def test_embed_query_uses_query_instruction(monkeypatch):
     )
 
     assert embeddings.embed_query("用户问题") == [0.5, 0.5]
+
+
+def test_openai_compatible_embeddings_do_not_download_openai_tokenizer(monkeypatch):
+    captured = {}
+    sentinel = object()
+
+    def fake_embeddings(**kwargs):
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr("langchain_openai.OpenAIEmbeddings", fake_embeddings)
+    provider = OpenAICompatibleEmbeddingProvider(
+        model="BAAI/bge-m3",
+        api_key="test-key",
+        base_url="https://embedding.example/v1",
+    )
+
+    assert provider.get_model() is sentinel
+    assert captured["check_embedding_ctx_length"] is False

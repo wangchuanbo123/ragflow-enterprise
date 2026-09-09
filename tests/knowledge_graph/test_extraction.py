@@ -39,6 +39,65 @@ def test_parse_valid_extraction():
     assert result.relations[0].predicate == "DEPENDS_ON"
 
 
+def test_parse_recovers_missing_local_ids_and_name_relation_endpoints():
+    content = "订单服务是业务平台的一部分，订单服务负责处理订单超时。"
+    raw = json.dumps({
+        "entities": [
+            {"name": "订单服务", "type": "service_component"},
+            {"name": "业务平台", "type": "software_system"},
+        ],
+        "relations": [
+            {
+                "subject": "订单服务",
+                "predicate": "part_of",
+                "object": "业务平台",
+                "evidence": "订单服务是业务平台的一部分",
+            }
+        ],
+    }, ensure_ascii=False)
+
+    result = parse_extraction_response(
+        raw,
+        "diagnostic-1",
+        content,
+        entity_types={"SERVICE_COMPONENT", "SOFTWARE_SYSTEM"},
+        relation_types={"PART_OF"},
+    )
+
+    assert [entity.local_id for entity in result.entities] == ["e1", "e2"]
+    assert [entity.type for entity in result.entities] == [
+        "SERVICE_COMPONENT",
+        "SOFTWARE_SYSTEM",
+    ]
+    assert result.relations[0].subject == "e1"
+    assert result.relations[0].object == "e2"
+    assert result.relations[0].confidence == 0.8
+
+
+def test_parse_does_not_resolve_ambiguous_entity_names():
+    content = "A依赖B"
+    raw = json.dumps({
+        "entities": [
+            {"name": "服务", "type": "MODULE"},
+            {"name": "服务", "type": "MODULE"},
+            {"name": "B", "type": "MODULE"},
+        ],
+        "relations": [
+            {
+                "subject": "服务",
+                "predicate": "DEPENDS_ON",
+                "object": "B",
+                "evidence": "A依赖B",
+            }
+        ],
+    }, ensure_ascii=False)
+
+    result = parse_extraction_response(raw, "c1", content)
+
+    assert len(result.entities) == 3
+    assert result.relations == []
+
+
 def test_parse_rejects_unknown_entity_type():
     content = "测试内容"
     raw = json.dumps({
@@ -248,6 +307,42 @@ def test_batch_extractor_uses_one_llm_call():
     assert len(results[0].relations) == 1
 
 
+def test_batch_extractor_retries_only_missing_chunk_ids():
+    from rag.knowledge_graph.extractor import GraphExtractor
+
+    class PartialBatchLLM:
+        def __init__(self):
+            self.calls = 0
+            self.prompts: list[str] = []
+
+        def generate(self, prompt):
+            self.calls += 1
+            self.prompts.append(prompt)
+            chunk_id = "c1" if self.calls == 1 else "c2"
+            return json.dumps({
+                "chunks": [{
+                    "chunk_id": chunk_id,
+                    "entities": [{
+                        "name": "订单服务" if chunk_id == "c1" else "支付服务",
+                        "type": "MODULE",
+                    }],
+                    "relations": [],
+                }]
+            }, ensure_ascii=False)
+
+    llm = PartialBatchLLM()
+    extractor = GraphExtractor(llm=llm, max_retries=1)
+    results = extractor.extract_batch([
+        {"chunk_id": "c1", "content": "订单服务处理订单"},
+        {"chunk_id": "c2", "content": "支付服务处理支付"},
+    ])
+
+    assert llm.calls == 2
+    assert [result.chunk_id for result in results] == ["c1", "c2"]
+    assert '"chunk_id": "c1"' not in llm.prompts[1]
+    assert '"chunk_id": "c2"' in llm.prompts[1]
+
+
 def test_graph_build_reextracts_old_schema_and_filters_low_confidence(
     db_engine,
 ):
@@ -328,7 +423,9 @@ def test_graph_build_reextracts_old_schema_and_filters_low_confidence(
         assert extractor.calls == 1
         assert result["succeeded"] == 1
         assert result["graph_stats"]["relations"] == 0
-        assert chunk.graph_schema_version == GRAPH_SCHEMA_VERSION
+        # The effective extraction contract uses the newest version across the
+        # general Schema and four independent professional Schemas.
+        assert chunk.graph_schema_version >= GRAPH_SCHEMA_VERSION
 
 
 def test_graph_build_recovers_interrupted_processing_chunk(db_engine):
@@ -375,6 +472,7 @@ def test_graph_build_recovers_interrupted_processing_chunk(db_engine):
         db.refresh(chunk)
         assert result["recovered_processing"] == 1
         assert result["succeeded"] == 1
+        assert result["empty_extractions"] == 1
         assert chunk.graph_status == "completed"
         assert chunk.graph_error is None
 

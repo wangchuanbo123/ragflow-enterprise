@@ -192,7 +192,11 @@ HYBRID_VECTOR_WEIGHT = float(os.getenv("HYBRID_VECTOR_WEIGHT", "0.70"))
 
 # --- Index and chunking ---
 INDEX_SCHEMA_VERSION = int(os.getenv("INDEX_SCHEMA_VERSION", "2"))
-CHUNK_STRATEGY = os.getenv("CHUNK_STRATEGY", "recursive").lower()
+CHUNK_STRATEGY = os.getenv("CHUNK_STRATEGY", "code_aware").lower()
+if CHUNK_STRATEGY not in {"recursive", "semantic", "code_aware"}:
+    raise ValueError(
+        f"CHUNK_STRATEGY must be one of recursive/semantic/code_aware, got {CHUNK_STRATEGY}"
+    )
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "384"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "64"))
 MIN_CHUNK_SIZE = int(os.getenv("MIN_CHUNK_SIZE", "80"))
@@ -200,6 +204,21 @@ INGEST_BATCH_SIZE = int(os.getenv("INGEST_BATCH_SIZE", "128"))
 MAX_DOCUMENT_SIZE_MB = int(os.getenv("MAX_DOCUMENT_SIZE_MB", "50"))
 MAX_BATCH_UPLOAD_FILES = int(os.getenv("MAX_BATCH_UPLOAD_FILES", "100"))
 MAX_BATCH_UPLOAD_TOTAL_MB = int(os.getenv("MAX_BATCH_UPLOAD_TOTAL_MB", "500"))
+
+# --- Document images ---
+IMAGE_EXTRACTION_ENABLED = os.getenv("IMAGE_EXTRACTION_ENABLED", "true").lower() == "true"
+MAX_IMAGES_PER_DOCUMENT = int(os.getenv("MAX_IMAGES_PER_DOCUMENT", "40"))
+MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(8 * 1024 * 1024)))
+IMAGE_CONTEXT_MAX_PER_CHUNK = int(os.getenv("IMAGE_CONTEXT_MAX_PER_CHUNK", "3"))
+IMAGE_URL_PREFIX = os.getenv("IMAGE_URL_PREFIX", "/api/v1/objects")
+
+# --- Code blocks inside documents ---
+CODE_AWARE_MIN_BLOCK_LINES = int(os.getenv("CODE_AWARE_MIN_BLOCK_LINES", "3"))
+DOCUMENT_CODE_GRAPH_ENABLED = (
+    os.getenv("DOCUMENT_CODE_GRAPH_ENABLED", "true").lower() == "true"
+)
+DOCUMENT_CODE_MAX_BLOCKS = int(os.getenv("DOCUMENT_CODE_MAX_BLOCKS", "60"))
+DOCUMENT_CODE_MIN_BLOCK_LINES = int(os.getenv("DOCUMENT_CODE_MIN_BLOCK_LINES", "3"))
 _index_worker_default = "true" if TASK_QUEUE_PROVIDER == "inline" else "false"
 INDEX_WORKER_ENABLED = (
     os.getenv("INDEX_WORKER_ENABLED", _index_worker_default).lower() == "true"
@@ -357,6 +376,12 @@ CONNECTOR_SCHEDULER_INTERVAL_SECONDS = int(
 CONNECTOR_GIT_TIMEOUT_SECONDS = int(os.getenv("CONNECTOR_GIT_TIMEOUT_SECONDS", "300"))
 CONNECTOR_MAX_DOWNLOAD_MB = int(os.getenv("CONNECTOR_MAX_DOWNLOAD_MB", "512"))
 
+# --- Knowledge backup scheduling ---
+BACKUP_MONTHLY_ENABLED = _env_bool("BACKUP_MONTHLY_ENABLED", True)
+BACKUP_MONTHLY_INTERVAL_DAYS = int(os.getenv("BACKUP_MONTHLY_INTERVAL_DAYS", "30"))
+BACKUP_RETENTION_VERSIONS = int(os.getenv("BACKUP_RETENTION_VERSIONS", "12"))
+BACKUP_SCHEDULER_INTERVAL_SECONDS = int(os.getenv("BACKUP_SCHEDULER_INTERVAL_SECONDS", "86400"))
+
 # --- Multi-channel retrieval ---
 VECTOR_RETRIEVAL_WEIGHT = float(os.getenv("VECTOR_RETRIEVAL_WEIGHT", "0.50"))
 BM25_RETRIEVAL_WEIGHT = float(os.getenv("BM25_RETRIEVAL_WEIGHT", "0.25"))
@@ -397,6 +422,10 @@ if CODE_VECTOR_MAX_CHARS < 100:
     raise ValueError("CODE_VECTOR_MAX_CHARS must be at least 100")
 if CONNECTOR_SCHEDULER_INTERVAL_SECONDS < 10:
     raise ValueError("CONNECTOR_SCHEDULER_INTERVAL_SECONDS must be at least 10")
+if BACKUP_MONTHLY_INTERVAL_DAYS < 1 or BACKUP_RETENTION_VERSIONS < 1:
+    raise ValueError("Backup interval and retention must be at least 1")
+if BACKUP_SCHEDULER_INTERVAL_SECONDS < 60:
+    raise ValueError("BACKUP_SCHEDULER_INTERVAL_SECONDS must be at least 60")
 if not 0.0 <= GRAPH_ENTITY_MERGE_SIMILARITY <= 1.0:
     raise ValueError("GRAPH_ENTITY_MERGE_SIMILARITY must be between 0 and 1")
 if GRAPH_AUTO_BUILD_DEBOUNCE_SECONDS < 0:

@@ -1,6 +1,7 @@
 """Knowledge-base lifecycle and scoped document endpoints."""
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -17,11 +18,14 @@ from app.repositories.index_job_repository import IndexJobRepository
 from app.schemas.document import DocumentOut, IndexJobEventOut, IndexJobOut
 from app.schemas.document_management import (
     BatchDocumentRequest,
+    ChunkDetailOut,
+    ChunkNeighborOut,
     ChunkOut,
     DocumentTagsUpdate,
     DocumentVersionOut,
     FolderCreate,
     FolderOut,
+    SearchHitOut,
     TagCreate,
     TagOut,
 )
@@ -34,6 +38,7 @@ from app.schemas.knowledge_base import (
     KnowledgeBaseMemberOut,
     KnowledgeBaseMemberUpsert,
     KnowledgeBaseOut,
+    KnowledgeBaseUpdate,
 )
 from app.schemas.knowledge_graph import (
     DocumentSubgraphOut,
@@ -128,6 +133,48 @@ def get_knowledge_base(
     if knowledge_base is None:
         raise not_found("知识库不存在")
     return knowledge_base
+
+
+@router.patch("/{knowledge_base_id}", response_model=KnowledgeBaseOut)
+def update_knowledge_base(
+    knowledge_base_id: str,
+    payload: KnowledgeBaseUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_owner(db, knowledge_base_id, current_user)
+    repository = KnowledgeBaseRepository(db)
+    knowledge_base = repository.get(knowledge_base_id)
+    if knowledge_base is None:
+        raise not_found("知识库不存在")
+    supplied = payload.model_fields_set
+    try:
+        return repository.update(
+            knowledge_base,
+            name=payload.name,
+            slug=payload.slug,
+            description=payload.description,
+            description_supplied="description" in supplied,
+        )
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
+
+
+@router.delete("/{knowledge_base_id}", status_code=status.HTTP_204_NO_CONTENT)
+def archive_knowledge_base(
+    knowledge_base_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_owner(db, knowledge_base_id, current_user)
+    repository = KnowledgeBaseRepository(db)
+    knowledge_base = repository.get(knowledge_base_id)
+    if knowledge_base is None:
+        raise not_found("知识库不存在")
+    try:
+        repository.archive(knowledge_base)
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
 
 
 @router.get(
@@ -679,16 +726,29 @@ def search_graph_entities(
     knowledge_base_id: str,
     query: str = Query(min_length=1, max_length=255),
     limit: int = Query(default=20, ge=1, le=100),
+    graph_kind: str | None = Query(
+        default=None,
+        pattern="^(general|concept|functional|configuration|standard)$",
+    ),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     _require_read(db, knowledge_base_id, current_user)
     from app.bootstrap.container import get_provider_container
 
+    fetch_limit = 100 if graph_kind else limit
     entities = get_provider_container().graph_store(
         db,
         knowledge_base_id,
-    ).search_entities(query, limit)
+    ).search_entities(query, fetch_limit)
+    if graph_kind and graph_kind != "general":
+        from rag.knowledge_graph.profiles import profile_type_names
+
+        allowed_entities, _ = profile_type_names(graph_kind)
+        entities = [
+            entity for entity in entities
+            if str(entity.get("entity_type") or "").upper() in allowed_entities
+        ][:limit]
     return [EntityOut(**entity) for entity in entities]
 
 
@@ -724,6 +784,10 @@ def entity_subgraph(
     hops: int = Query(default=1, ge=1, le=2),
     offset: int = Query(default=0, ge=0, le=5000),
     limit: int = Query(default=100, ge=1, le=500),
+    graph_kind: str | None = Query(
+        default=None,
+        pattern="^(general|concept|functional|configuration|standard)$",
+    ),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -745,6 +809,21 @@ def entity_subgraph(
         offset=offset,
     )
     page = relations[:limit]
+    visible_entity_ids = set(entity_ids)
+    for relation in page:
+        visible_entity_ids.update(
+            (relation["subject_id"], relation["object_id"])
+        )
+    from app.models.knowledge_graph import KgEntityMention
+
+    mention_counts = dict(db.execute(
+        select(KgEntityMention.entity_id, func.count(KgEntityMention.id))
+        .where(
+            KgEntityMention.knowledge_base_id == knowledge_base_id,
+            KgEntityMention.entity_id.in_(visible_entity_ids),
+        )
+        .group_by(KgEntityMention.entity_id)
+    ).all()) if visible_entity_ids else {}
     relation_ids = [relation["relation_id"] for relation in page]
     evidence_rows = store.get_relation_evidence(relation_ids)
     evidence_by_relation: dict[str, list[dict]] = {}
@@ -761,7 +840,7 @@ def entity_subgraph(
             "label": entity.canonical_name,
             "entity_type": entity.entity_type,
             "description": entity.description,
-            "mention_count": len(repository.get_entity_mentions(entity.id)),
+            "mention_count": int(mention_counts.get(entity.id, 0)),
         }
         for entity in seed_entities
         if entity is not None
@@ -772,13 +851,13 @@ def entity_subgraph(
             "id": relation["subject_id"],
             "label": relation["subject_name"],
             "entity_type": relation["subject_type"],
-            "mention_count": 0,
+            "mention_count": int(mention_counts.get(relation["subject_id"], 0)),
         }
         nodes[relation["object_id"]] = {
             "id": relation["object_id"],
             "label": relation["object_name"],
             "entity_type": relation["object_type"],
-            "mention_count": 0,
+            "mention_count": int(mention_counts.get(relation["object_id"], 0)),
         }
         edges.append({
             "id": relation["relation_id"],
@@ -790,13 +869,19 @@ def entity_subgraph(
             "manual": relation.get("manual", False),
             "correction_id": relation.get("correction_id"),
         })
-    return {
+    payload = {
         "seed_entity_ids": entity_ids,
+        "graph_kind": graph_kind,
         "nodes": list(nodes.values()),
         "edges": edges,
         "offset": offset,
         "next_offset": offset + limit if len(relations) > limit else None,
     }
+    if graph_kind and graph_kind != "general":
+        from rag.knowledge_graph.profiles import project_subgraph
+
+        return project_subgraph(payload, graph_kind)
+    return payload
 
 
 @router.get(
@@ -807,6 +892,10 @@ def document_subgraph(
     knowledge_base_id: str,
     document_id: str,
     limit: int = Query(default=200, ge=1, le=1000),
+    graph_kind: str | None = Query(
+        default=None,
+        pattern="^(general|concept|functional|configuration|standard)$",
+    ),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -816,10 +905,15 @@ def document_subgraph(
         raise not_found("文档不存在")
     from app.bootstrap.container import get_provider_container
 
-    return get_provider_container().graph_store(
+    payload = get_provider_container().graph_store(
         db,
         knowledge_base_id,
     ).get_document_subgraph(document_id, limit)
+    if graph_kind and graph_kind != "general":
+        from rag.knowledge_graph.profiles import project_subgraph
+
+        return project_subgraph(payload, graph_kind)
+    return payload
 
 
 @router.get(
@@ -849,10 +943,10 @@ def create_graph_correction(
     db: Session = Depends(get_db),
 ):
     _require_edit(db, knowledge_base_id, current_user)
-    from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
+    from app.services.graph_governance_service import GraphGovernanceService
 
     try:
-        return KnowledgeGraphRepository(db, knowledge_base_id).create_correction(
+        return GraphGovernanceService(db, knowledge_base_id).create_correction(
             action=payload.action,
             target_id=payload.target_id,
             payload=payload.payload,
@@ -874,12 +968,11 @@ def revert_graph_correction(
     db: Session = Depends(get_db),
 ):
     _require_edit(db, knowledge_base_id, current_user)
-    from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
+    from app.services.graph_governance_service import GraphGovernanceService
 
-    correction = KnowledgeGraphRepository(
-        db,
-        knowledge_base_id,
-    ).revert_correction(correction_id, current_user.id)
+    correction = GraphGovernanceService(db, knowledge_base_id).revert_correction(
+        correction_id, current_user.id
+    )
     if correction is None:
         raise not_found("图谱校正不存在")
     return correction
@@ -1045,6 +1138,154 @@ def list_document_chunks(
         offset=offset,
         limit=limit,
     )
+
+
+@router.get(
+    "/{knowledge_base_id}/search",
+    response_model=list[SearchHitOut],
+)
+def search_chunks(
+    knowledge_base_id: str,
+    query: str = Query(min_length=1, max_length=255),
+    limit: int = Query(default=20, ge=1, le=50),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """知识库全文搜索：复用 BM25 索引，返回命中片段与摘要。"""
+    _require_read(db, knowledge_base_id, current_user)
+
+    from rag.retrievers.bm25_retriever import get_bm25_retriever
+
+    retriever = get_bm25_retriever(knowledge_base_id)
+    docs = retriever.get_relevant_documents(query, top_k=limit)
+    if not docs:
+        return []
+
+    document_names = {
+        document.id: document.original_filename
+        for document in DocumentIndexService(db, knowledge_base_id).list_documents()
+    }
+    hits: list[SearchHitOut] = []
+    for doc in docs:
+        content = doc.page_content
+        hits.append(SearchHitOut(
+            chunk_id=str(doc.metadata.get("chunk_id", "")),
+            document_id=str(doc.metadata.get("document_id", "")),
+            document_name=document_names.get(
+                str(doc.metadata.get("document_id", "")), "未知文档"
+            ),
+            chunk_index=int(doc.metadata.get("chunk_index", 0) or 0),
+            page=doc.metadata.get("page"),
+            section=doc.metadata.get("section"),
+            score=float(doc.metadata.get("bm25_score", 0.0) or 0.0),
+            snippet=_build_snippet(content, query),
+            content=content,
+            images=[
+                item for item in (doc.metadata.get("images") or [])
+                if isinstance(item, dict)
+            ],
+        ))
+    return hits
+
+
+def _build_snippet(content: str, query: str, window: int = 160) -> str:
+    """围绕首个命中词截取摘要片段。"""
+    normalized = content.replace("\r\n", "\n")
+    compact = normalized.replace("\n", " ")
+    anchor = -1
+    for term in query.split():
+        term = term.strip()
+        if term:
+            anchor = compact.find(term)
+            if anchor >= 0:
+                break
+    if anchor < 0:
+        return compact[:window * 2]
+    start = max(0, anchor - window)
+    end = min(len(compact), anchor + len(term) + window)
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(compact) else ""
+    return f"{prefix}{compact[start:end].strip()}{suffix}"
+
+
+@router.get(
+    "/{knowledge_base_id}/chunks/{chunk_id}",
+    response_model=ChunkDetailOut,
+)
+def get_chunk_detail(
+    knowledge_base_id: str,
+    chunk_id: str,
+    context: int = Query(default=1, ge=0, le=5),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """片段详情：全量内容 + 前后相邻片段，用于前端原文定位预览。"""
+    _require_read(db, knowledge_base_id, current_user)
+
+    service = DocumentIndexService(db, knowledge_base_id)
+    chunk = service.management_repo.get_chunk_by_id(chunk_id)
+    if chunk is None or chunk.knowledge_base_id != knowledge_base_id:
+        raise not_found("片段不存在")
+
+    document = service.get_document(chunk.document_id)
+    document_name = (
+        document.original_filename if document is not None else "未知文档"
+    )
+
+    neighbors = service.management_repo.list_chunks_around_index(
+        chunk.document_id,
+        chunk.chunk_index,
+        before=context,
+        after=context,
+    )
+    previous: list[ChunkNeighborOut] = []
+    next_chunks: list[ChunkNeighborOut] = []
+    for item in neighbors:
+        if item.id == chunk.id:
+            continue
+        entry = ChunkNeighborOut(
+            chunk_id=item.id,
+            chunk_index=item.chunk_index,
+            content=item.content,
+            page=item.page,
+            section=item.section,
+        )
+        if item.chunk_index < chunk.chunk_index:
+            previous.append(entry)
+        else:
+            next_chunks.append(entry)
+
+    metadata_images = _chunk_images_from_metadata(chunk)
+    return ChunkDetailOut(
+        chunk_id=chunk.id,
+        document_id=chunk.document_id,
+        document_name=document_name,
+        chunk_index=chunk.chunk_index,
+        content=chunk.content,
+        page=chunk.page,
+        section=chunk.section,
+        images=metadata_images,
+        previous=previous,
+        next=next_chunks,
+    )
+
+
+def _chunk_images_from_metadata(chunk) -> list[dict]:
+    """从 chunk 的 metadata_json 中安全提取 images 列表。"""
+    import json
+
+    metadata = getattr(chunk, "metadata_json", None)
+    if not metadata:
+        return []
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return []
+    images = metadata.get("images") if isinstance(metadata, dict) else None
+    if not isinstance(images, list):
+        return []
+    return [item for item in images if isinstance(item, dict)]
 
 
 @router.get(

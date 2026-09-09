@@ -50,9 +50,9 @@ package "一、知识构建阶段" #EAF4FF {
     rectangle "代码数据源\nGit / 本地目录" as CodeSource #DCFCE7
 
     package "文档处理" #EDF7FF {
-        rectangle "文档解析\nOCR / 版面 / 结构解析" as DocumentParser #E0F2FE
-        rectangle "文档切片\n标题 / 段落 / 表格 / Token" as DocumentChunker #E0F2FE
-        rectangle "Chunk 标准化\n哈希 / 元数据 / 权限 / 版本" as ChunkNormalize #E0F2FE
+        rectangle "文档解析\n按扩展名加载\ntxt / pdf / docx / md / html" as DocumentParser #E0F2FE
+        rectangle "文档切片\n递归切分 / Token 计数\n384 / 重叠 64" as DocumentChunker #E0F2FE
+        rectangle "Chunk 标准化\nSHA-256 哈希 / 确定性 chunk_id\n元数据 / 知识库隔离" as ChunkNormalize #E0F2FE
 
         database "文档与 Chunk 库" as ChunkStore
         rectangle "Chunk 向量生成" as ChunkEmbedding #CCFBF1
@@ -125,11 +125,11 @@ package "一、知识构建阶段" #EAF4FF {
 package "二、提问与路由阶段" #F4F0FF {
 
     rectangle "用户提问" as Question #DBEAFE
-    rectangle "LLM 限制层\n认证 / 权限 / 租户隔离\n限流 / Prompt 防护" as InputGuard #FDE68A
-    rectangle "检索路由器\n规则路由 / LLM 路由\n单路或多路并行" as RetrievalRouter #DDD6FE
-    rectangle "自适应 Query Rewrite\n仅低置信度或多轮问题调用 LLM\n成功后以规则复核路由" as AdaptiveRewrite #EDE9FE
-    rectangle "共享问题向量\n只生成一次" as SharedQueryEmbedding #CCFBF1
-    rectangle "检索档位策略\n快速 / 标准 / 深度" as RetrievalPolicy #FCE7F3
+    rectangle "认证与限制层\nJWT Cookie 登录 / 知识库成员权限\nRAG 并发信号量" as InputGuard #FDE68A
+    rectangle "检索路由器 route_request\n显式通道 > 规则关键词 > 可选 LLM 回退\n解析文档/标签/目录/元数据范围" as RetrievalRouter #DDD6FE
+    rectangle "自适应 Query Rewrite\n仅低置信度(<0.75)或多轮问题调用 LLM\nroute_after_rewrite 规则复核" as AdaptiveRewrite #EDE9FE
+    rectangle "共享问题向量 embed_query\n只生成一次供全部向量索引复用" as SharedQueryEmbedding #CCFBF1
+    rectangle "检索档位策略\nfast / standard / deep\n控制各通道 K 值/跳数/预算" as RetrievalPolicy #FCE7F3
 
     User --> Question
     Question --> InputGuard
@@ -142,7 +142,7 @@ package "二、提问与路由阶段" #F4F0FF {
 package "三、多路检索与召回阶段" #EEF8F1 {
 
     package "文档检索通道" #EDF7FF {
-        rectangle "文档检索计划\n知识库 / 权限 / 元数据过滤" as DocumentRetrieval #DBEAFE
+        rectangle "文档检索计划\n范围先解析为允许的文档 ID\n再下推通道过滤" as DocumentRetrieval #DBEAFE
         rectangle "向量召回\nSemantic Top-K" as DocumentVectorRecall #CCFBF1
         rectangle "词法召回\nBM25 Top-K" as BM25Recall #FEF3C7
         rectangle "文档通道融合\nRRF / 加权融合 / 去重" as DocumentFusion #FFEDD5
@@ -226,19 +226,17 @@ package "四、融合、重排与生成阶段" #FFF5E8 {
 
     rectangle "多通道召回候选\n文档 Chunk\n图谱证据 Chunk\n代码 Symbol" as RecallCandidates #E0F2FE
 
-    rectangle "跨通道融合\n通道权重 + RRF\n统一评分 / 去重\n权限与版本过滤" as GlobalFusion #FED7AA
+    rectangle "跨通道融合 fuse\n通道权重 + 加权 RRF\n按 chunk_id 统一去重" as GlobalFusion #FED7AA
 
-    rectangle "候选重排\nCross-Encoder / Reranker" as Reranker #FBCFE8
+    rectangle "候选重排 rerank\nBGE CrossEncoder / HTTP / Passthrough\n以原始问题重排 Top-K" as Reranker #FBCFE8
 
-    rectangle "上下文组装\nToken Budget\n多样性控制 / 邻近片段补全\n来源与引用绑定" as ContextBuilder #EDE9FE
+    rectangle "上下文组装 build_context\nToken Budget × 安全比 0.85\n来源配额 / 每源 ≤2 Chunk\n引用编号与来源绑定" as ContextBuilder #EDE9FE
 
-    rectangle "生成限制层\nSystem Prompt / 上下文边界\n最大 Token / 敏感信息策略" as GenerationGuard #FDE68A
+    rectangle "回答 Prompt 组装\nSystem Prompt / 上下文边界\n历史消息块" as GenerationGuard #FDE68A
 
-    rectangle "LLM 答案生成\nGrounded Generation" as LLMGeneration #DDD6FE
+    rectangle "LLM 答案生成 generate\n同步 invoke 或 SSE 流式\n回答 + 来源 + 路由解释 + 通道状态" as LLMGeneration #DDD6FE
 
-    rectangle "答案校验\n事实一致性 / 引用检查\n无证据拒答 / 风险过滤" as AnswerValidation #FCE7F3
-
-    rectangle "最终答案\nAnswer + Citations + Trace" as FinalAnswer #BBF7D0
+    rectangle "最终答案\nAnswer + Citations + Route Trace" as FinalAnswer #BBF7D0
 
     DocumentFusion -[#2563EB]-> RecallCandidates
     GraphEvidenceRecall -[#7C3AED]-> RecallCandidates
@@ -249,24 +247,25 @@ package "四、融合、重排与生成阶段" #FFF5E8 {
     Reranker -[#7C3AED]-> ContextBuilder
     ContextBuilder -[#7C3AED]-> GenerationGuard
     GenerationGuard -[#7C3AED]-> LLMGeneration
-    LLMGeneration -[#DB2777]-> AnswerValidation
-    AnswerValidation -[#16A34A]-> FinalAnswer
+    LLMGeneration -[#16A34A]-> FinalAnswer
     FinalAnswer -[#16A34A]-> User
 }
 
 note bottom of RetrievalRouter
-路由器根据问题选择：
-1. 文档检索通道
-2. 知识图谱检索通道
-3. 代码检索通道
+route_request 按优先级选择通道：
+1. 用户显式选择的通道
+2. 规则关键词（关系/依赖/影响→graph；代码/函数/调用→code）
+3. 可选 LLM 结构化回退（默认关闭）
 
-允许单通道或多通道并行检索。
+三个检索通道在编译后的 LangGraph 中
+条件并行执行，单通道失败不影响其余通道。
 end note
 
 note bottom of GlobalFusion
 先进行通道内部融合，
 再进行跨通道融合，
 最后统一重排。
+向量服务异常时降级为词法召回 + 图遍历。
 end note
 
 note bottom of CodeGraphStore

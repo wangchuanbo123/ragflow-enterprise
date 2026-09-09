@@ -8,7 +8,7 @@ import json
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.config import INDEX_JOB_MAX_ATTEMPTS
+from app.core.config import INDEX_JOB_MAX_ATTEMPTS, INGEST_BATCH_SIZE
 from app.models.code_graph import EntityVectorIndexState
 from app.models.index_job import IndexJob
 from app.repositories.index_job_repository import IndexJobRepository
@@ -35,7 +35,10 @@ class EntityVectorService:
     ) -> IndexJob:
         repository = IndexJobRepository(self.db, self.knowledge_base_id)
         existing = repository.find_open("entity_vector_rebuild")
-        if existing is not None:
+        # A pending job will read the newest graph when it starts. If the only
+        # open job is already running, queue one follow-up so an edit that lands
+        # after its snapshot cannot be lost.
+        if existing is not None and existing.status == "pending":
             return existing
         job = repository.create(IndexJob(
             job_type="entity_vector_rebuild",
@@ -51,18 +54,21 @@ class EntityVectorService:
     def _entity_document(self, entity, aliases: list[str]):
         from langchain_core.documents import Document
 
+        def value(name: str):
+            return entity.get(name) if isinstance(entity, dict) else getattr(entity, name)
+
         return Document(
             page_content="\n".join(filter(None, [
-                entity.canonical_name,
+                value("canonical_name"),
                 "、".join(aliases),
-                entity.description,
-                f"类型：{entity.entity_type}",
+                value("description"),
+                f"类型：{value('entity_type')}",
             ])),
             metadata={
-                "entity_id": entity.id,
+                "entity_id": value("id"),
                 "knowledge_base_id": self.knowledge_base_id,
-                "entity_type": entity.entity_type,
-                "canonical_name": entity.canonical_name,
+                "entity_type": value("entity_type"),
+                "canonical_name": value("canonical_name"),
             },
         )
 
@@ -131,7 +137,11 @@ class EntityVectorService:
                 store = self.container.vector_store.open(
                     self.container.embedding.get_model(), index_ref
                 )
-                store.add_documents(documents, ids=ids)
+                for start in range(0, len(documents), INGEST_BATCH_SIZE):
+                    store.add_documents(
+                        documents[start:start + INGEST_BATCH_SIZE],
+                        ids=ids[start:start + INGEST_BATCH_SIZE],
+                    )
             state.entity_count = repository.count_entities()
             state.graph_fingerprint = ""
             state.status = "ready"
@@ -149,12 +159,16 @@ class EntityVectorService:
         }
 
     def rebuild(self) -> dict:
-        repository = KnowledgeGraphRepository(self.db, self.knowledge_base_id)
-        entities = repository.list_entities()
+        from rag.knowledge_graph.sqlite_store import SqliteGraphStore
+
+        entities = SqliteGraphStore(
+            self.db, self.knowledge_base_id
+        ).list_effective_entities()
         embedding_identity = self.container.embedding.identity().as_dict()
         embedding_fingerprint = json.dumps(embedding_identity, sort_keys=True, ensure_ascii=False)
         graph_fingerprint = hashlib.sha256("\n".join(
-            f"{entity.id}:{entity.updated_at}:{entity.canonical_name}:{entity.description or ''}"
+            f"{entity['id']}:{entity['updated_at']}:{entity['canonical_name']}:{entity['description'] or ''}:"
+            f"{','.join(entity['aliases'])}"
             for entity in entities
         ).encode("utf-8")).hexdigest()
         state = self.state()
@@ -191,12 +205,14 @@ class EntityVectorService:
         documents = []
         ids = []
         for entity in entities:
-            aliases = [alias.alias for alias in repository.get_entity_aliases(entity.id)]
-            documents.append(self._entity_document(entity, aliases))
-            ids.append(f"entity:{entity.id}")
+            documents.append(self._entity_document(entity, entity["aliases"]))
+            ids.append(f"entity:{entity['id']}")
         try:
-            if documents:
-                store.add_documents(documents, ids=ids)
+            for start in range(0, len(documents), INGEST_BATCH_SIZE):
+                store.add_documents(
+                    documents[start:start + INGEST_BATCH_SIZE],
+                    ids=ids[start:start + INGEST_BATCH_SIZE],
+                )
             state.index_name = index_name
             state.embedding_fingerprint = embedding_fingerprint
             state.graph_fingerprint = graph_fingerprint

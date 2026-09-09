@@ -1,10 +1,12 @@
 """会话相关 Pydantic 模型。"""
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
+from app.schemas.artifacts import CodeSnippet, SourceImage
 from app.schemas.message import SourceRef
 from app.schemas.rag import RouteDecisionOut
 
@@ -27,17 +29,25 @@ class MessageBrief(BaseModel):
         default_factory=list,
         validation_alias="sources_json",
     )
+    images: list[SourceImage] = Field(default_factory=list)
+    code_snippets: list[CodeSnippet] = Field(default_factory=list)
     route: RouteDecisionOut | None = Field(
         default=None,
         validation_alias="routing_json",
     )
     error_message: str | None = None
+    feedback: Literal["helpful", "unhelpful"] | None = None
     created_at: datetime
 
     @field_validator("route", mode="before")
     @classmethod
     def normalize_empty_route(cls, value):
         return value or None
+
+    @field_validator("feedback", mode="before")
+    @classmethod
+    def normalize_feedback(cls, value):
+        return getattr(value, "rating", value) if value else None
 
     model_config = {"from_attributes": True}
 

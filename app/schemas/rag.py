@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from app.core.config import RETRIEVAL_SCOPE_MAX_IDS
+from app.schemas.artifacts import CodeSnippet, SourceImage
 
 
 RetrievalChannel = Literal["text", "graph", "code"]
@@ -14,6 +15,10 @@ RetrievalStrategy = Literal["fast", "standard", "deep"]
 
 
 class RetrievalScope(BaseModel):
+    knowledge_base_ids: list[str] = Field(
+        default_factory=list,
+        max_length=RETRIEVAL_SCOPE_MAX_IDS,
+    )
     document_ids: list[str] = Field(
         default_factory=list,
         max_length=RETRIEVAL_SCOPE_MAX_IDS,
@@ -51,11 +56,14 @@ class RouteDecisionOut(BaseModel):
     strategy: RetrievalStrategy = "standard"
     rewrite: dict = Field(default_factory=dict)
     query_embedding: dict = Field(default_factory=dict)
+    knowledge_bases: list[dict] = Field(default_factory=list)
 
 
 class AskResponse(BaseModel):
     answer: str
     sources: list[dict]
+    images: list[SourceImage] = Field(default_factory=list)
+    code_snippets: list[CodeSnippet] = Field(default_factory=list)
     route: RouteDecisionOut
 
 

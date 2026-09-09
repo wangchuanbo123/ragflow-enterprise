@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from threading import Lock
 
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -57,7 +58,12 @@ class GraphBuildService:
             store = get_provider_container().graph_store(db, knowledge_base_id)
         self.store = store
         self.knowledge_repo = KnowledgeRepository(db, knowledge_base_id)
+        self._extractor_injected = extractor is not None
         self._extractor = extractor
+        # SQLite permits concurrent readers but only one writer. Extraction
+        # workers also update the persistent cache, so serialize those writes
+        # with progressive graph persistence to keep ORM sessions healthy.
+        self._db_write_lock = Lock()
         self._escalation_provider = None
         self._escalation_loaded = False
 
@@ -89,12 +95,13 @@ class GraphBuildService:
 
         schema = GraphGovernanceService(
             self.db, self.knowledge_base_id
-        ).active_schema()
+        ).extraction_schema()
         schema_version = schema.version if schema else GRAPH_SCHEMA_VERSION
         chunks = self._get_chunks_to_process(only_pending, retry_failed)
         total = len(chunks)
         succeeded = 0
         failed = 0
+        empty = 0
         skipped = 0
         errors: list[str] = []
 
@@ -115,7 +122,6 @@ class GraphBuildService:
             self.db.commit()
 
         worker_count = 1 if self._extractor is not None else GRAPH_PARALLEL_WORKERS
-        extracted: dict[int, tuple[list | None, Exception | None]] = {}
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {
                 executor.submit(self._extract_batch_cached, batch, schema): index
@@ -124,20 +130,31 @@ class GraphBuildService:
             for future in as_completed(futures):
                 index = futures[future]
                 try:
-                    extracted[index] = (future.result(), None)
+                    batch_result = (future.result(), None)
                 except Exception as exc:
-                    extracted[index] = (None, exc)
+                    batch_result = (None, exc)
 
-        extracted = self._escalate_low_signal(batches, extracted, schema)
-
-        for index, batch in enumerate(batches):
-            extractions, extraction_error = extracted[index]
-            result = self._persist_batch(
-                batch, extractions, extraction_error, schema_version, schema
-            )
-            succeeded += result["succeeded"]
-            failed += result["failed"]
-            errors.extend(result["errors"])
+                # Persist each completed batch immediately. This makes a large
+                # graph progressively visible instead of keeping every result
+                # in memory until the slowest LLM request finishes.
+                escalated = self._escalate_low_signal(
+                    [batches[index]],
+                    {0: batch_result},
+                    schema,
+                )
+                extractions, extraction_error = escalated[0]
+                with self._db_write_lock:
+                    result = self._persist_batch(
+                        batches[index],
+                        extractions,
+                        extraction_error,
+                        schema_version,
+                        schema,
+                    )
+                succeeded += result["succeeded"]
+                failed += result["failed"]
+                empty += result.get("empty", 0)
+                errors.extend(result["errors"])
 
         self.store.cleanup_orphans()
         from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
@@ -153,6 +170,7 @@ class GraphBuildService:
             "total_chunks": total,
             "succeeded": succeeded,
             "failed": failed,
+            "empty_extractions": empty,
             "skipped": skipped,
             "prefiltered_chunks": prefiltered,
             "errors": errors[:20],
@@ -438,9 +456,14 @@ class GraphBuildService:
             configure_schema(
                 entity_types=schema.entity_types_json,
                 relation_types=schema.relation_types_json,
+                relation_constraints=(
+                    (schema.generation_summary_json or {}).get(
+                        "relation_type_details", []
+                    )
+                ),
                 prompt_prefix=schema.extraction_prompt,
             )
-        if not GRAPH_CACHE_ENABLED or self._extractor is not None:
+        if not GRAPH_CACHE_ENABLED or self._extractor_injected:
             if llm_override is not None:
                 return self.extractor.extract_batch(batch, llm=llm_override)
             return self.extractor.extract_batch(batch)
@@ -455,23 +478,30 @@ class GraphBuildService:
             batch, schema_version, model_fingerprint
         )
         container = get_provider_container()
-        with container.metadata.session() as cache_db:
-            governance = GraphGovernanceService(
-                cache_db, self.knowledge_base_id, task_queue=container.task_queue
-            )
-            cached = governance.get_cached_extractions(cache_key)
+        with self._db_write_lock:
+            with container.metadata.session() as cache_db:
+                governance = GraphGovernanceService(
+                    cache_db, self.knowledge_base_id, task_queue=container.task_queue
+                )
+                cached = governance.get_cached_extractions(cache_key)
         if cached is not None:
             return cached
         extractions = self.extractor.extract_batch(
             batch, llm=llm_override
         ) if llm_override is not None else self.extractor.extract_batch(batch)
         try:
-            with container.metadata.session() as cache_db:
-                GraphGovernanceService(
-                    cache_db, self.knowledge_base_id, task_queue=container.task_queue
-                ).put_cached_extractions(
-                    cache_key, schema_version, model_fingerprint, extractions
-                )
+            with self._db_write_lock:
+                with container.metadata.session() as cache_db:
+                    GraphGovernanceService(
+                        cache_db,
+                        self.knowledge_base_id,
+                        task_queue=container.task_queue,
+                    ).put_cached_extractions(
+                        cache_key,
+                        schema_version,
+                        model_fingerprint,
+                        extractions,
+                    )
         except Exception as exc:
             logger.debug("Graph extraction cache write skipped: %s", exc)
         return extractions
@@ -503,7 +533,7 @@ class GraphBuildService:
     def _get_chunks_to_process(self, only_pending: bool, retry_failed: bool) -> list[KnowledgeChunk]:
         from app.services.graph_governance_service import GraphGovernanceService
 
-        schema = GraphGovernanceService(self.db, self.knowledge_base_id).active_schema()
+        schema = GraphGovernanceService(self.db, self.knowledge_base_id).extraction_schema()
         schema_version = schema.version if schema else GRAPH_SCHEMA_VERSION
         statuses = ["pending"]
         if retry_failed:
@@ -539,7 +569,7 @@ class GraphBuildService:
 
     def _process_batch(self, batch: list[dict]) -> dict:
         from app.services.graph_governance_service import GraphGovernanceService
-        schema = GraphGovernanceService(self.db, self.knowledge_base_id).active_schema()
+        schema = GraphGovernanceService(self.db, self.knowledge_base_id).extraction_schema()
         schema_version = schema.version if schema else GRAPH_SCHEMA_VERSION
         for chunk_data in batch:
             chunk_id = chunk_data["chunk_id"]
@@ -558,6 +588,7 @@ class GraphBuildService:
     def _persist_batch(self, batch, extractions, extraction_error, schema_version, schema) -> dict:
         succeeded = 0
         failed = 0
+        empty = 0
         errors: list[str] = []
         chunks_by_id = {
             item["chunk_id"]: self.db.get(KnowledgeChunk, item["chunk_id"])
@@ -570,7 +601,12 @@ class GraphBuildService:
                 chunk.graph_error = str(extraction_error)[:500]
                 errors.append(f"{chunk_id}: {str(extraction_error)[:200]}")
             self.db.commit()
-            return {"succeeded": 0, "failed": len(chunks_by_id), "errors": errors}
+            return {
+                "succeeded": 0,
+                "failed": len(chunks_by_id),
+                "empty": 0,
+                "errors": errors,
+            }
         extractions_by_id = {extraction.chunk_id: extraction for extraction in (extractions or [])}
         allowed_entities = set(schema.entity_types_json) if schema else None
         allowed_relations = set(schema.relation_types_json) if schema else None
@@ -601,6 +637,9 @@ class GraphBuildService:
                     }
                 )
 
+                if not extraction.entities and not extraction.relations:
+                    empty += 1
+
                 # Always replace the old result. An empty new extraction must
                 # remove graph facts left by an older schema or model.
                 self.store.upsert_extraction(chunk_data, extraction)
@@ -611,6 +650,7 @@ class GraphBuildService:
                 chunk.graph_error = None
                 succeeded += 1
             except Exception as exc:
+                self.db.rollback()
                 chunk.graph_status = "failed"
                 chunk.graph_error = str(exc)[:500]
                 failed += 1
@@ -619,4 +659,9 @@ class GraphBuildService:
 
             self.db.commit()
 
-        return {"succeeded": succeeded, "failed": failed, "errors": errors}
+        return {
+            "succeeded": succeeded,
+            "failed": failed,
+            "empty": empty,
+            "errors": errors,
+        }

@@ -1,22 +1,30 @@
 <script setup lang="ts">
-import { computed, onMounted, watch } from 'vue'
-import type { RetrievalStrategy } from '../types'
+import { computed, onMounted, ref, watch } from 'vue'
+import * as api from '../api/client'
+import type { Folder, KnowledgeBase, KnowledgeDocument, RetrievalScope, RetrievalStrategy, Tag } from '../types'
 import { useConversations } from '../composables/useConversations'
 import ConversationSidebar from './ConversationSidebar.vue'
 import MessageList from './MessageList.vue'
 
-const props = defineProps<{ knowledgeBaseId: string }>()
+const props = defineProps<{ knowledgeBaseId: string; knowledgeBases: KnowledgeBase[] }>()
 const conv = useConversations()
+const documents = ref<KnowledgeDocument[]>([])
+const folders = ref<Folder[]>([])
+const tags = ref<Tag[]>([])
 const visibleConversations = computed(() =>
   conv.conversations.value.filter((item) => item.knowledge_base_id === props.knowledgeBaseId),
 )
 
-onMounted(() => {
-  conv.loadList()
-})
+async function loadScopeOptions():Promise<void>{
+  ;[documents.value,folders.value,tags.value]=await Promise.all([
+    api.listDocuments(props.knowledgeBaseId),api.listFolders(props.knowledgeBaseId),api.listTags(props.knowledgeBaseId),
+  ])
+}
 
-function onSend(payload: { content: string; strategy: RetrievalStrategy }): void {
-  void conv.send(payload.content, payload.strategy)
+onMounted(() => { void conv.loadList(); void loadScopeOptions() })
+
+function onSend(payload: { content: string; strategy: RetrievalStrategy; scope?: Partial<RetrievalScope> }): void {
+  void conv.send(payload.content, payload.strategy, payload.scope)
 }
 
 function onCreate(): void {
@@ -29,6 +37,7 @@ watch(() => props.knowledgeBaseId, () => {
     conv.activeId.value = null
     conv.resetDetail()
   }
+  void loadScopeOptions()
 })
 </script>
 
@@ -58,7 +67,14 @@ watch(() => props.knowledgeBaseId, () => {
         :messages="conv.messages.value"
         :loading="conv.loadingDetail.value"
         :sending="conv.sending.value"
+        :knowledge-base-id="knowledgeBaseId"
+        :knowledge-bases="knowledgeBases"
+        :documents="documents"
+        :folders="folders"
+        :tags="tags"
         @retry="onSend"
+        @stop="conv.stop"
+        @feedback="({messageId,rating})=>conv.feedback(messageId,rating)"
       />
     </div>
   </div>

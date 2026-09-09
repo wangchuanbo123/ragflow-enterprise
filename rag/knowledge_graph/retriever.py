@@ -125,19 +125,13 @@ class KnowledgeGraphRetriever:
                         float(item.get("match_score", 0)),
                     )
                 else:
-                    from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
-
-                    model = KnowledgeGraphRepository(
-                        self.db, self.knowledge_base_id
-                    ).get_entity(entity_id)
+                    model = next((
+                        candidate for candidate in store.list_effective_entities()
+                        if candidate["id"] == entity_id
+                    ), None)
                     if model:
                         by_id[entity_id] = {
-                            "id": model.id,
-                            "entity_type": model.entity_type,
-                            "canonical_name": model.canonical_name,
-                            "normalized_name": model.normalized_name,
-                            "description": model.description,
-                            "aliases": [],
+                            **model,
                             "match_score": float(item.get("match_score", 0)),
                         }
             entities = sorted(
@@ -208,6 +202,7 @@ class KnowledgeGraphRetriever:
 
         relation_seed_scores: dict[str, float] = {}
         entity_ids = [entity["id"] for entity in entities]
+        matched_entity_ids = list(entity_ids)
         for index, relation in enumerate(relation_seeds):
             score = max(
                 0.0,
@@ -230,12 +225,11 @@ class KnowledgeGraphRetriever:
         for relation in traversed:
             relations_by_id.setdefault(relation["relation_id"], relation)
         relations = list(relations_by_id.values())[:policy.graph_max_relations]
-        if not relations:
-            return []
 
-        # Step 4: map relations back to source chunks via evidence.
+        # Step 4: map relations and entity mentions back to real source chunks.
         relation_ids = [r["relation_id"] for r in relations]
         evidence = store.get_relation_evidence(relation_ids)
+        entity_evidence = store.get_entity_evidence(matched_entity_ids)
 
         # Build chunk -> graph_facts mapping
         chunk_facts: dict[str, list[str]] = {}
@@ -269,6 +263,20 @@ class KnowledgeGraphRetriever:
                     else endpoint_score * math.pow(0.75, hop)
                 ) * rel["confidence"]
                 chunk_scores[cid] = max(chunk_scores.get(cid, 0), graph_score)
+
+        for ev in entity_evidence:
+            cid = ev["chunk_id"]
+            if cid not in chunk_facts:
+                chunk_facts[cid] = []
+                chunk_match_methods[cid] = set()
+            fact = f"实体：{ev['entity_name']}（{ev['entity_type']}）"
+            if fact not in chunk_facts[cid]:
+                chunk_facts[cid].append(fact)
+            chunk_match_methods[cid].add("entity_mention")
+            entity_score = max(
+                float(seed_scores.get(ev["entity_id"], 0.5)), 0.5
+            ) * float(ev["confidence"])
+            chunk_scores[cid] = max(chunk_scores.get(cid, 0), entity_score)
 
         if not chunk_facts:
             return []

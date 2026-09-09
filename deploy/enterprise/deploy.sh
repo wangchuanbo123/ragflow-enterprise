@@ -65,7 +65,7 @@ validate_env() {
     failed=1
   fi
   value="$(env_value INITIAL_ADMIN_PASSWORD)"
-  if (( ${#value} < 12 )); then
+  if [[ "$(env_value ALLOW_WEAK_INITIAL_ADMIN_PASSWORD)" != "true" ]] && (( ${#value} < 12 )); then
     printf 'INITIAL_ADMIN_PASSWORD must contain at least 12 characters.\n' >&2
     failed=1
   fi

@@ -43,6 +43,8 @@ class CodeGraphRetriever:
 
         with SessionLocal() as db:
             repository = CodeGraphRepository(db, self.knowledge_base_id)
+            active_snapshot = repository.active_snapshot()
+            revision = active_snapshot.revision if active_snapshot else ""
             try:
                 symbols = CodeVectorService(
                     db, self.knowledge_base_id
@@ -79,8 +81,28 @@ class CodeGraphRetriever:
                 symbol.get("source_excerpt") or "",
                 *fact_lines,
             ]).strip()
+            document_source = (symbol.get("metadata") or {}).get("document_source") or {}
+            source_excerpt = symbol.get("source_excerpt") or ""
+            code_snippets = []
+            if source_excerpt:
+                code_snippets.append({
+                    "content": source_excerpt,
+                    "language": symbol["language"],
+                    "path": symbol["path"],
+                    "start_line": symbol["start_line"],
+                    "end_line": symbol["end_line"],
+                    "line_scope": "file",
+                    "revision": revision,
+                    "origin": "document" if document_source else "repository",
+                    "document_id": document_source.get("document_id", ""),
+                    "chunk_index": document_source.get("chunk_index"),
+                    "symbol_id": symbol["id"],
+                    "qualified_name": symbol["qualified_name"],
+                    "is_verbatim": True,
+                })
             documents.append(Document(page_content=content, metadata={
                 "source": symbol["path"],
+                "knowledge_base_id": self.knowledge_base_id,
                 "document_id": f'code:{symbol["snapshot_id"]}',
                 "chunk_id": f'code-symbol:{symbol["id"]}',
                 "symbol_id": symbol["id"],
@@ -93,6 +115,8 @@ class CodeGraphRetriever:
                 "retrieval_methods": symbol.get("retrieval_methods", ["lexical"]),
                 "vector_match_types": symbol.get("vector_match_types", []),
                 "functional_summary": symbol.get("functional_summary"),
+                "contains_code": bool(source_excerpt),
+                "code_snippets": code_snippets,
                 "_channel": "code",
             }))
         return documents

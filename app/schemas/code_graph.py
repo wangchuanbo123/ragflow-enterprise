@@ -25,6 +25,22 @@ class CodeSnapshotOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class CodeSnapshotDiffOut(BaseModel):
+    base_snapshot_id: str
+    target_snapshot_id: str
+    added_files: list[str] = Field(default_factory=list)
+    modified_files: list[str] = Field(default_factory=list)
+    deleted_files: list[str] = Field(default_factory=list)
+    unchanged_files: int = 0
+
+
+class CodeFileIssueOut(BaseModel):
+    path: str
+    language: str
+    status: str
+    errors: list[str] = Field(default_factory=list)
+
+
 class CodeSymbolOut(BaseModel):
     id: str
     snapshot_id: str

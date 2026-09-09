@@ -11,13 +11,24 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.core.config import CODE_MAX_FILE_SIZE_MB, CODE_PARSE_WORKERS, CODE_SNAPSHOT_RETENTION
+from app.core.config import (
+    CODE_MAX_FILE_SIZE_MB,
+    CODE_PARSE_WORKERS,
+    CODE_SNAPSHOT_RETENTION,
+    DOCUMENT_CODE_MAX_BLOCKS,
+    DOCUMENT_CODE_MIN_BLOCK_LINES,
+)
 from app.core.config import INDEX_JOB_MAX_ATTEMPTS
 from app.models.code_graph import CodeFile, CodeRelation, CodeSnapshot, CodeSymbol
 from app.models.index_job import IndexJob
 from app.repositories.code_graph_repository import CodeGraphRepository
 from app.repositories.index_job_repository import IndexJobRepository
 from app.repositories.knowledge_base_repository import KnowledgeBaseRepository
+from rag.code_graph.document_source import (
+    document_code_parser_version,
+    extract_document_code,
+    manifest_for_document_chunks,
+)
 from rag.code_graph.parser import PARSER_VERSION, CodeParser
 
 
@@ -84,6 +95,7 @@ class CodeIndexService:
         *,
         data_source_id: str | None = None,
         revision: str = "working-tree",
+        merge_document_code: bool = False,
     ) -> dict:
         root_path = Path(root).resolve()
         candidates = [
@@ -102,12 +114,96 @@ class CodeIndexService:
             digest = hashlib.sha256(data).hexdigest()
             manifest.append((relative, digest))
             source_by_path[relative] = data
+        doc_stats: dict = {}
+        from app.core import config as _config
+
+        if merge_document_code and _config.DOCUMENT_CODE_GRAPH_ENABLED:
+            doc_manifest, doc_sources, doc_stats = self._collect_document_code()
+            known_paths = {path for path, _ in manifest}
+            for path, digest in doc_manifest:
+                if path in known_paths:
+                    continue
+                manifest.append((path, digest))
+                source_by_path[path] = doc_sources[path]
+        return self._build_snapshot_from_manifest(
+            manifest,
+            source_by_path,
+            data_source_id=data_source_id,
+            revision=revision,
+            extra_stats=doc_stats if doc_stats else None,
+        )
+
+    @staticmethod
+    def _combined_parser_version() -> str:
+        """目录解析版本 + 文档代码提取版本；任一升级都会触发全量重建。"""
+        return f"{PARSER_VERSION}+{document_code_parser_version()}"
+
+    def _collect_document_code(
+        self,
+    ) -> tuple[list[tuple[str, str]], dict[str, bytes], dict]:
+        """从当前知识库的 ready 文档 chunk 里提取代码块。"""
+        from app.repositories.knowledge_repository import KnowledgeRepository
+
+        repo = KnowledgeRepository(self.db, self.knowledge_base_id)
+        chunk_contents: list[tuple[str, int, str]] = []
+        for document in repo.list_ready_documents():
+            for chunk in repo.list_chunks_for_document(document.id):
+                chunk_contents.append((document.id, chunk.chunk_index, chunk.content))
+
+        parsed_files = extract_document_code(
+            chunk_contents,
+            self.parser,
+            max_blocks=DOCUMENT_CODE_MAX_BLOCKS,
+            min_block_lines=DOCUMENT_CODE_MIN_BLOCK_LINES,
+        )
+        manifest, source_by_path = manifest_for_document_chunks(parsed_files)
+        stats = {
+            "documents": len({doc_id for doc_id, _, _ in chunk_contents}),
+            "code_blocks": len(parsed_files),
+        }
+        return manifest, source_by_path, stats
+
+    def index_document_code(self) -> dict:
+        """只从已入库文档构建代码图谱（无目录代码源时的独立入口）。
+
+        - 若当前活动快照属于某个目录/Git 数据源：在其根目录已不可用时无法
+          重新读取源码，因此这里只重建纯文档快照并接管活动位；
+        - 否则直接以文档代码为唯一 manifest 构建快照。
+        """
+        from app.core import config as _config
+
+        if not _config.DOCUMENT_CODE_GRAPH_ENABLED:
+            return {"status": "disabled"}
+
+        doc_manifest, doc_sources, doc_stats = self._collect_document_code()
+        if not doc_manifest:
+            return {"status": "no_code_blocks", **doc_stats}
+
+        return self._build_snapshot_from_manifest(
+            doc_manifest,
+            doc_sources,
+            data_source_id=None,
+            revision="documents",
+            extra_stats=doc_stats,
+        )
+
+    def _build_snapshot_from_manifest(
+        self,
+        manifest: list[tuple[str, str]],
+        source_by_path: dict[str, bytes],
+        *,
+        data_source_id: str | None,
+        revision: str,
+        extra_stats: dict | None = None,
+    ) -> dict:
         content_hash = hashlib.sha256(
             "\n".join(f"{path}:{digest}" for path, digest in manifest).encode("utf-8")
         ).hexdigest()
         active = self.repository.active_snapshot()
         same_source = bool(active and active.data_source_id == data_source_id)
-        same_parser = bool(active and active.parser_version == PARSER_VERSION)
+        same_parser = bool(
+            active and active.parser_version == self._combined_parser_version()
+        )
         if (
             active
             and active.content_hash == content_hash
@@ -139,7 +235,7 @@ class CodeIndexService:
             data_source_id=data_source_id,
             revision=revision,
             content_hash=content_hash,
-            parser_version=PARSER_VERSION,
+            parser_version=self._combined_parser_version(),
             status="building",
         ))
         try:
@@ -230,6 +326,7 @@ class CodeIndexService:
                 "files_reused": len(reused_paths),
                 "files_parsed": len(parsed_paths),
                 "files_deleted": len(deleted_paths),
+                **(extra_stats or {}),
             }
             self.repository.activate_snapshot(snapshot, stats)
             self.repository.prune_snapshots(CODE_SNAPSHOT_RETENTION)

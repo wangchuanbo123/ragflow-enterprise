@@ -29,7 +29,11 @@ class BgeReranker:
         scores = self._model.predict(pairs)
         ranked = sorted(zip(docs, scores), key=lambda item: item[1], reverse=True)
         limit = self.default_top_k if top_k is None else top_k
-        return [doc for doc, _ in ranked[:limit]]
+        result: list[Document] = []
+        for doc, score in ranked[:limit]:
+            doc.metadata = {**doc.metadata, "rerank_score": float(score)}
+            result.append(doc)
+        return result
 
     def identity(self) -> ProviderIdentity:
         return ProviderIdentity(

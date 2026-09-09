@@ -18,7 +18,7 @@ from app.models.knowledge_graph import (
     KgRelation,
     KgRelationEvidence,
 )
-from app.models.graph_governance import KgEntityMerge
+from app.models.graph_governance import GraphSchemaDefinition, KgEntityMerge
 from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 from rag.knowledge_graph.normalizer import normalize_alias, normalize_name
 from rag.knowledge_graph.relation_vocabulary import relation_query_scores
@@ -83,6 +83,93 @@ class SqliteGraphStore:
             resolved[source] = current
         return resolved
 
+    def _relation_vocabulary(self) -> dict[str, dict[str, object]]:
+        """Combine built-in aliases with the active Schema's domain vocabulary."""
+        from rag.knowledge_graph.relation_vocabulary import RELATION_VOCABULARY
+
+        vocabulary = {
+            key: {**value} for key, value in RELATION_VOCABULARY.items()
+        }
+        schema = self.db.scalar(select(GraphSchemaDefinition).where(
+            GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+            GraphSchemaDefinition.status == "active",
+        ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
+        if schema is None:
+            return vocabulary
+        details = (schema.generation_summary_json or {}).get("relation_type_details") or []
+        detail_by_name = {
+            str(item.get("name", "")).upper(): item
+            for item in details if isinstance(item, dict)
+        }
+        for predicate in schema.relation_types_json or []:
+            name = str(predicate).upper()
+            detail = detail_by_name.get(name, {})
+            existing = vocabulary.get(name, {})
+            aliases = [
+                *existing.get("aliases", ()),
+                *(detail.get("aliases") or []),
+                detail.get("label", ""),
+            ]
+            vocabulary[name] = {
+                "label": detail.get("label") or existing.get("label") or name.replace("_", " "),
+                "description": detail.get("description") or existing.get("description") or "",
+                "aliases": tuple(dict.fromkeys(str(item) for item in aliases if item)),
+            }
+        return vocabulary
+
+    def list_effective_entities(self) -> list[dict]:
+        """Return canonical entities after corrections and entity merges."""
+        entities = list(self.db.scalars(select(KgEntity).where(
+            KgEntity.knowledge_base_id == self.knowledge_base_id
+        ).order_by(KgEntity.id)))
+        aliases_by_entity: dict[str, list[str]] = {}
+        for alias in self.db.scalars(select(KgAlias).where(
+            KgAlias.knowledge_base_id == self.knowledge_base_id
+        )):
+            aliases_by_entity.setdefault(alias.entity_id, []).append(alias.alias)
+        overrides = self._entity_overrides()
+        merge_map = self._merge_map()
+        entities_by_id = {entity.id: entity for entity in entities}
+        grouped: dict[str, list[KgEntity]] = {}
+        for entity in entities:
+            grouped.setdefault(merge_map.get(entity.id, entity.id), []).append(entity)
+        result: list[dict] = []
+        for canonical_id, group in grouped.items():
+            canonical = entities_by_id.get(canonical_id)
+            if canonical is None:
+                continue
+            override = overrides.get(canonical.id, {})
+            aliases: list[str] = []
+            for member in group:
+                aliases.extend(aliases_by_entity.get(member.id, []))
+                if member.id != canonical.id:
+                    aliases.append(overrides.get(member.id, {}).get(
+                        "canonical_name", member.canonical_name
+                    ))
+            canonical_name = override.get("canonical_name", canonical.canonical_name)
+            result.append({
+                "id": canonical.id,
+                "entity_type": canonical.entity_type,
+                "canonical_name": canonical_name,
+                "normalized_name": normalize_name(canonical_name),
+                "description": override.get("description", canonical.description),
+                "aliases": list(dict.fromkeys(
+                    item for item in aliases if item and item != canonical_name
+                )),
+                "updated_at": str(canonical.updated_at),
+            })
+        return result
+
+    def list_effective_relations(self) -> list[dict]:
+        base_ids = list(self.db.scalars(select(KgRelation.id).where(
+            KgRelation.knowledge_base_id == self.knowledge_base_id
+        ).order_by(KgRelation.id)))
+        manual_ids = [
+            f"manual:{item.id}" for item in self._active_corrections()
+            if item.action == "add_relation"
+        ]
+        return self.get_relations([*base_ids, *manual_ids])
+
     def upsert_extraction(
         self,
         chunk: dict,
@@ -114,6 +201,26 @@ class SqliteGraphStore:
                     KgEntity.normalized_name == norm,
                 )
             )
+
+            # A later chunk may use an abbreviation that an earlier extraction
+            # already registered as an alias. Reuse that entity only when the
+            # alias resolves uniquely inside the same type and knowledge base;
+            # ambiguous aliases remain separate and enter the review workflow.
+            if existing is None:
+                alias_matches = list(self.db.scalars(
+                    select(KgEntity)
+                    .join(KgAlias, KgAlias.entity_id == KgEntity.id)
+                    .where(
+                        KgEntity.knowledge_base_id == self.knowledge_base_id,
+                        KgEntity.entity_type == ent.type,
+                        KgAlias.knowledge_base_id == self.knowledge_base_id,
+                        KgAlias.normalized_alias == norm,
+                    )
+                    .distinct()
+                    .limit(2)
+                ))
+                if len(alias_matches) == 1:
+                    existing = alias_matches[0]
 
             if existing:
                 entity = existing
@@ -396,23 +503,26 @@ class SqliteGraphStore:
 
             next_layer: set[str] = set()
 
-            rels_as_subj = self.db.scalars(
+            blocked = list(visited | current)
+            relations = self.db.scalars(
                 select(KgRelation).where(
                     KgRelation.knowledge_base_id == self.knowledge_base_id,
-                    KgRelation.subject_entity_id.in_(list(current)),
-                    KgRelation.object_entity_id.notin_(list(visited | current)),
-                ).order_by(KgRelation.id).limit(fetch_limit - count)
+                    or_(
+                        (
+                            KgRelation.subject_entity_id.in_(list(current))
+                            & KgRelation.object_entity_id.notin_(blocked)
+                        ),
+                        (
+                            KgRelation.object_entity_id.in_(list(current))
+                            & KgRelation.subject_entity_id.notin_(blocked)
+                        ),
+                    ),
+                )
+                .order_by(KgRelation.confidence.desc(), KgRelation.id)
+                .limit(fetch_limit - count)
             ).all()
 
-            rels_as_obj = self.db.scalars(
-                select(KgRelation).where(
-                    KgRelation.knowledge_base_id == self.knowledge_base_id,
-                    KgRelation.object_entity_id.in_(list(current)),
-                    KgRelation.subject_entity_id.notin_(list(visited | current)),
-                ).order_by(KgRelation.id).limit(fetch_limit - count)
-            ).all()
-
-            for rel in list(rels_as_subj) + list(rels_as_obj):
+            for rel in relations:
                 if count >= fetch_limit:
                     break
                 subj = self.db.get(KgEntity, rel.subject_entity_id)
@@ -480,25 +590,30 @@ class SqliteGraphStore:
             object_id = payload.get("object_entity_id")
             if subject_id not in relevant_entity_ids and object_id not in relevant_entity_ids:
                 continue
+            relation_id = f"manual:{correction.id}"
+            if relation_id in hidden:
+                continue
             subject = self.db.get(KgEntity, subject_id)
             obj = self.db.get(KgEntity, object_id)
             if subject is None or obj is None:
                 continue
             subject_override = entity_overrides.get(subject.id, {})
             object_override = entity_overrides.get(obj.id, {})
+            updated = relation_updates.get(relation_id)
+            update_payload = (updated.payload_json or {}) if updated else {}
             overlaid.append({
-                "relation_id": f"manual:{correction.id}",
+                "relation_id": relation_id,
                 "hop": 1,
                 "subject_id": subject.id,
                 "subject_name": subject_override.get("canonical_name", subject.canonical_name),
                 "subject_type": subject.entity_type,
-                "predicate": payload["predicate"],
+                "predicate": update_payload.get("predicate", payload["predicate"]),
                 "object_id": obj.id,
                 "object_name": object_override.get("canonical_name", obj.canonical_name),
                 "object_type": obj.entity_type,
-                "confidence": float(payload.get("confidence", 1.0)),
+                "confidence": float(update_payload.get("confidence", payload.get("confidence", 1.0))),
                 "manual": True,
-                "correction_id": correction.id,
+                "correction_id": updated.id if updated else correction.id,
             })
         merge_map = self._merge_map()
         merged_relations: dict[tuple[str, str, str], dict] = {}
@@ -528,7 +643,7 @@ class SqliteGraphStore:
 
     def search_relations(self, query: str, limit: int = 20) -> list[dict]:
         """Match relation predicates using canonical names and multilingual aliases."""
-        scores = relation_query_scores(query)
+        scores = relation_query_scores(query, self._relation_vocabulary())
         if not scores or limit <= 0:
             return []
 
@@ -642,23 +757,28 @@ class SqliteGraphStore:
                 object_entity = self.db.get(KgEntity, payload.get("object_entity_id"))
                 if subject_entity is None or object_entity is None:
                     continue
+                relation_id = f"manual:{correction.id}"
+                if relation_id in hidden:
+                    continue
+                update = relation_updates.get(relation_id)
+                update_payload = (update.payload_json or {}) if update else {}
                 items.append({
-                    "relation_id": f"manual:{correction.id}",
+                    "relation_id": relation_id,
                     "hop": 0,
                     "subject_id": subject_entity.id,
                     "subject_name": entity_overrides.get(subject_entity.id, {}).get(
                         "canonical_name", subject_entity.canonical_name
                     ),
                     "subject_type": subject_entity.entity_type,
-                    "predicate": payload["predicate"],
+                    "predicate": update_payload.get("predicate", payload["predicate"]),
                     "object_id": object_entity.id,
                     "object_name": entity_overrides.get(object_entity.id, {}).get(
                         "canonical_name", object_entity.canonical_name
                     ),
                     "object_type": object_entity.entity_type,
-                    "confidence": float(payload.get("confidence", 1.0)),
+                    "confidence": float(update_payload.get("confidence", payload.get("confidence", 1.0))),
                     "manual": True,
-                    "correction_id": correction.id,
+                    "correction_id": update.id if update else correction.id,
                 })
 
         merge_map = self._merge_map()
@@ -737,6 +857,42 @@ class SqliteGraphStore:
                 })
         return result
 
+    def get_entity_evidence(self, entity_ids: list[str]) -> list[dict]:
+        """Map effective entity ids to real source chunks through mentions."""
+        if not entity_ids:
+            return []
+        requested = set(entity_ids)
+        merge_map = self._merge_map()
+        source_ids = requested | {
+            source for source, canonical in merge_map.items() if canonical in requested
+        }
+        mentions = list(self.db.scalars(select(KgEntityMention).where(
+            KgEntityMention.knowledge_base_id == self.knowledge_base_id,
+            KgEntityMention.entity_id.in_(source_ids),
+        )))
+        effective_by_id = {
+            item["id"]: item for item in self.list_effective_entities()
+        }
+        result = []
+        seen: set[tuple[str, str]] = set()
+        for mention in mentions:
+            entity_id = merge_map.get(mention.entity_id, mention.entity_id)
+            entity = effective_by_id.get(entity_id)
+            key = (entity_id, mention.chunk_id)
+            if entity is None or key in seen:
+                continue
+            seen.add(key)
+            result.append({
+                "entity_id": entity_id,
+                "entity_name": entity["canonical_name"],
+                "entity_type": entity["entity_type"],
+                "document_id": mention.document_id,
+                "chunk_id": mention.chunk_id,
+                "mention": mention.mention,
+                "confidence": float(mention.confidence),
+            })
+        return result
+
     def get_document_subgraph(self, document_id: str, limit: int = 200) -> dict:
         """Return entities and relations supported by a document's evidence."""
         mentions = list(self.db.scalars(
@@ -745,21 +901,44 @@ class SqliteGraphStore:
                 KgEntityMention.document_id == document_id,
             )
         ))
+        # Rank relations rather than raw evidence rows. A heavily cited relation
+        # must not consume the whole visual budget and hide every other fact.
+        relation_ids = list(self.db.scalars(
+            select(KgRelationEvidence.relation_id)
+            .where(
+                KgRelationEvidence.knowledge_base_id == self.knowledge_base_id,
+                KgRelationEvidence.document_id == document_id,
+            )
+            .group_by(KgRelationEvidence.relation_id)
+            .order_by(
+                func.max(KgRelationEvidence.confidence).desc(),
+                KgRelationEvidence.relation_id,
+            )
+            .limit(limit)
+        ))
         evidence = list(self.db.scalars(
             select(KgRelationEvidence).where(
                 KgRelationEvidence.knowledge_base_id == self.knowledge_base_id,
                 KgRelationEvidence.document_id == document_id,
-            ).limit(limit)
-        ))
-        relation_ids = list(dict.fromkeys(item.relation_id for item in evidence))
+                KgRelationEvidence.relation_id.in_(relation_ids),
+            )
+        )) if relation_ids else []
         relations = []
         if relation_ids:
-            relations = list(self.db.scalars(
+            relation_by_id = {
+                relation.id: relation
+                for relation in self.db.scalars(
                 select(KgRelation).where(
                     KgRelation.knowledge_base_id == self.knowledge_base_id,
                     KgRelation.id.in_(relation_ids),
                 )
-            ))
+                )
+            }
+            relations = [
+                relation_by_id[relation_id]
+                for relation_id in relation_ids
+                if relation_id in relation_by_id
+            ]
 
         entity_ids = {item.entity_id for item in mentions}
         for relation in relations:
@@ -836,19 +1015,24 @@ class SqliteGraphStore:
             })
         for correction in manual_relations:
             payload = correction.payload_json or {}
+            relation_id = f"manual:{correction.id}"
+            if relation_id in hidden:
+                continue
+            updated = relation_updates.get(relation_id)
+            update_payload = (updated.payload_json or {}) if updated else {}
             edges.append({
-                "id": f"manual:{correction.id}",
+                "id": relation_id,
                 "source": payload["subject_entity_id"],
                 "target": payload["object_entity_id"],
-                "predicate": payload["predicate"],
-                "confidence": float(payload.get("confidence", 1.0)),
+                "predicate": update_payload.get("predicate", payload["predicate"]),
+                "confidence": float(update_payload.get("confidence", payload.get("confidence", 1.0))),
                 "evidence": [{
                     "chunk_id": payload.get("chunk_id") or f"manual:{correction.id}",
                     "quote": payload.get("evidence", correction.reason),
                     "confidence": float(payload.get("confidence", 1.0)),
                 }],
                 "manual": True,
-                "correction_id": correction.id,
+                "correction_id": updated.id if updated else correction.id,
             })
 
         return {

@@ -1,9 +1,13 @@
 import type {
   ApiError,
+  ChunkDetail,
   Conversation,
   ConversationDetail,
   CodeGraphStats,
+  CodeSnippet,
+  CodeFileIssue,
   CodeSnapshot,
+  CodeSnapshotDiff,
   CodeSubgraph,
   CodeSymbol,
   DataSource,
@@ -24,11 +28,16 @@ import type {
   IndexJob,
   KnowledgeBase,
   KnowledgeBaseMember,
+  KnowledgeBackup,
+  BackupSettings,
   KnowledgeDocument,
   Message,
   Readiness,
   RetrievalDebugResult,
   RouteDecision,
+  SearchHit,
+  SourceItem,
+  SourceImage,
   Tag,
   User,
 } from '../types'
@@ -51,11 +60,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (init.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
-  const res = await fetch(`${BASE}${path}`, {
-    ...init,
-    headers,
-    credentials: 'include',
-  })
+  let res: Response
+  try {
+    res = await fetch(`${BASE}${path}`, { ...init, headers, credentials: 'include' })
+  } catch {
+    throw new Error('无法连接到服务，请检查服务是否已启动或稍后重试')
+  }
   if (!res.ok) throw new Error(await parseError(res))
   if (res.status === 204) return undefined as T
   return (await res.json()) as T
@@ -84,6 +94,18 @@ export function listKnowledgeBases(): Promise<KnowledgeBase[]> {
   return request('/knowledge-bases')
 }
 
+export function createKnowledgeBase(payload: { name: string; slug?: string | null; description?: string | null }): Promise<KnowledgeBase> {
+  return request('/knowledge-bases', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export function updateKnowledgeBase(knowledgeBaseId: string, payload: { name?: string; slug?: string; description?: string | null }): Promise<KnowledgeBase> {
+  return request(`/knowledge-bases/${knowledgeBaseId}`, { method: 'PATCH', body: JSON.stringify(payload) })
+}
+
+export function archiveKnowledgeBase(knowledgeBaseId: string): Promise<void> {
+  return request(`/knowledge-bases/${knowledgeBaseId}`, { method: 'DELETE' })
+}
+
 export function listKnowledgeBaseMembers(knowledgeBaseId: string): Promise<KnowledgeBaseMember[]> {
   return request(`/knowledge-bases/${knowledgeBaseId}/members`)
 }
@@ -101,6 +123,31 @@ export function upsertKnowledgeBaseMember(
 
 export function removeKnowledgeBaseMember(knowledgeBaseId: string, userId: string): Promise<void> {
   return request(`/knowledge-bases/${knowledgeBaseId}/members/${userId}`, { method: 'DELETE' })
+}
+
+export function listBackups(knowledgeBaseId: string): Promise<KnowledgeBackup[]> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/backups`)
+}
+
+export function getBackupSettings(knowledgeBaseId: string): Promise<BackupSettings> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/backup-settings`)
+}
+
+export function createBackup(
+  knowledgeBaseId: string,
+  payload: { backup_type: 'knowledge_base' | 'document_graph'; document_id?: string | null; label?: string | null },
+): Promise<KnowledgeBackup> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/backups`, {
+    method: 'POST', body: JSON.stringify(payload),
+  })
+}
+
+export function restoreBackup(knowledgeBaseId: string, backupId: string): Promise<KnowledgeBackup> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/backups/${backupId}/restore`, { method: 'POST' })
+}
+
+export function deleteBackup(knowledgeBaseId: string, backupId: string): Promise<void> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/backups/${backupId}`, { method: 'DELETE' })
 }
 
 export function listDataSources(knowledgeBaseId: string): Promise<DataSource[]> {
@@ -163,6 +210,17 @@ export function createConversation(
 
 export function getConversation(id: string): Promise<ConversationDetail> {
   return request(`/conversations/${id}`)
+}
+
+export function saveMessageFeedback(
+  conversationId: string,
+  messageId: string,
+  rating: 'helpful' | 'unhelpful',
+  comment?: string | null,
+): Promise<{ message_id: string; rating: 'helpful' | 'unhelpful'; comment: string | null }> {
+  return request(`/conversations/${conversationId}/messages/${messageId}/feedback`, {
+    method: 'PUT', body: JSON.stringify({ rating, comment: comment || null }),
+  })
 }
 
 export function renameConversation(id: string, title: string): Promise<Conversation> {
@@ -228,6 +286,45 @@ export function listDocumentChunks(knowledgeBaseId: string, documentId: string):
   return request(`/knowledge-bases/${knowledgeBaseId}/documents/${documentId}/chunks?limit=200`)
 }
 
+export function searchKnowledgeBase(knowledgeBaseId: string, query: string, limit = 20): Promise<SearchHit[]> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/search?query=${encodeURIComponent(query)}&limit=${limit}`)
+}
+
+export function getChunkDetail(knowledgeBaseId: string, chunkId: string, context = 1): Promise<ChunkDetail> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/chunks/${chunkId}?context=${context}`)
+}
+
+export interface UploadProgress { loaded: number; total: number }
+
+/** 带进度回调的批量上传（fetch 不支持上传进度，用 XHR）。 */
+export function uploadDocumentsWithProgress(
+  knowledgeBaseId: string,
+  files: File[],
+  onProgress?: (info: UploadProgress) => void,
+): Promise<{ job_id: string; document_ids: string[]; accepted: number; rejected: Array<{ filename: string; error: string }>; status: string }> {
+  return new Promise((resolve, reject) => {
+    const form = new FormData()
+    files.forEach((file) => form.append('files', file))
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${BASE}/knowledge-bases/${knowledgeBaseId}/documents/batch-upload`)
+    xhr.withCredentials = true
+    xhr.responseType = 'json'
+    xhr.upload.onprogress = (event) => {
+      if (onProgress && event.lengthComputable) onProgress({ loaded: event.loaded, total: event.total })
+    }
+    xhr.onload = () => {
+      const body = xhr.response ?? {}
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body as { job_id: string; document_ids: string[]; accepted: number; rejected: Array<{ filename: string; error: string }>; status: string })
+      } else {
+        reject(new Error((body as { detail?: string }).detail || `请求失败（${xhr.status}）`))
+      }
+    }
+    xhr.onerror = () => reject(new Error('无法连接到服务，请检查服务是否已启动或稍后重试'))
+    xhr.send(form)
+  })
+}
+
 export function listDocumentVersions(knowledgeBaseId: string, documentId: string): Promise<DocumentVersion[]> {
   return request(`/knowledge-bases/${knowledgeBaseId}/documents/${documentId}/versions`)
 }
@@ -255,8 +352,10 @@ export async function restoreDocumentVersion(
   })
 }
 
-export function getDocumentSubgraph(knowledgeBaseId: string, documentId: string): Promise<DocumentSubgraph> {
-  return request(`/knowledge-bases/${knowledgeBaseId}/documents/${documentId}/subgraph`)
+export function getDocumentSubgraph(knowledgeBaseId: string, documentId: string, limit = 200, graphKind?: import('../types').GraphKind): Promise<DocumentSubgraph> {
+  const params = new URLSearchParams({ limit: String(limit) })
+  if (graphKind) params.set('graph_kind', graphKind)
+  return request(`/knowledge-bases/${knowledgeBaseId}/documents/${documentId}/subgraph?${params}`)
 }
 
 export function listFolders(knowledgeBaseId: string): Promise<Folder[]> {
@@ -292,9 +391,12 @@ export function getEntitySubgraph(
   entityIds: string[],
   offset = 0,
   limit = 100,
+  hops: 1 | 2 = 1,
+  graphKind?: import('../types').GraphKind,
 ): Promise<EntitySubgraph> {
-  const params = new URLSearchParams({ offset: String(offset), limit: String(limit), hops: '2' })
+  const params = new URLSearchParams({ offset: String(offset), limit: String(limit), hops: String(hops) })
   entityIds.forEach((id) => params.append('entity_ids', id))
+  if (graphKind) params.set('graph_kind', graphKind)
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/subgraph?${params}`)
 }
 
@@ -325,7 +427,7 @@ export function reconcileGraphCorrections(
 export function debugRetrieval(
   knowledgeBaseId: string,
   query: string,
-  retrieval: { strategy?: import('../types').RetrievalStrategy; channels: string[]; scope: { document_ids: string[]; tag_ids: string[]; folder_id: string | null; metadata: Record<string, string> } },
+  retrieval: { strategy?: import('../types').RetrievalStrategy; channels: string[]; scope: { knowledge_base_ids: string[]; document_ids: string[]; tag_ids: string[]; folder_id: string | null; metadata: Record<string, string> } },
 ): Promise<RetrievalDebugResult> {
   return request(`/knowledge-bases/${knowledgeBaseId}/retrieval/debug`, {
     method: 'POST',
@@ -333,8 +435,10 @@ export function debugRetrieval(
   })
 }
 
-export function searchGraphEntities(knowledgeBaseId: string, query: string): Promise<GraphEntity[]> {
-  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/entities?query=${encodeURIComponent(query)}`)
+export function searchGraphEntities(knowledgeBaseId: string, query: string, graphKind?: import('../types').GraphKind): Promise<GraphEntity[]> {
+  const params = new URLSearchParams({ query })
+  if (graphKind) params.set('graph_kind', graphKind)
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/entities?${params}`)
 }
 
 export function getReadiness(): Promise<Readiness> {
@@ -347,6 +451,20 @@ export function getCodeGraphStats(knowledgeBaseId: string): Promise<CodeGraphSta
 
 export function listCodeSnapshots(knowledgeBaseId: string): Promise<CodeSnapshot[]> {
   return request(`/knowledge-bases/${knowledgeBaseId}/code-graph/snapshots`)
+}
+
+export async function uploadCodeArchive(knowledgeBaseId: string, file: File): Promise<DataSource> {
+  const form = new FormData()
+  form.append('file', file)
+  return request(`/knowledge-bases/${knowledgeBaseId}/code-graph/upload`, { method: 'POST', body: form })
+}
+
+export function getCodeSnapshotDiff(knowledgeBaseId: string, snapshotId: string, baseSnapshotId: string): Promise<CodeSnapshotDiff> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/code-graph/snapshots/${snapshotId}/diff?base_snapshot_id=${encodeURIComponent(baseSnapshotId)}`)
+}
+
+export function getCodeSnapshotIssues(knowledgeBaseId: string, snapshotId: string): Promise<CodeFileIssue[]> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/code-graph/snapshots/${snapshotId}/issues`)
 }
 
 export function requestCodeIndex(knowledgeBaseId: string, dataSourceId: string): Promise<IndexJob> {
@@ -369,9 +487,22 @@ export function listGraphSchemas(knowledgeBaseId: string): Promise<GraphSchema[]
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas`)
 }
 
+export function listGraphProfiles(knowledgeBaseId: string): Promise<import('../types').GraphProfile[]> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/profiles`)
+}
+
+export function createGraphProfileSchema(
+  knowledgeBaseId: string,
+  graphKind: Exclude<import('../types').GraphKind, 'general'>,
+): Promise<GraphSchema> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/profile-template`, {
+    method: 'POST', body: JSON.stringify({ graph_kind: graphKind }),
+  })
+}
+
 export function createGraphSchema(
   knowledgeBaseId: string,
-  payload: { entity_types: string[]; relation_types: string[]; normalization_rules?: Record<string, unknown>; extraction_prompt?: string | null },
+  payload: { graph_kind?: import('../types').GraphKind; entity_types: string[]; relation_types: string[]; normalization_rules?: Record<string, unknown>; extraction_prompt?: string | null; graph_profiles?: Record<string, import('../types').GraphProfile> },
 ): Promise<GraphSchema> {
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas`, {
     method: 'POST', body: JSON.stringify(payload),
@@ -388,15 +519,16 @@ export function generateGraphSchema(
   documentIds: string[] = [],
   mode: 'new' | 'overwrite' = 'new',
   targetSchemaId: string | null = null,
+  graphKind: import('../types').GraphKind = 'general',
 ): Promise<IndexJob> {
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/generate`, {
-    method: 'POST', body: JSON.stringify({ instructions: instructions || null, document_ids: documentIds, mode, target_schema_id: targetSchemaId }),
+    method: 'POST', body: JSON.stringify({ instructions: instructions || null, document_ids: documentIds, mode, target_schema_id: targetSchemaId, graph_kind: graphKind }),
   })
 }
 
-export function checkGraphSchemaDrift(knowledgeBaseId: string, instructions = '', documentIds: string[] = []): Promise<IndexJob> {
+export function checkGraphSchemaDrift(knowledgeBaseId: string, instructions = '', documentIds: string[] = [], graphKind: import('../types').GraphKind = 'general'): Promise<IndexJob> {
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/drift-check`, {
-    method: 'POST', body: JSON.stringify({ instructions: instructions || null, document_ids: documentIds }),
+    method: 'POST', body: JSON.stringify({ instructions: instructions || null, document_ids: documentIds, graph_kind: graphKind }),
   })
 }
 
@@ -407,7 +539,7 @@ export function getGraphSchemaImpact(knowledgeBaseId: string, schemaId: string):
 export function updateGraphSchema(
   knowledgeBaseId: string,
   schemaId: string,
-  payload: { entity_types: string[]; relation_types: string[]; normalization_rules?: Record<string, unknown>; extraction_prompt?: string | null },
+  payload: { entity_types: string[]; relation_types: string[]; normalization_rules?: Record<string, unknown>; extraction_prompt?: string | null; graph_profiles?: Record<string, import('../types').GraphProfile> },
 ): Promise<GraphSchema> {
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/${schemaId}`, {
     method: 'PUT', body: JSON.stringify(payload),
@@ -424,9 +556,9 @@ export function updateGraphAutomation(knowledgeBaseId: string, autoBuildEnabled:
   })
 }
 
-export function requestGraphBuild(knowledgeBaseId: string, profile: 'fast' | 'standard' | 'deep'): Promise<IndexJob> {
+export function requestGraphBuild(knowledgeBaseId: string, profile: 'fast' | 'standard' | 'deep', graphKind: import('../types').GraphKind = 'general'): Promise<IndexJob> {
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/build`, {
-    method: 'POST', body: JSON.stringify({ profile }),
+    method: 'POST', body: JSON.stringify({ profile, graph_kind: graphKind }),
   })
 }
 
@@ -520,7 +652,7 @@ export interface StreamHandlers {
   onMessageId?: (id: string) => void
   onRoute?: (route: RouteDecision) => void
   onDelta: (chunk: string) => void
-  onSources?: (sources: { source: string; preview: string }[]) => void
+  onSources?: (sources: SourceItem[], images: SourceImage[], codeSnippets: CodeSnippet[]) => void
   onDone?: (status: string) => void
   onError?: (code: string, message: string) => void
 }
@@ -529,14 +661,17 @@ export async function streamMessage(
   conversationId: string,
   content: string,
   handlers: StreamHandlers,
-  strategy: import('../types').RetrievalStrategy = 'standard',
+  retrieval: {
+    strategy?: import('../types').RetrievalStrategy
+    scope?: Partial<import('../types').RetrievalScope>
+  } = { strategy: 'standard' },
   signal?: AbortSignal,
 ): Promise<void> {
   const res = await fetch(`${BASE}/conversations/${conversationId}/messages/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
-    body: JSON.stringify({ content, retrieval: { strategy } }),
+    body: JSON.stringify({ content, retrieval }),
     signal,
   })
   if (!res.ok || !res.body) throw new Error(await parseError(res))
@@ -574,7 +709,9 @@ function parseEvent(block: string, handlers: StreamHandlers): void {
   if (event === 'message') handlers.onMessageId?.(payload.message_id)
   else if (event === 'route') handlers.onRoute?.(payload.route)
   else if (event === 'delta') handlers.onDelta(payload.content ?? '')
-  else if (event === 'sources') handlers.onSources?.(payload.sources ?? [])
+  else if (event === 'sources') handlers.onSources?.(
+    payload.sources ?? [], payload.images ?? [], payload.code_snippets ?? [],
+  )
   else if (event === 'done') handlers.onDone?.(payload.status)
   else if (event === 'error') handlers.onError?.(payload.code ?? 'UNKNOWN', payload.message ?? '未知错误')
 }

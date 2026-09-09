@@ -4,12 +4,15 @@ import json
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.models.user import User
-from app.schemas.message import MessageAnswer, MessageCreate
+from app.models.message import MessageFeedback
+from app.repositories.conversation_repository import MessageRepository
+from app.schemas.message import MessageAnswer, MessageCreate, MessageFeedbackCreate, MessageFeedbackOut
 from app.services import chat_service
 
 router = APIRouter(prefix="/conversations", tags=["messages"])
@@ -68,3 +71,28 @@ def stream_message(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.put(
+    "/{conversation_id}/messages/{message_id}/feedback",
+    response_model=MessageFeedbackOut,
+)
+def save_message_feedback(
+    conversation_id: str,
+    message_id: str,
+    payload: MessageFeedbackCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    message = MessageRepository(db).get_for_user(message_id, conversation_id, current_user.id)
+    if message is None or message.role != "assistant":
+        from app.api.errors import not_found
+        raise not_found("回答不存在")
+    feedback = db.scalar(select(MessageFeedback).where(MessageFeedback.message_id == message_id))
+    if feedback is None:
+        feedback = MessageFeedback(message_id=message_id, user_id=current_user.id, rating=payload.rating)
+        db.add(feedback)
+    feedback.rating = payload.rating
+    feedback.comment = payload.comment.strip() if payload.comment else None
+    db.commit()
+    return MessageFeedbackOut(message_id=message_id, rating=feedback.rating, comment=feedback.comment)

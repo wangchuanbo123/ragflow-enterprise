@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 
 from datetime import datetime
 
@@ -30,6 +31,7 @@ class KnowledgeBaseRepository:
     def _ensure_active_schema(self, knowledge_base_id: str) -> None:
         existing = self.db.scalar(select(GraphSchemaDefinition.id).where(
             GraphSchemaDefinition.knowledge_base_id == knowledge_base_id,
+            GraphSchemaDefinition.graph_kind == "general",
             GraphSchemaDefinition.status == "active",
         ).limit(1))
         if existing is not None:
@@ -39,10 +41,13 @@ class KnowledgeBaseRepository:
         )) or 0
         self.db.add(GraphSchemaDefinition(
             knowledge_base_id=knowledge_base_id,
+            graph_kind="general",
             version=max(int(latest) + 1, GRAPH_SCHEMA_VERSION),
             status="active",
             entity_types_json=sorted(VALID_ENTITY_TYPES),
             relation_types_json=sorted(VALID_PREDICATES),
+            graph_profiles_json=None,
+            extraction_prompt=None,
             normalization_rules_json={
                 "unicode": "NFKC",
                 "case": "lower_ascii",
@@ -111,19 +116,28 @@ class KnowledgeBaseRepository:
             return self.get(knowledge_base_id) is not None
         return self.member_role(knowledge_base_id, user_id) in {"owner", "editor"}
 
-    def create(self, *, name: str, slug: str, owner_id: str) -> KnowledgeBase:
-        normalized_slug = slug.strip().lower()
-        if not _SLUG_PATTERN.fullmatch(normalized_slug):
-            raise ValueError(
-                "Knowledge-base slug must contain 3-64 lowercase letters, digits, or hyphens"
-            )
+    def _available_slug(self, name: str, requested_slug: str | None = None) -> str:
+        candidate = (requested_slug or "").strip().lower()
+        if not _SLUG_PATTERN.fullmatch(candidate):
+            candidate = re.sub(r"[^a-z0-9]+", "-", name.strip().lower()).strip("-")
+            if len(candidate) < 3:
+                candidate = f"kb-{candidate}" if candidate else f"kb-{uuid.uuid4().hex[:8]}"
+            candidate = candidate[:64].strip("-")
+        base = candidate
+        counter = 2
+        while self.db.scalar(select(KnowledgeBase.id).where(KnowledgeBase.slug == candidate)):
+            suffix = f"-{counter}"
+            candidate = f"{base[:64-len(suffix)].rstrip('-')}{suffix}"
+            counter += 1
+        return candidate
+
+    def create(self, *, name: str, slug: str | None = None, owner_id: str) -> KnowledgeBase:
+        normalized_slug = self._available_slug(name, slug)
         duplicate = self.db.scalar(
-            select(KnowledgeBase.id).where(
-                or_(KnowledgeBase.slug == normalized_slug, KnowledgeBase.name == name.strip())
-            )
+            select(KnowledgeBase.id).where(KnowledgeBase.name == name.strip())
         )
         if duplicate:
-            raise ValueError("Knowledge-base name or slug already exists")
+            raise ValueError("知识库名称已经存在")
 
         knowledge_base = KnowledgeBase(
             name=name.strip(),
@@ -145,6 +159,41 @@ class KnowledgeBaseRepository:
         self.db.commit()
         self.db.refresh(knowledge_base)
         return knowledge_base
+
+    def update(
+        self,
+        knowledge_base: KnowledgeBase,
+        *,
+        name: str | None = None,
+        slug: str | None = None,
+        description: str | None = None,
+        description_supplied: bool = False,
+    ) -> KnowledgeBase:
+        normalized_name = name.strip() if name is not None else knowledge_base.name
+        normalized_slug = slug.strip().lower() if slug is not None else knowledge_base.slug
+        if not _SLUG_PATTERN.fullmatch(normalized_slug):
+            raise ValueError("知识库标识需要使用 3-64 位小写字母、数字或连字符")
+        duplicate = self.db.scalar(
+            select(KnowledgeBase.id).where(
+                KnowledgeBase.id != knowledge_base.id,
+                or_(KnowledgeBase.slug == normalized_slug, KnowledgeBase.name == normalized_name),
+            )
+        )
+        if duplicate:
+            raise ValueError("知识库名称或标识已经存在")
+        knowledge_base.name = normalized_name
+        knowledge_base.slug = normalized_slug
+        if description_supplied:
+            knowledge_base.description = description.strip() if description else None
+        self.db.commit()
+        self.db.refresh(knowledge_base)
+        return knowledge_base
+
+    def archive(self, knowledge_base: KnowledgeBase) -> None:
+        if knowledge_base.is_default:
+            raise ValueError("默认知识库不能归档")
+        knowledge_base.is_active = False
+        self.db.commit()
 
     def list_members(self, knowledge_base_id: str) -> list[dict]:
         rows = self.db.execute(

@@ -8,6 +8,7 @@ import math
 import re
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -46,6 +47,15 @@ from app.models.knowledge_document import KnowledgeDocument
 from app.models.knowledge_graph import KgAlias, KgEntity, KgEntityMention, KgRelation, KgRelationEvidence
 from app.repositories.index_job_repository import IndexJobRepository
 from rag.knowledge_graph.schemas import ChunkExtraction, VALID_ENTITY_TYPES, VALID_PREDICATES
+from rag.knowledge_graph.profiles import (
+    BUSINESS_GRAPH_PROFILE_ORDER,
+    get_graph_profile,
+    profile_catalog,
+    profile_schema,
+)
+
+GRAPH_KIND_ORDER = ("general", *BUSINESS_GRAPH_PROFILE_ORDER)
+VALID_GRAPH_KINDS = set(GRAPH_KIND_ORDER)
 
 
 class GraphGovernanceService:
@@ -57,10 +67,106 @@ class GraphGovernanceService:
             task_queue = get_provider_container().task_queue
         self.task_queue = task_queue
 
-    def list_schemas(self) -> list[GraphSchemaDefinition]:
-        return list(self.db.scalars(select(GraphSchemaDefinition).where(
+    def create_correction(
+        self, *, action: str, target_id: str | None, payload: dict,
+        reason: str, created_by: str,
+    ):
+        """Persist a governance edit, then refresh every derived retrieval view."""
+        from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
+
+        correction = KnowledgeGraphRepository(
+            self.db, self.knowledge_base_id
+        ).create_correction(
+            action=action,
+            target_id=target_id,
+            payload=payload,
+            reason=reason,
+            created_by=created_by,
+        )
+        self._queue_derived_refresh(created_by)
+        return correction
+
+    def revert_correction(self, correction_id: str, reverted_by: str):
+        from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
+
+        correction = KnowledgeGraphRepository(
+            self.db, self.knowledge_base_id
+        ).revert_correction(correction_id, reverted_by)
+        if correction is not None:
+            self._queue_derived_refresh(reverted_by)
+        return correction
+
+    def _queue_derived_refresh(self, requested_by: str | None) -> None:
+        """Keep vector search and communities consistent without blocking the API."""
+        from app.services.entity_vector_service import EntityVectorService
+        from app.services.relation_vector_service import RelationVectorService
+
+        self.mark_communities_stale()
+        if not callable(getattr(self.task_queue, "enqueue", None)):
+            return
+        EntityVectorService(self.db, self.knowledge_base_id).request_rebuild(
+            requested_by, task_queue=self.task_queue
+        )
+        RelationVectorService(self.db, self.knowledge_base_id).request_rebuild(
+            requested_by, task_queue=self.task_queue
+        )
+        repository = IndexJobRepository(self.db, self.knowledge_base_id)
+        maintenance = repository.find_open("graph_maintenance")
+        if maintenance is None or maintenance.status == "running":
+            job = repository.create(IndexJob(
+                job_type="graph_maintenance",
+                status="pending",
+                requested_by=requested_by,
+                total_items=1,
+                max_attempts=INDEX_JOB_MAX_ATTEMPTS,
+                options_json={"trigger": "graph_governance_edit"},
+            ))
+            self.task_queue.enqueue(job.id)
+
+    def list_schemas(self, graph_kind: str | None = None) -> list[GraphSchemaDefinition]:
+        stmt = select(GraphSchemaDefinition).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id
-        ).order_by(GraphSchemaDefinition.version.desc())))
+        )
+        if graph_kind:
+            self._validate_graph_kind(graph_kind)
+            stmt = stmt.where(GraphSchemaDefinition.graph_kind == graph_kind)
+        return list(self.db.scalars(stmt.order_by(GraphSchemaDefinition.version.desc())))
+
+    def list_graph_profiles(self) -> list[dict]:
+        """Return profile contracts plus live graph and active-Schema coverage."""
+        result: list[dict] = []
+        for profile in profile_catalog():
+            kind = profile["key"]
+            active = self.active_schema(graph_kind=kind, create_default=False)
+            active_entities = set(active.entity_types_json or []) if active else set()
+            active_relations = set(active.relation_types_json or []) if active else set()
+            entity_types = {item["name"] for item in profile["entity_types"]}
+            relation_types = {item["name"] for item in profile["relation_types"]}
+            entity_filters = [KgEntity.knowledge_base_id == self.knowledge_base_id]
+            relation_filters = [KgRelation.knowledge_base_id == self.knowledge_base_id]
+            if kind != "general":
+                entity_filters.append(KgEntity.entity_type.in_(entity_types))
+                relation_filters.append(KgRelation.predicate.in_(relation_types))
+            entity_count = self.db.scalar(select(func.count(KgEntity.id)).where(*entity_filters)) or 0
+            relation_count = self.db.scalar(select(func.count(KgRelation.id)).where(*relation_filters)) or 0
+            result.append({
+                **profile,
+                "entity_count": int(entity_count),
+                "relation_count": int(relation_count),
+                "schema_entity_coverage": (
+                    len(active_entities) if kind == "general" else len(entity_types & active_entities)
+                ),
+                "schema_relation_coverage": (
+                    len(active_relations) if kind == "general" else len(relation_types & active_relations)
+                ),
+            })
+        return result
+
+    @staticmethod
+    def _validate_graph_kind(graph_kind: str) -> str:
+        if graph_kind not in VALID_GRAPH_KINDS:
+            raise ValueError("不支持的图谱类型")
+        return graph_kind
 
     def _next_schema_version(self) -> int:
         latest = self.db.scalar(select(func.max(GraphSchemaDefinition.version)).where(
@@ -82,18 +188,32 @@ class GraphGovernanceService:
             raise ValueError("实体类型和关系类型分别不能超过 100 个")
         return entities, relations
 
-    def active_schema(self, *, create_default: bool = True) -> GraphSchemaDefinition | None:
+    def active_schema(
+        self, *, graph_kind: str = "general", create_default: bool = True
+    ) -> GraphSchemaDefinition | None:
+        self._validate_graph_kind(graph_kind)
         schema = self.db.scalar(select(GraphSchemaDefinition).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+            GraphSchemaDefinition.graph_kind == graph_kind,
             GraphSchemaDefinition.status == "active",
         ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
         if schema is None and create_default:
+            contract = profile_schema(graph_kind) if graph_kind != "general" else {
+                "entity_types": sorted(VALID_ENTITY_TYPES),
+                "relation_types": sorted(VALID_PREDICATES),
+                "graph_profiles": None,
+                "extraction_prompt": None,
+            }
             schema = GraphSchemaDefinition(
                 knowledge_base_id=self.knowledge_base_id,
+                graph_kind=graph_kind,
                 version=self._next_schema_version(),
                 status="active",
-                entity_types_json=sorted(VALID_ENTITY_TYPES),
-                relation_types_json=sorted(VALID_PREDICATES),
+                entity_types_json=contract["entity_types"],
+                relation_types_json=contract["relation_types"],
+                graph_profiles_json=contract["graph_profiles"],
+                extraction_prompt=contract["extraction_prompt"],
+                generation_method="builtin" if graph_kind != "general" else "manual",
                 normalization_rules_json={
                     "unicode": "NFKC", "case": "lower_ascii", "trim_punctuation": True,
                 },
@@ -106,6 +226,7 @@ class GraphGovernanceService:
                 self.db.rollback()
                 schema = self.db.scalar(select(GraphSchemaDefinition).where(
                     GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+                    GraphSchemaDefinition.graph_kind == graph_kind,
                     GraphSchemaDefinition.status == "active",
                 ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
                 if schema is None:
@@ -113,22 +234,58 @@ class GraphGovernanceService:
             self.db.refresh(schema)
         return schema
 
+    def extraction_schema(self) -> SimpleNamespace:
+        """Merge independent active contracts only for a single efficient LLM pass."""
+        schemas = [self.active_schema(graph_kind=kind) for kind in GRAPH_KIND_ORDER]
+        schemas = [schema for schema in schemas if schema is not None]
+        prompts = [
+            f"【{get_graph_profile(schema.graph_kind)['label']}】\n{schema.extraction_prompt}"
+            for schema in schemas if schema.extraction_prompt
+        ]
+        return SimpleNamespace(
+            id="effective:" + ":".join(str(schema.version) for schema in schemas),
+            version=max((schema.version for schema in schemas), default=GRAPH_SCHEMA_VERSION),
+            entity_types_json=sorted({item for schema in schemas for item in (schema.entity_types_json or [])}),
+            relation_types_json=sorted({item for schema in schemas for item in (schema.relation_types_json or [])}),
+            normalization_rules_json=(
+                self.active_schema(graph_kind="general").normalization_rules_json or {}
+            ),
+            extraction_prompt="\n\n".join(prompts) or None,
+            graph_profiles_json={
+                schema.graph_kind: get_graph_profile(schema.graph_kind)
+                for schema in schemas if schema.graph_kind != "general"
+            },
+            generation_summary_json={
+                "relation_type_details": [
+                    detail
+                    for schema in schemas
+                    for detail in ((schema.generation_summary_json or {}).get("relation_type_details") or [])
+                ],
+                "graph_kinds": [schema.graph_kind for schema in schemas],
+            },
+        )
+
     def create_schema(
         self, *, entity_types: list[str], relation_types: list[str],
         normalization_rules: dict, extraction_prompt: str | None, created_by: str | None,
         generation_method: str = "manual",
         source_document_ids: list[str] | None = None,
         generation_summary: dict | None = None,
+        graph_profiles: dict | None = None,
+        graph_kind: str = "general",
     ) -> GraphSchemaDefinition:
+        self._validate_graph_kind(graph_kind)
         entity_types, relation_types = self._validate_schema_types(
             entity_types, relation_types
         )
         schema = GraphSchemaDefinition(
             knowledge_base_id=self.knowledge_base_id,
+            graph_kind=graph_kind,
             version=self._next_schema_version(),
             status="draft",
             entity_types_json=entity_types,
             relation_types_json=relation_types,
+            graph_profiles_json=graph_profiles or None,
             normalization_rules_json=normalization_rules,
             extraction_prompt=extraction_prompt,
             created_by=created_by,
@@ -144,6 +301,7 @@ class GraphGovernanceService:
     def update_schema(
         self, schema_id: str, *, entity_types: list[str], relation_types: list[str],
         normalization_rules: dict, extraction_prompt: str | None,
+        graph_profiles: dict | None = None,
     ) -> GraphSchemaDefinition | None:
         schema = self.db.scalar(select(GraphSchemaDefinition).where(
             GraphSchemaDefinition.id == schema_id,
@@ -156,6 +314,8 @@ class GraphGovernanceService:
         entities, relations = self._validate_schema_types(entity_types, relation_types)
         schema.entity_types_json = entities
         schema.relation_types_json = relations
+        if graph_profiles is not None:
+            schema.graph_profiles_json = graph_profiles or None
         schema.normalization_rules_json = normalization_rules
         schema.extraction_prompt = extraction_prompt
         self.db.commit()
@@ -233,11 +393,56 @@ class GraphGovernanceService:
             return "type_addition"
         if (previous.extraction_prompt or "") != (schema.extraction_prompt or ""):
             return "prompt_change"
+        if (previous.graph_profiles_json or {}) != (schema.graph_profiles_json or {}):
+            return "prompt_change"
         return "unchanged"
+
+    def create_profile_schema(
+        self,
+        *,
+        graph_kind: str,
+        created_by: str | None,
+    ) -> GraphSchemaDefinition:
+        """Create one reviewable Schema for exactly one business graph."""
+        contract = profile_schema(graph_kind)
+        profile = contract["graph_profiles"][graph_kind]
+        entity_details = []
+        relation_details = []
+        for item in profile["entity_types"]:
+            entity_details.append({
+                "name": item["name"], "description": item["label"],
+                "graph_kind": graph_kind, "aliases": [], "exclusions": [],
+            })
+        for item in profile["relation_types"]:
+            relation_details.append({
+                **item, "description": item["label"],
+                "direction": "directed", "graph_kind": graph_kind,
+            })
+        return self.create_schema(
+            graph_kind=graph_kind,
+            entity_types=contract["entity_types"],
+            relation_types=contract["relation_types"],
+            graph_profiles=contract["graph_profiles"],
+            normalization_rules={
+                "unicode": "NFKC",
+                "case": "lower_ascii",
+                "trim_punctuation": True,
+            },
+            extraction_prompt=contract["extraction_prompt"],
+            created_by=created_by,
+            generation_method="profile_template",
+            generation_summary={
+                "graph_kind": graph_kind,
+                "design": "independent_schema_shared_canonical_graph",
+                "entity_type_details": entity_details,
+                "relation_type_details": relation_details,
+            },
+        )
 
     def _new_type_tokens(self, schema: GraphSchemaDefinition) -> list[str]:
         previous = self.db.scalar(select(GraphSchemaDefinition).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+            GraphSchemaDefinition.graph_kind == schema.graph_kind,
             GraphSchemaDefinition.status == "active",
         ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
         if previous is None:
@@ -276,6 +481,7 @@ class GraphGovernanceService:
             return None
         previous = self.db.scalar(select(GraphSchemaDefinition).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+            GraphSchemaDefinition.graph_kind == schema.graph_kind,
             GraphSchemaDefinition.status == "active",
         ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
         kind = self.schema_change_kind(previous, schema)
@@ -392,6 +598,7 @@ class GraphGovernanceService:
             return None
         previous = self.db.scalar(select(GraphSchemaDefinition).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+            GraphSchemaDefinition.graph_kind == schema.graph_kind,
             GraphSchemaDefinition.status == "active",
         ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
         kind = self.schema_change_kind(previous, schema)
@@ -402,10 +609,24 @@ class GraphGovernanceService:
 
         self.db.execute(update(GraphSchemaDefinition).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+            GraphSchemaDefinition.graph_kind == schema.graph_kind,
             GraphSchemaDefinition.status == "active",
         ).values(status="superseded"))
         schema.status = "active"
         schema.activated_at = datetime.utcnow()
+
+        if schema.graph_kind != "general":
+            # Professional schemas share the canonical store. Re-extract with
+            # the new effective contract instead of deleting facts that may
+            # still belong to the general or another professional schema.
+            if kind != "unchanged":
+                self.db.execute(update(KnowledgeChunk).where(
+                    KnowledgeChunk.knowledge_base_id == self.knowledge_base_id
+                ).values(graph_status="pending"))
+            self.db.commit()
+            self.db.refresh(schema)
+            self._after_schema_activation("domain_change" if kind != "unchanged" else kind)
+            return schema
 
         chunk_scope = update(KnowledgeChunk).where(
             KnowledgeChunk.knowledge_base_id == self.knowledge_base_id
@@ -455,8 +676,10 @@ class GraphGovernanceService:
         document_ids: list[str] | None = None,
         instructions: str | None = None,
         target_schema_id: str | None = None,
+        graph_kind: str = "general",
     ) -> IndexJob:
         """Queue one deduplicated, auditable Schema induction job."""
+        self._validate_graph_kind(graph_kind)
         repository = IndexJobRepository(self.db, self.knowledge_base_id)
         if target_schema_id:
             target = self.db.scalar(select(GraphSchemaDefinition).where(
@@ -465,6 +688,8 @@ class GraphGovernanceService:
             ))
             if target is None or target.status != "draft":
                 raise ValueError("只能覆盖当前知识库中的 Schema 草稿")
+            if target.graph_kind != graph_kind:
+                raise ValueError("只能覆盖同一图谱类型的 Schema 草稿")
         existing = repository.find_open("schema_generation")
         if existing is not None:
             return existing
@@ -478,6 +703,7 @@ class GraphGovernanceService:
                 "document_ids": list(dict.fromkeys(document_ids or []))[:100],
                 "instructions": (instructions or "").strip()[:2000],
                 "target_schema_id": target_schema_id,
+                "graph_kind": graph_kind,
             },
         )
         repository.create(job)
@@ -492,10 +718,11 @@ class GraphGovernanceService:
             return None
         # Establish the immutable default active baseline before a generated
         # draft receives its version number.
-        self.active_schema()
+        self.active_schema(graph_kind="general")
         existing_schema = self.db.scalar(select(GraphSchemaDefinition.id).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
             GraphSchemaDefinition.generation_method == "document_llm",
+            GraphSchemaDefinition.graph_kind == "general",
         ).limit(1))
         if existing_schema is not None:
             return None
@@ -515,9 +742,11 @@ class GraphGovernanceService:
         requested_by: str | None,
         document_ids: list[str] | None = None,
         instructions: str | None = None,
+        graph_kind: str = "general",
     ) -> IndexJob:
         """Queue a drift check that creates a draft only for new type concepts."""
-        self.active_schema()
+        self._validate_graph_kind(graph_kind)
+        self.active_schema(graph_kind=graph_kind)
         repository = IndexJobRepository(self.db, self.knowledge_base_id)
         existing = repository.find_open("schema_drift")
         if existing is not None:
@@ -531,6 +760,7 @@ class GraphGovernanceService:
             options_json={
                 "document_ids": list(dict.fromkeys(document_ids or []))[:100],
                 "instructions": (instructions or "").strip()[:2000],
+                "graph_kind": graph_kind,
             },
         )
         repository.create(job)
@@ -872,12 +1102,36 @@ class GraphGovernanceService:
         for entity in entities:
             by_normalized[entity.normalized_name].append(entity)
         duplicate_groups = [items for items in by_normalized.values() if len(items) > 1]
+        connected_entity_ids: set[str] = set()
+        degrees: dict[str, int] = defaultdict(int)
+        for relation in relations:
+            connected_entity_ids.update(
+                (relation.subject_entity_id, relation.object_entity_id)
+            )
+            degrees[relation.subject_entity_id] += 1
+            degrees[relation.object_entity_id] += 1
+        mentioned_entity_ids = set(self.db.scalars(
+            select(KgEntityMention.entity_id)
+            .where(KgEntityMention.knowledge_base_id == self.knowledge_base_id)
+            .distinct()
+        ))
+        orphan_entities = [
+            entity for entity in entities
+            if entity.id not in connected_entity_ids
+            and entity.id not in mentioned_entity_ids
+        ]
+        high_degree_threshold = max(12, int(max(len(relations), 1) ** 0.5 * 3))
+        high_degree_entities = [
+            entity_id for entity_id, degree in degrees.items()
+            if degree >= high_degree_threshold
+        ]
         status_counts = dict(self.db.execute(
             select(KnowledgeChunk.graph_status, func.count(KnowledgeChunk.id))
             .where(KnowledgeChunk.knowledge_base_id == self.knowledge_base_id)
             .group_by(KnowledgeChunk.graph_status)
         ).all())
         relation_count = len(relations)
+        source_chunk_count = sum(int(value) for value in status_counts.values())
         evidence_coverage = evidence_backed / relation_count if relation_count else 1.0
         related_ratio = related_to / relation_count if relation_count else 0.0
         metrics = {
@@ -887,10 +1141,37 @@ class GraphGovernanceService:
             "low_confidence_relations": len(low_confidence),
             "related_to_ratio": round(related_ratio, 6),
             "duplicate_entity_groups": len(duplicate_groups),
+            "orphan_entities": len(orphan_entities),
+            "max_entity_degree": max(degrees.values(), default=0),
+            "high_degree_entities": len(high_degree_entities),
+            "high_degree_threshold": high_degree_threshold,
             "cross_knowledge_base_relations": cross_kb,
             "chunk_status": status_counts,
         }
+        non_empty_graph = (
+            source_chunk_count == 0 or (len(entities) > 0 and relation_count > 0)
+        )
+        extraction_complete = (
+            status_counts.get("pending", 0) == 0
+            and status_counts.get("processing", 0) == 0
+        )
         gates = {
+            "non_empty_graph": {
+                "passed": non_empty_graph,
+                "minimum_entities": 1 if source_chunk_count else 0,
+                "minimum_relations": 1 if source_chunk_count else 0,
+            },
+            "extraction_complete": {
+                "passed": extraction_complete,
+                "pending_or_processing": int(status_counts.get("pending", 0))
+                + int(status_counts.get("processing", 0)),
+                "maximum": 0,
+            },
+            "failed_chunks": {
+                "passed": status_counts.get("failed", 0) == 0,
+                "failed": int(status_counts.get("failed", 0)),
+                "maximum": 0,
+            },
             "evidence_coverage": {"passed": evidence_coverage >= 0.95, "minimum": 0.95},
             "related_to_ratio": {"passed": related_ratio <= GRAPH_RELATED_TO_MAX_RATIO, "maximum": GRAPH_RELATED_TO_MAX_RATIO},
             "cross_knowledge_base": {"passed": cross_kb == 0, "maximum": 0},
@@ -1070,18 +1351,17 @@ class GraphGovernanceService:
         ).order_by(KgGraphCorrection.created_at.desc())))
 
     def merge_relations(self, canonical_id: str, merged_id: str, reason: str, created_by: str):
-        from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
-        return KnowledgeGraphRepository(self.db, self.knowledge_base_id).create_correction(
+        record = self.create_correction(
             action="merge_relation",
             target_id=merged_id,
             payload={"canonical_relation_id": canonical_id},
             reason=reason,
             created_by=created_by,
         )
+        return record
 
     def revert_relation_merge(self, merge_id: str, reverted_by: str):
         from app.models.knowledge_graph import KgGraphCorrection
-        from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
         record = self.db.scalar(select(KgGraphCorrection).where(
             KgGraphCorrection.id == merge_id,
             KgGraphCorrection.knowledge_base_id == self.knowledge_base_id,
@@ -1089,9 +1369,7 @@ class GraphGovernanceService:
         ))
         if record is None:
             return None
-        return KnowledgeGraphRepository(self.db, self.knowledge_base_id).revert_correction(
-            merge_id, reverted_by
-        )
+        return self.revert_correction(merge_id, reverted_by)
 
     def list_merges(self) -> list[KgEntityMerge]:
         return list(self.db.scalars(select(KgEntityMerge).where(
@@ -1137,6 +1415,7 @@ class GraphGovernanceService:
             record.reverted_at = None
         self.db.commit()
         self.db.refresh(record)
+        self._queue_derived_refresh(created_by)
         return record
 
     def revert_merge(self, merge_id: str, reverted_by: str) -> KgEntityMerge | None:
@@ -1151,6 +1430,7 @@ class GraphGovernanceService:
         record.reverted_at = datetime.utcnow()
         self.db.commit()
         self.db.refresh(record)
+        self._queue_derived_refresh(reverted_by)
         return record
 
     def community_state(self, *, create: bool = True) -> GraphCommunityState | None:
@@ -1176,18 +1456,24 @@ class GraphGovernanceService:
         return state
 
     def _load_graph_adjacency(self) -> tuple[dict[str, object], dict, list]:
-        entities = list(self.db.scalars(select(KgEntity).where(
-            KgEntity.knowledge_base_id == self.knowledge_base_id
-        )))
-        relations = list(self.db.scalars(select(KgRelation).where(
-            KgRelation.knowledge_base_id == self.knowledge_base_id
-        )))
+        from rag.knowledge_graph.sqlite_store import SqliteGraphStore
+
+        store = SqliteGraphStore(self.db, self.knowledge_base_id)
+        effective_entities = store.list_effective_entities()
+        relations = store.list_effective_relations()
+        entities = [SimpleNamespace(**item) for item in effective_entities]
         adjacency: dict[str, set[str]] = {entity.id: set() for entity in entities}
         relation_by_pair: dict[frozenset[str], list[str]] = defaultdict(list)
         for relation in relations:
-            adjacency.setdefault(relation.subject_entity_id, set()).add(relation.object_entity_id)
-            adjacency.setdefault(relation.object_entity_id, set()).add(relation.subject_entity_id)
-            relation_by_pair[frozenset((relation.subject_entity_id, relation.object_entity_id))].append(relation.id)
+            subject_id = relation["subject_id"]
+            object_id = relation["object_id"]
+            if subject_id not in adjacency or object_id not in adjacency:
+                continue
+            adjacency[subject_id].add(object_id)
+            adjacency[object_id].add(subject_id)
+            relation_by_pair[frozenset((subject_id, object_id))].append(
+                relation["relation_id"]
+            )
         return adjacency, relation_by_pair, entities
 
     @staticmethod

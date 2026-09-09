@@ -64,3 +64,5 @@ def init_app() -> None:
     start_connector_scheduler()
     from app.services.graph_maintenance import start_graph_maintenance_scheduler
     start_graph_maintenance_scheduler()
+    from app.services.backup_scheduler import start_backup_scheduler
+    start_backup_scheduler()

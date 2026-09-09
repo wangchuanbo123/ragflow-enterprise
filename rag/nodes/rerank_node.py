@@ -1,11 +1,32 @@
 """Rerank node. 必须使用原始问题重排，不能使用改写问题。"""
 
 import logging
+import math
 
 from rag.providers.interfaces import Reranker
 from rag.retrieval_strategy import get_retrieval_policy
 
 logger = logging.getLogger(__name__)
+
+
+def _attach_relevance_scores(docs):
+    """Expose an interpretable score without treating RRF rank scores as probabilities."""
+    for doc in docs:
+        raw_score = doc.metadata.get("rerank_score")
+        if raw_score is None:
+            continue
+        try:
+            score = float(raw_score)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(score):
+            continue
+        # Most HTTP rerank APIs return a normalized score. Local cross encoders
+        # may return logits, which need a sigmoid before they can be shown as %.
+        if not 0.0 <= score <= 1.0:
+            score = 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, score))))
+        doc.metadata["relevance_score"] = round(score, 6)
+    return docs
 
 
 def create_rerank_node(reranker: Reranker):
@@ -30,7 +51,7 @@ def create_rerank_node(reranker: Reranker):
             for doc in reranked:
                 doc.metadata["reranker_degraded"] = True
 
-        return {"docs": reranked}
+        return {"docs": _attach_relevance_scores(reranked)}
 
     return rerank_node
 

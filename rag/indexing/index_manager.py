@@ -24,8 +24,11 @@ from langchain_core.documents import Document
 from app.core.config import (
     EMBEDDING_MODEL,
     EMBEDDING_PROVIDER,
+    IMAGE_EXTRACTION_ENABLED,
     INDEX_SCHEMA_VERSION,
     INGEST_BATCH_SIZE,
+    MAX_IMAGE_BYTES,
+    MAX_IMAGES_PER_DOCUMENT,
 )
 from app.core.knowledge_bases import (
     DEFAULT_KNOWLEDGE_BASE_ID,
@@ -33,6 +36,7 @@ from app.core.knowledge_bases import (
 )
 from app.repositories.knowledge_repository import KnowledgeRepository
 from rag.indexing.chunker import split_documents
+from rag.indexing.image_metadata import encode_images_for_vector
 from rag.loaders.document_loader import is_supported_document, load_document
 from rag.providers.interfaces import VectorIndexRef
 from rag.utils.file_hash import file_hash
@@ -74,11 +78,14 @@ class IndexManager:
         embedding=None,
         vector_provider=None,
         knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+        image_sink=None,
     ):
         self.db = db
         self.knowledge_base_id = knowledge_base_id
         self.repo = KnowledgeRepository(db, knowledge_base_id)
         self._embedding = embedding
+        self._image_sink = image_sink
+        self._image_sink_resolved = image_sink is not None
         if vector_provider is None:
             from app.bootstrap.container import get_provider_container
 
@@ -91,6 +98,26 @@ class IndexManager:
             from rag.providers.factory import get_embedding_provider
             self._embedding = get_embedding_provider().get_model()
         return self._embedding
+
+    @property
+    def image_sink(self):
+        """惰性解析图片落盘通道；不可用时返回 None，图片提取自动跳过。"""
+        if self._image_sink_resolved:
+            return self._image_sink
+        self._image_sink_resolved = True
+        if not IMAGE_EXTRACTION_ENABLED:
+            return None
+        try:
+            from app.bootstrap.container import get_provider_container
+            from app.services.document_image_service import ObjectStoreImageSink
+
+            self._image_sink = ObjectStoreImageSink(
+                get_provider_container().object_store
+            )
+        except Exception as exc:
+            logger.warning("Image extraction disabled: %s", exc)
+            self._image_sink = None
+        return self._image_sink
 
     def _index_ref(self, collection_name: str) -> VectorIndexRef:
         return VectorIndexRef(
@@ -271,6 +298,43 @@ class IndexManager:
         self.repo.touch_index_state()
         return len(prepared.chunk_records)
 
+    def _attach_document_images(
+        self,
+        docs: list[Document],
+        file_path: Path,
+        document_id: str,
+    ) -> None:
+        """抽取文档图片、写入对象存储，并把占位符锚定到正文。"""
+        sink = self.image_sink
+        if sink is None or not docs:
+            return
+        from rag.loaders.image_extractor import (
+            attach_document_images,
+            extract_document_images,
+        )
+
+        images = extract_document_images(
+            file_path,
+            limit=MAX_IMAGES_PER_DOCUMENT,
+            max_bytes=MAX_IMAGE_BYTES,
+        )
+        if not images:
+            return
+        prefix = "/".join(
+            part
+            for part in (
+                object_prefix_for_knowledge_base(self.knowledge_base_id),
+                document_id,
+            )
+            if part
+        )
+        try:
+            attach_document_images(docs, images, sink, object_prefix=prefix)
+        except Exception as exc:
+            logger.warning(
+                "Failed to attach images for %s: %s", file_path.name, exc
+            )
+
     def _prepare_document(
         self,
         source_path: str,
@@ -284,6 +348,8 @@ class IndexManager:
         docs = load_document(file_path)
         if not docs:
             raise ValueError(f"No readable content: {source_path}")
+
+        self._attach_document_images(docs, file_path, document_id)
 
         chunk_result = split_documents(
             docs,
@@ -308,6 +374,11 @@ class IndexManager:
                 "filename": file_path.name,
             })
             chunk_doc.metadata = metadata
+            vector_metadata = dict(metadata)
+            encoded_images = encode_images_for_vector(vector_metadata.get("images"))
+            if encoded_images is not None:
+                vector_metadata["images"] = encoded_images
+            chunk_doc.metadata = vector_metadata
             chunk_records.append(KnowledgeChunk(
                 id=metadata["chunk_id"],
                 knowledge_base_id=self.knowledge_base_id,

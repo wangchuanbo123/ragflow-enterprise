@@ -55,3 +55,11 @@ def test_per_source_quota():
     context, sources = build_context(docs)
     # MAX_CHUNKS_PER_SOURCE defaults to 2
     assert len(sources) <= 2
+
+
+def test_source_exposes_reranker_relevance_not_rrf_as_probability():
+    doc = _make_doc("content")
+    doc.metadata.update({"fusion_score": 0.016, "relevance_score": 0.83})
+    _, sources = build_context([doc])
+    assert sources[0]["fusion_score"] == 0.016
+    assert sources[0]["relevance_score"] == 0.83

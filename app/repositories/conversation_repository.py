@@ -42,7 +42,7 @@ class ConversationRepository:
     def get_detail_for_user(self, conversation_id: str, user_id: str) -> Conversation | None:
         stmt = (
             select(Conversation)
-            .options(selectinload(Conversation.messages))
+            .options(selectinload(Conversation.messages).selectinload(Message.feedback))
             .where(Conversation.id == conversation_id, Conversation.user_id == user_id)
         )
         return self.db.scalar(stmt)

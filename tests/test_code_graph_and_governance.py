@@ -196,6 +196,49 @@ def test_graph_quality_merge_overlay_and_communities(db_engine):
         assert governance.revert_merge(merge.id, "test-user").status == "reverted"
 
 
+def test_graph_quality_rejects_empty_graph_when_chunks_were_processed(db_engine):
+    from app.core.database import SessionLocal
+    from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
+    from app.models.knowledge_chunk import KnowledgeChunk
+    from app.models.knowledge_document import KnowledgeDocument
+    from app.services.graph_governance_service import GraphGovernanceService
+
+    with SessionLocal() as db:
+        document = KnowledgeDocument(
+            knowledge_base_id=DEFAULT_KNOWLEDGE_BASE_ID,
+            source_path="empty-graph.txt",
+            original_filename="empty-graph.txt",
+            file_hash="empty-graph-hash",
+            file_size=20,
+            status="ready",
+        )
+        db.add(document)
+        db.flush()
+        db.add(KnowledgeChunk(
+            id="empty-graph-chunk",
+            knowledge_base_id=DEFAULT_KNOWLEDGE_BASE_ID,
+            document_id=document.id,
+            file_hash=document.file_hash,
+            chunk_index=0,
+            content="订单服务调用支付服务。",
+            content_hash="empty-graph-content",
+            token_count=8,
+            graph_status="completed",
+        ))
+        db.commit()
+
+        report = GraphGovernanceService(
+            db,
+            DEFAULT_KNOWLEDGE_BASE_ID,
+            task_queue=object(),
+        ).assess_quality()
+
+        assert report.status == "warning"
+        assert report.gate_results_json["non_empty_graph"]["passed"] is False
+        assert report.metrics_json["entities"] == 0
+        assert report.metrics_json["relations"] == 0
+
+
 def test_automatic_graph_build_is_configurable_and_deduplicated(db_engine):
     from app.core.database import SessionLocal
     from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
