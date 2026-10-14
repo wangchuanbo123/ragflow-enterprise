@@ -1,0 +1,13 @@
+=== 09:57:05
+Docker Desktop processes:
+Docker Desktop exe exists: True
+docker.exe exists: True
+engine exit=1 out=docker.exe : failed to connect to the docker API at npipe:////./pipe/dockerDesk
+topLinuxEngine; check if the path is correct and if the daemon is running: open
+ //./pipe/dockerDesktopLinuxEngine: The system cannot find the file specified.
+所在位置 行:452 字符: 8
++ $out = & $docker info --format '{{.ServerVersion}}' 2>&1 | Out-String
++        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (failed to conne...file specified. 
+   :String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
