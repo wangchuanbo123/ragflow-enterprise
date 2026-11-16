@@ -13,7 +13,7 @@ from app.core.config import INDEX_JOB_MAX_ATTEMPTS, INGEST_BATCH_SIZE
 from app.models.code_graph import RelationVectorIndexState
 from app.models.index_job import IndexJob
 from app.models.knowledge_graph import KgRelation
-from app.repositories.index_job_repository import IndexJobRepository
+from app.repositories.index_job_repository import IndexJobRepository, signal_persisted_job
 from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
 from rag.knowledge_graph.relation_vocabulary import (
     relation_description,
@@ -52,7 +52,7 @@ class RelationVectorService:
             max_attempts=INDEX_JOB_MAX_ATTEMPTS,
         ))
         queue = task_queue or self.container.task_queue
-        queue.enqueue(job.id)
+        signal_persisted_job(queue, job.id)
         return job
 
     def _relation_document(self, relation, subject, obj, quotes: list[str]):
@@ -259,14 +259,13 @@ class RelationVectorService:
             return {"status": "ready", "relation_count": 0, "index_name": None}
 
         compact_kb = self.knowledge_base_id.replace("-", "")[:12]
-        index_name = f"kg_relations_{compact_kb}_{graph_fingerprint[:12]}"
+        embedding_hash = hashlib.sha256(embedding_fingerprint.encode()).hexdigest()[:12]
+        index_name = f"kg_relations_{compact_kb}_{embedding_hash}_{graph_fingerprint[:12]}"
         index_ref = VectorIndexRef(
             name=index_name,
             knowledge_base_id=self.knowledge_base_id,
             index_version=graph_fingerprint[:12],
-            embedding_profile_id=hashlib.sha256(
-                embedding_fingerprint.encode("utf-8")
-            ).hexdigest()[:12],
+            embedding_profile_id=embedding_hash,
         )
         if index_name != old_index_name:
             self._delete_index(index_name)

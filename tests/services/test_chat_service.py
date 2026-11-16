@@ -9,6 +9,21 @@ def _runtime():
     return RAGRuntime(llm=FakeStreamLLM(), retriever=FakeRetriever(), reranker=FakeReranker())
 
 
+def test_explicit_empty_evidence_skips_both_generation_paths():
+    runtime = _runtime()
+    from rag.answer_validation import NO_EVIDENCE_ANSWER
+    assert rag_service.generate("test", "misleading context", runtime=runtime, sources=[]) == NO_EVIDENCE_ANSWER
+    assert "".join(rag_service.stream_generate("test", "misleading context", runtime=runtime, sources=[])) == NO_EVIDENCE_ANSWER
+    assert runtime.llm.calls == []
+
+
+def test_stream_final_answer_removes_unknown_reference_and_reports_status():
+    prepared = {"sources": [{"citation_id": "来源1"}], "route": {}}
+    events = list(rag_service._validated_stream_result(["事实[来源1]，其他[来源99]"], prepared))
+    assert events[0] == {"event": "answer", "data": {"content": "事实[来源1]，其他"}}
+    assert events[1]["data"]["route"]["citation_validation"]["invalid_ids"] == ["来源99"]
+
+
 def test_prepare_context_keeps_original_query():
     runtime = _runtime()
     prepared = rag_service.prepare_context("原始问题", [], runtime)

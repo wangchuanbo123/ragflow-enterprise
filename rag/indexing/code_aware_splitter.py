@@ -7,11 +7,11 @@
 
 from __future__ import annotations
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
 from rag.indexing.code_segments import Segment, extract_segments
-from rag.indexing.tokens import count_tokens
+from rag.indexing.tokens import TOKEN_ENCODING_NAME, count_tokens
 
 _SEPARATORS = [
     "\n\n\n",
@@ -175,6 +175,7 @@ def split_documents_code_aware(
 ) -> list[Document]:
     """按"代码段整体保留、正文段递归切分"的方式切片。"""
     splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        encoding_name=TOKEN_ENCODING_NAME,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         separators=_SEPARATORS,
@@ -203,6 +204,7 @@ def split_documents_code_aware(
                 and not merged[-1][1]
                 and min_chunk_size > 0
                 and count_tokens(text) < min_chunk_size
+                and count_tokens(merged[-1][0] + "\n" + text) <= chunk_size
             ):
                 merged[-1] = (merged[-1][0] + "\n" + text, False)
             else:

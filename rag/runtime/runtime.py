@@ -19,6 +19,7 @@ from rag.providers.interfaces import (
     VectorIndexRef,
 )
 from rag.retrievers.hybrid_retriever import create_hybrid_retriever
+from rag.indexing.profiles import index_ref
 
 logger = logging.getLogger(__name__)
 
@@ -56,16 +57,22 @@ def get_runtime(
         index_signature = repo.get_index_signature()
 
     # The adapter owns connection/path details; runtime only knows a logical index.
-    vector_db = providers.vector_store.open(
-        embedding=embedding,
-        index_ref=VectorIndexRef(
-            name=active_collection,
-            knowledge_base_id=knowledge_base_id,
-        ),
-    )
+    try:
+        vector_db = providers.vector_store.open(
+            embedding=embedding,
+            index_ref=index_ref(active_collection, knowledge_base_id, embedding),
+        )
+    except ValueError as exc:
+        if "Legacy vector identity is unverified" in str(exc) or "does not match" in str(exc):
+            from rag.errors import IndexCompatibilityError
+            raise IndexCompatibilityError(
+                "当前索引与模型或解析配置不兼容。请由知识库编辑者在文档管理中执行“重建全库索引”，完成后重试。"
+            ) from exc
+        from rag.errors import VectorStoreError
+        raise VectorStoreError("知识库向量索引不可用，请检查存储或执行全库重建后重试。", cause=exc) from exc
 
     # Text retrieval remains the baseline channel. Graph and code retrieval are
-    # exposed separately so LangGraph can route and explain each channel.
+    # exposed separately so the workflow can route and explain each channel.
     retriever = create_hybrid_retriever(
         vector_db,
         knowledge_base_id=knowledge_base_id,

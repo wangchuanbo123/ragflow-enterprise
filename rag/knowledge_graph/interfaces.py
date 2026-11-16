@@ -6,6 +6,10 @@ from typing import Any, Protocol
 
 
 class GraphStore(Protocol):
+    def get_effective_entities(self, entity_ids: list[str]) -> list[dict]:
+        """Read governed entity candidates by ID without loading the corpus."""
+        ...
+
     def upsert_extraction(self, chunk: Any, extraction: dict) -> None:
         """保存一个 chunk 的实体关系抽取结果。"""
         ...

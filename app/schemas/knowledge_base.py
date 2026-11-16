@@ -18,6 +18,13 @@ class KnowledgeBaseUpdate(BaseModel):
     description: str | None = Field(default=None, max_length=1000)
 
 
+class KnowledgeBaseCapabilities(BaseModel):
+    can_read: bool = False
+    can_edit: bool = False
+    can_manage_members: bool = False
+    can_archive: bool = False
+
+
 class KnowledgeBaseOut(BaseModel):
     id: str
     name: str
@@ -28,6 +35,8 @@ class KnowledgeBaseOut(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+    current_user_role: str | None = None
+    capabilities: KnowledgeBaseCapabilities = Field(default_factory=KnowledgeBaseCapabilities)
 
     model_config = {"from_attributes": True}
 
@@ -58,7 +67,11 @@ class DataSourceCreate(BaseModel):
     @classmethod
     def reject_inline_secrets(cls, value: dict) -> dict:
         forbidden = {"password", "secret", "secret_key", "access_key", "api_key", "token"}
-        if any(str(key).lower() in forbidden for key in value):
+        def contains_secret(item) -> bool:
+            if isinstance(item, dict):
+                return any(str(key).lower() in forbidden or contains_secret(child) for key, child in item.items())
+            return isinstance(item, list) and any(contains_secret(child) for child in item)
+        if contains_secret(value):
             raise ValueError("敏感凭据不能直接写入配置，请使用 connection_ref")
         return value
 
@@ -111,3 +124,10 @@ class DataSourceSyncOut(BaseModel):
     accepted: int = 0
     skipped: int = 0
     rejected: list[dict] = Field(default_factory=list)
+
+
+class ConnectorCredentialOut(BaseModel):
+    id: str
+    connection_ref: str
+    source_type: Literal["git", "s3"]
+    allowed_locations: list[str]

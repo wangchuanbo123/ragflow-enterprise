@@ -1,4 +1,4 @@
-"""LangGraph node for explainable retrieval routing and scope resolution."""
+"""Explainable retrieval routing and scope resolution."""
 
 from __future__ import annotations
 

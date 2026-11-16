@@ -14,7 +14,7 @@ def main() -> int:
         ensure_initial_admin(db)
         admin = db.query(User).filter(User.role == "admin").order_by(User.created_at).first()
         KnowledgeBaseRepository(db).ensure_default(admin.id if admin else None)
-    print("empty enterprise environment initialized")
+    print("empty environment initialized")
     return 0
 
 

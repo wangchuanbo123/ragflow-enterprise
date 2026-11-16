@@ -6,7 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 
-GraphKind = Literal["general", "concept", "functional", "configuration", "standard"]
+GraphKind = Literal["general"]
 BusinessGraphKind = Literal["concept", "functional", "configuration", "standard"]
 
 
@@ -42,7 +42,7 @@ class GraphProfileOut(BaseModel):
 
 
 class GraphProfileTemplateRequest(BaseModel):
-    graph_kind: BusinessGraphKind
+    graph_kind: str
 
 
 class GraphSchemaCreate(BaseModel):
@@ -50,7 +50,7 @@ class GraphSchemaCreate(BaseModel):
     entity_types: list[str] = Field(min_length=1)
     relation_types: list[str] = Field(min_length=1)
     normalization_rules: dict = Field(default_factory=dict)
-    extraction_prompt: str | None = Field(default=None, max_length=10000)
+    extraction_prompt: str | None = Field(default=None, max_length=100000)
     graph_profiles: dict | None = None
 
 
@@ -66,7 +66,7 @@ class GraphAutomationSettings(BaseModel):
 class GraphSchemaOut(BaseModel):
     id: str
     knowledge_base_id: str
-    graph_kind: GraphKind = "general"
+    graph_kind: str = "general"
     version: int
     status: str
     entity_types_json: list

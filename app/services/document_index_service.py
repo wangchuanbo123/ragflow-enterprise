@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import hashlib
 from pathlib import Path, PurePosixPath
 
 from sqlalchemy.orm import Session
@@ -24,8 +25,9 @@ from app.core.knowledge_bases import (
 from app.models.document_management import DocumentVersion
 from app.models.index_job import IndexJob, IndexJobItem
 from app.repositories.document_management_repository import DocumentManagementRepository
-from app.repositories.index_job_repository import IndexJobRepository
+from app.repositories.index_job_repository import IndexJobRepository, signal_persisted_job
 from app.repositories.knowledge_repository import KnowledgeRepository
+from app.services.knowledge_mutation import serialized_knowledge_mutation
 from rag.errors import DocumentTooLargeError, DocumentValidationError
 from rag.loaders.document_loader import SUPPORTED_EXTENSIONS
 
@@ -76,8 +78,24 @@ class DocumentIndexService:
         self.object_store = object_store
         self.task_queue = task_queue
 
+    @staticmethod
+    def _payload_size(data: bytes | Path) -> int:
+        return data.stat().st_size if isinstance(data, Path) else len(data)
+
+    @staticmethod
+    def _payload_hash(data: bytes | Path) -> str:
+        if isinstance(data, Path):
+            with data.open("rb") as stream:
+                return hashlib.file_digest(stream, "sha256").hexdigest()
+        return hashlib.sha256(data).hexdigest()
+
+    def _store_payload(self, key: str, data: bytes | Path) -> ObjectRef:
+        if isinstance(data, Path):
+            return self.object_store.put_file(key, data)
+        return self.object_store.put_bytes(key, data)
+
     def _signal_job(self, job: IndexJob) -> IndexJob:
-        self.task_queue.enqueue(job.id)
+        signal_persisted_job(self.task_queue, job.id)
         return job
 
     @staticmethod
@@ -95,7 +113,7 @@ class DocumentIndexService:
         self,
         document,
         filename: str,
-        file_data: bytes,
+        file_data: bytes | Path,
         requested_by: str | None,
     ) -> DocumentVersion:
         """Persist an immutable version and move the canonical object pointer."""
@@ -104,23 +122,23 @@ class DocumentIndexService:
             oldest = versions[-1]
             if oldest.object_key == document.source_path:
                 with self.object_store.materialize(document.source_path) as old_path:
-                    archived_ref = self.object_store.put_bytes(
+                    archived_ref = self._store_payload(
                         self._version_object_key(
                             document.source_path,
                             oldest.version_no,
                             document.original_filename,
                         ),
-                        old_path.read_bytes(),
+                        old_path,
                     )
                 oldest.object_key = archived_ref.key
                 self.db.commit()
 
         version_no = self.management_repo.next_version_number(document.id)
-        immutable_ref = self.object_store.put_bytes(
+        immutable_ref = self._store_payload(
             self._version_object_key(document.source_path, version_no, filename),
             file_data,
         )
-        canonical_ref = self.object_store.put_bytes(document.source_path, file_data)
+        canonical_ref = self._store_payload(document.source_path, file_data)
         version = self.management_repo.add_version(
             DocumentVersion(
                 knowledge_base_id=self.knowledge_base_id,
@@ -160,11 +178,49 @@ class DocumentIndexService:
         )
         return self._signal_job(self.job_repo.create(job))
 
-    def request_reindex(self, document_id: str, requested_by: str | None = None) -> IndexJob:
+    def request_rebuild_job(self, requested_by: str | None = None) -> IndexJob:
+        """Queue a full shadow rebuild of this KB's registered originals."""
+        existing = self.job_repo.find_open("rebuild")
+        if existing is not None:
+            return self._signal_job(existing)
+        return self._create_rebuild_job(requested_by)
+
+    @serialized_knowledge_mutation
+    def _create_rebuild_job(self, requested_by: str | None) -> IndexJob:
+        from app.services.index_rebuild_service import registered_rebuild_documents
+
+        existing = self.job_repo.find_open("rebuild")
+        if existing is not None:
+            return self._signal_job(existing)
+        documents = registered_rebuild_documents(self.db, self.knowledge_base_id)
+        if not documents:
+            raise DocumentValidationError("知识库没有可重建的已登记文档")
+        job = IndexJob(
+            job_type="rebuild", status="pending", requested_by=requested_by,
+            total_items=len(documents), max_attempts=INDEX_JOB_MAX_ATTEMPTS,
+            options_json={"source_kind": "registered_objects"},
+        )
+        return self._signal_job(self.job_repo.create(job))
+
+    @serialized_knowledge_mutation
+    def request_reindex(self, document_id: str, requested_by: str | None = None, *, parse_options: dict | None = None) -> IndexJob:
         """请求重新索引单个文档。"""
         doc = self.knowledge_repo.get_by_id(document_id)
         if not doc:
             raise DocumentValidationError(f"Document not found: {document_id}")
+
+        if parse_options is not None:
+            from app.schemas.document import DocumentReindexRequest
+            normalized = DocumentReindexRequest.model_validate(parse_options).model_dump()
+            metadata = dict(doc.metadata_json or {})
+            metadata["parse_options"] = normalized
+            doc.metadata_json = metadata
+
+        existing = self.job_repo.find_open_document(document_id)
+        if existing is not None:
+            if parse_options is not None:
+                self.db.commit()
+            return self._signal_job(existing)
 
         job = IndexJob(
             job_type="file",
@@ -173,17 +229,15 @@ class DocumentIndexService:
             total_items=1,
             max_attempts=INDEX_JOB_MAX_ATTEMPTS,
         )
-        created = self.job_repo.create(job)
-
         item = IndexJobItem(
-            job_id=created.id,
             document_id=document_id,
             source_path=doc.source_path,
             action="update",
         )
-        self.job_repo.add_items([item])
+        created = self.job_repo.create(job, [item])
         return self._signal_job(created)
 
+    @serialized_knowledge_mutation
     def request_delete(self, document_id: str, requested_by: str | None = None) -> IndexJob:
         """请求删除文档。"""
         doc = self.knowledge_repo.get_by_id(document_id)
@@ -200,21 +254,19 @@ class DocumentIndexService:
             total_items=1,
             max_attempts=INDEX_JOB_MAX_ATTEMPTS,
         )
-        created = self.job_repo.create(job)
-
         item = IndexJobItem(
-            job_id=created.id,
             document_id=document_id,
             source_path=doc.source_path,
             action="delete",
         )
-        self.job_repo.add_items([item])
+        created = self.job_repo.create(job, [item])
         return self._signal_job(created)
 
+    @serialized_knowledge_mutation
     def register_upload(
         self,
         filename: str,
-        file_data: bytes,
+        file_data: bytes | Path,
         requested_by: str | None = None,
     ) -> tuple[str, ObjectRef]:
         """Register an uploaded file and return its logical object reference."""
@@ -226,20 +278,22 @@ class DocumentIndexService:
                 f"Unsupported document type. Supported extensions: {supported}"
             )
 
-        if len(file_data) > MAX_DOCUMENT_SIZE_MB * 1024 * 1024:
+        if self._payload_size(file_data) > MAX_DOCUMENT_SIZE_MB * 1024 * 1024:
             raise DocumentTooLargeError(
-                f"File too large: {len(file_data)} bytes (max {MAX_DOCUMENT_SIZE_MB}MB)"
+                f"File too large: {self._payload_size(file_data)} bytes (max {MAX_DOCUMENT_SIZE_MB}MB)"
             )
 
         import hashlib
-        file_hash_val = hashlib.sha256(file_data).hexdigest()
+        file_hash_val = self._payload_hash(file_data)
 
         # Check if document already exists by hash
-        existing = None
-        for doc in self.knowledge_repo.list_documents():
-            if doc.file_hash == file_hash_val and doc.status != "deleted":
-                existing = doc
-                break
+        from sqlalchemy import select
+        from app.models.knowledge_document import KnowledgeDocument
+        existing = self.db.scalar(select(KnowledgeDocument).where(
+            KnowledgeDocument.knowledge_base_id == self.knowledge_base_id,
+            KnowledgeDocument.file_hash == file_hash_val,
+            KnowledgeDocument.status != "deleted",
+        ).limit(1))
 
         import uuid
         document_id = existing.id if existing else str(uuid.uuid4())
@@ -253,10 +307,11 @@ class DocumentIndexService:
                 part for part in (prefix, document_id, safe_name) if part
             )
 
-        return document_id, self.object_store.put_bytes(object_key, file_data)
+        return document_id, self._store_payload(object_key, file_data)
 
+    @serialized_knowledge_mutation
     def create_upload_job(
-        self, filename: str, file_data: bytes, requested_by: str | None = None
+        self, filename: str, file_data: bytes | Path, requested_by: str | None = None
     ) -> tuple[IndexJob, str]:
         """上传文件并创建索引任务。返回 (job, document_id)。"""
         document_id, object_ref = self.register_upload(filename, file_data, requested_by)
@@ -265,6 +320,9 @@ class DocumentIndexService:
         existing_doc = self.knowledge_repo.get_by_id(document_id)
         if existing_doc is not None:
             source_path = existing_doc.source_path
+            existing_job = self.job_repo.find_open_document(document_id)
+            if existing_job is not None:
+                return self._signal_job(existing_job), document_id
         else:
             from app.models.knowledge_document import KnowledgeDocument
 
@@ -278,7 +336,7 @@ class DocumentIndexService:
                 status="pending",
             )
             self.knowledge_repo.upsert_document(existing_doc)
-            version_ref = self.object_store.put_bytes(
+            version_ref = self._store_payload(
                 self._version_object_key(
                     source_path,
                     1,
@@ -307,21 +365,19 @@ class DocumentIndexService:
             total_items=1,
             max_attempts=INDEX_JOB_MAX_ATTEMPTS,
         )
-        created = self.job_repo.create(job)
-
         item = IndexJobItem(
-            job_id=created.id,
             document_id=document_id,
             source_path=source_path,
             action="update" if existing_doc.status == "ready" else "add",
         )
-        self.job_repo.add_items([item])
+        created = self.job_repo.create(job, [item])
         self._signal_job(created)
         return created, document_id
 
+    @serialized_knowledge_mutation
     def create_batch_upload_job(
         self,
-        files: list[tuple[str, bytes]],
+        files: list[tuple[str, bytes | Path]],
         requested_by: str | None = None,
     ) -> tuple[IndexJob, list[str], list[dict]]:
         """Upload many files into one job while reporting rejected files."""
@@ -334,7 +390,7 @@ class DocumentIndexService:
 
         accepted: dict[str, tuple[str, str]] = {}
         rejected: list[dict] = []
-        for filename, file_data in files:
+        for index, (filename, file_data) in enumerate(files):
             try:
                 document_id, object_ref = self.register_upload(
                     filename,
@@ -356,7 +412,7 @@ class DocumentIndexService:
                         status="pending",
                     )
                     self.knowledge_repo.upsert_document(document)
-                    version_ref = self.object_store.put_bytes(
+                    version_ref = self._store_payload(
                         self._version_object_key(
                             source_path,
                             1,
@@ -386,7 +442,7 @@ class DocumentIndexService:
             except Exception as exc:
                 if not isinstance(exc, (DocumentValidationError, DocumentTooLargeError)):
                     raise
-                rejected.append({"filename": filename, "error": str(exc)})
+                rejected.append({"filename": filename, "index": index, "error": str(exc)})
 
         if not accepted:
             raise DocumentValidationError("No valid files were accepted")
@@ -399,12 +455,9 @@ class DocumentIndexService:
                 total_items=len(accepted),
                 max_attempts=INDEX_JOB_MAX_ATTEMPTS,
                 options_json={"rejected_files": rejected} if rejected else None,
-            )
-        )
-        self.job_repo.add_items(
+            ),
             [
                 IndexJobItem(
-                    job_id=job.id,
                     document_id=document_id,
                     source_path=source_path,
                     action=action,
@@ -415,11 +468,12 @@ class DocumentIndexService:
         self._signal_job(job)
         return job, list(accepted), rejected
 
+    @serialized_knowledge_mutation
     def create_document_version(
         self,
         document_id: str,
         filename: str,
-        file_data: bytes,
+        file_data: bytes | Path,
         requested_by: str | None = None,
     ) -> tuple[IndexJob, DocumentVersion]:
         document = self.knowledge_repo.get_by_id(document_id)
@@ -433,9 +487,9 @@ class DocumentIndexService:
             raise DocumentValidationError(
                 "A new version must keep the current document extension"
             )
-        if len(file_data) > MAX_DOCUMENT_SIZE_MB * 1024 * 1024:
+        if self._payload_size(file_data) > MAX_DOCUMENT_SIZE_MB * 1024 * 1024:
             raise DocumentTooLargeError(
-                f"File too large: {len(file_data)} bytes (max {MAX_DOCUMENT_SIZE_MB}MB)"
+                f"File too large: {self._payload_size(file_data)} bytes (max {MAX_DOCUMENT_SIZE_MB}MB)"
             )
 
         version = self._activate_document_version(
@@ -452,11 +506,9 @@ class DocumentIndexService:
             total_items=1,
             max_attempts=INDEX_JOB_MAX_ATTEMPTS,
         )
-        created = self.job_repo.create(job)
-        self.job_repo.add_items(
+        created = self.job_repo.create(job,
             [
                 IndexJobItem(
-                    job_id=created.id,
                     document_id=document.id,
                     source_path=document.source_path,
                     action="update",
@@ -466,6 +518,7 @@ class DocumentIndexService:
         self._signal_job(created)
         return created, version
 
+    @serialized_knowledge_mutation
     def restore_document_version(
         self,
         document_id: str,
@@ -478,14 +531,14 @@ class DocumentIndexService:
         if document is None or version is None:
             raise DocumentValidationError("Document version not found")
         with self.object_store.materialize(version.object_key) as version_path:
-            file_data = version_path.read_bytes()
-        return self.create_document_version(
-            document_id,
-            document.original_filename,
-            file_data,
-            requested_by,
-        )
+            return self.create_document_version(
+                document_id,
+                document.original_filename,
+                version_path,
+                requested_by,
+            )
 
+    @serialized_knowledge_mutation
     def create_data_source_sync_job(
         self,
         source_id: str,
@@ -496,6 +549,8 @@ class DocumentIndexService:
         source_type: str = "local_directory",
         deletion_policy: str = "ignore",
         sync_cursor: dict | None = None,
+        snapshot_complete: bool = True,
+        observed_paths: list[str] | None = None,
     ) -> tuple[IndexJob, list[str], list[str], list[dict]]:
         """Stage an incremental connector snapshot as one auditable index job."""
         import hashlib
@@ -512,9 +567,10 @@ class DocumentIndexService:
         staged: list[tuple[str, str, str]] = []
         skipped: list[str] = []
         incoming_paths = {relative_path for relative_path, _ in files}
+        snapshot_paths = set(observed_paths) if observed_paths is not None else incoming_paths
         existing_by_hash: dict[str, list] = {}
         for existing_path, existing_document in existing_by_relative_path.items():
-            if existing_path not in incoming_paths:
+            if existing_path not in snapshot_paths:
                 existing_by_hash.setdefault(existing_document.file_hash, []).append(existing_document)
         renamed_from: set[str] = set()
 
@@ -616,7 +672,11 @@ class DocumentIndexService:
             except (DocumentValidationError, DocumentTooLargeError, OSError) as exc:
                 rejected.append({"path": relative_path, "error": str(exc)})
 
-        removed_paths = sorted(set(existing_by_relative_path) - incoming_paths - renamed_from)
+        # Rejected/unscanned files are still present at the source. Never infer
+        # removal from a partial snapshot, including failures while staging.
+        snapshot_complete = bool(snapshot_complete and not rejected)
+        removed_paths = (sorted(set(existing_by_relative_path) - snapshot_paths - renamed_from)
+                         if snapshot_complete else [])
         if deletion_policy == "delete":
             for relative_path in removed_paths:
                 document = existing_by_relative_path[relative_path]
@@ -633,27 +693,27 @@ class DocumentIndexService:
             "sync_cursor": sync_cursor or {},
             "skipped_paths": skipped,
             "rejected_files": rejected,
+            "snapshot_complete": snapshot_complete,
         }
         job = self.job_repo.create(
             IndexJob(
                 job_type="file",
-                status="pending",
+                status="pending" if staged else "completed",
                 requested_by=requested_by,
                 total_items=len(staged),
                 max_attempts=INDEX_JOB_MAX_ATTEMPTS,
                 options_json=options,
-            )
-        )
-        if staged:
-            self.job_repo.add_items([
+            ),
+            [
                 IndexJobItem(
-                    job_id=job.id,
                     document_id=document_id,
                     source_path=source_path,
                     action=action,
                 )
                 for document_id, source_path, action in staged
-            ])
+            ],
+        )
+        if staged:
             self._signal_job(job)
         else:
             self.job_repo.update(job, status="completed")
@@ -665,6 +725,7 @@ class DocumentIndexService:
             raise DocumentValidationError(f"Index job not found: {job_id}")
         return self._signal_job(job)
 
+    @serialized_knowledge_mutation
     def request_batch(
         self,
         document_ids: list[str],
@@ -707,20 +768,17 @@ class DocumentIndexService:
             total_items=len(unique_ids),
             max_attempts=INDEX_JOB_MAX_ATTEMPTS,
         )
-        created = self.job_repo.create(job)
         items = []
         for document in documents:
             if action == "delete":
                 document.status = "pending_delete"
             items.append(
                 IndexJobItem(
-                    job_id=created.id,
                     document_id=document.id,
                     source_path=document.source_path,
                     action="delete" if action == "delete" else "update",
                 )
             )
-        self.db.commit()
-        self.job_repo.add_items(items)
+        created = self.job_repo.create(job, items)
         self._signal_job(created)
         return created

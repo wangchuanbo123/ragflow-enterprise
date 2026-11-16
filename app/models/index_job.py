@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
@@ -40,6 +40,7 @@ class KnowledgeIndexState(Base):
 
 class IndexJob(Base):
     __tablename__ = "index_jobs"
+    __table_args__ = (Index("ix_index_jobs_schedule", "status", "priority", "created_at"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     knowledge_base_id: Mapped[str] = mapped_column(
@@ -51,6 +52,7 @@ class IndexJob(Base):
         nullable=False,
     )
     job_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=50, server_default="50")
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     requested_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
     total_items: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

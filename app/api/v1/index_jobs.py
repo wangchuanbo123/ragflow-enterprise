@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.api.legacy_scope import require_default_knowledge_base
 from app.api.errors import forbidden
 from app.core.database import get_db
 from app.models.user import User
@@ -34,6 +35,7 @@ def list_jobs(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    require_default_knowledge_base(db, current_user)
     from app.repositories.index_job_repository import IndexJobRepository
     repo = IndexJobRepository(db)
     return repo.list_jobs()
@@ -45,6 +47,7 @@ def get_job(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    require_default_knowledge_base(db, current_user)
     from app.repositories.index_job_repository import IndexJobRepository
     repo = IndexJobRepository(db)
     job = repo.get(job_id)

@@ -1,4 +1,4 @@
-"""Single RAG application service backed by the compiled LangGraph workflow."""
+"""RAG application service backed by an application-owned retrieval workflow."""
 
 from __future__ import annotations
 
@@ -71,8 +71,9 @@ def invalidate_rag_caches() -> None:
 
         get_provider_container().cache.publish("rag-cache-invalidate", "all")
     except Exception:
-        # Database signatures still provide cross-process correctness.
-        pass
+        from app.core.config import CACHE_PROVIDER
+        if CACHE_PROVIDER == "redis":
+            raise
 
 
 def _retrieval_dict(retrieval_options) -> dict:
@@ -99,6 +100,9 @@ def _initial_state(
 
 
 def _answer_payload(answer: str, sources: list[dict], route: dict) -> dict:
+    from rag.answer_validation import validate_answer
+    answer, validation = validate_answer(answer, sources, route)
+    route["citation_validation"] = validation
     images, code_snippets = collect_source_artifacts(sources)
     return {
         "answer": answer,
@@ -187,7 +191,7 @@ def _combine_routes(
         count = sum(int(item.get("count") or 0) for item in children)
         elapsed_ms = round(sum(float(item.get("elapsed_ms") or 0) for item in children), 2)
         channel_results[name] = {
-            "status": "ok" if count else children[0].get("status", "empty"),
+            "status": "degraded" if any(item.get("status") in {"degraded", "failed", "error"} for item in children) else "ok" if count else children[0].get("status", "empty"),
             "count": count,
             "elapsed_ms": elapsed_ms,
         }
@@ -220,6 +224,8 @@ def _combine_routes(
         "scope": _scope_with_defaults(retrieval_options),
         "scope_match_count": scope_match_count,
         "channel_results": channel_results,
+        "retrieval_diagnostics": [item for route in routes for item in route.get("retrieval_diagnostics", [])],
+        "evidence_status": "sufficient" if fused_count else "unavailable" if failures else "insufficient",
         "fused_count": fused_count,
         "strategy": strategy,
         "rewrite": routes[0].get("rewrite", {}) if routes else {},
@@ -290,19 +296,22 @@ def prepare_context_multi(
     docs = [doc for result in prepared_results for doc in result.get("docs", [])]
     strategy = _retrieval_dict(retrieval_options).get("strategy") or "standard"
     primary_runtime = _active_runtime_for_knowledge_base(knowledge_bases[0]["id"])
-    reranked = create_rerank_node(primary_runtime.reranker)({
+    rerank_result = create_rerank_node(primary_runtime.reranker)({
         "original_query": original_query,
         "docs": docs,
         "retrieval_strategy": strategy,
-    }).get("docs", [])
+    })
+    reranked = rerank_result.get("docs", [])
     policy = get_retrieval_policy(strategy)
     context, sources = build_context(
         reranked,
         max_chunks=policy.context_chunks,
         max_tokens=policy.context_tokens,
+        max_chunks_per_source=policy.source_chunks,
     )
     routes = [result.get("route", {}) for result in prepared_results]
     route = _combine_routes(routes, knowledge_bases, retrieval_options, len(reranked), failures)
+    route["retrieval_diagnostics"].extend(rerank_result.get("route", {}).get("retrieval_diagnostics", []))
     return {
         "retrieval_query": prepared_results[0].get("retrieval_query", original_query) if prepared_results else original_query,
         "retrieval_queries": list(dict.fromkeys(
@@ -320,8 +329,12 @@ def generate(
     context: str,
     history: list[dict] | None = None,
     runtime: RAGRuntime | None = None,
+    *, sources: list[dict] | None = None, route: dict | None = None,
 ) -> str:
     """Compatibility helper for callers that already own a prepared context."""
+    from rag.answer_validation import evidence_unavailable, NO_EVIDENCE_ANSWER, validate_answer
+    if evidence_unavailable(sources, route):
+        return NO_EVIDENCE_ANSWER
     rt = runtime or _active_runtime_for_knowledge_base(DEFAULT_KNOWLEDGE_BASE_ID)
     prompt = build_answer_prompt(
         {
@@ -331,7 +344,10 @@ def generate(
         },
         ANSWER_PROMPT,
     )
-    return rt.llm.generate(prompt)
+    answer, validation = validate_answer(rt.llm.generate(prompt), sources, route)
+    if route is not None:
+        route["citation_validation"] = validation
+    return answer
 
 
 def stream_generate(
@@ -339,8 +355,13 @@ def stream_generate(
     context: str,
     history: list[dict] | None = None,
     runtime: RAGRuntime | None = None,
+    *, sources: list[dict] | None = None, route: dict | None = None,
 ) -> Iterator[str]:
     """Compatibility helper for true model streaming over prepared context."""
+    from rag.answer_validation import evidence_unavailable, NO_EVIDENCE_ANSWER
+    if evidence_unavailable(sources, route):
+        yield NO_EVIDENCE_ANSWER
+        return
     rt = runtime or _active_runtime_for_knowledge_base(DEFAULT_KNOWLEDGE_BASE_ID)
     prompt = build_answer_prompt(
         {
@@ -350,7 +371,8 @@ def stream_generate(
         },
         ANSWER_PROMPT,
     )
-    yield from rt.llm.stream(prompt)
+    from rag.answer_validation import filter_citation_stream
+    yield from filter_citation_stream(rt.llm.stream(prompt), sources, route)
 
 
 def ask(
@@ -393,7 +415,8 @@ def ask_multi(
             retrieval_options,
         )
         runtime = _active_runtime_for_knowledge_base(knowledge_bases[0]["id"])
-        answer = generate(query, prepared["context"], history, runtime)
+        answer = generate(query, prepared["context"], history, runtime,
+                          sources=prepared["sources"], route=prepared["route"])
     return _answer_payload(
         answer, prepared["sources"], prepared["route"]
     )
@@ -406,7 +429,7 @@ def stream(
     knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
     retrieval_options=None,
 ) -> Iterator[dict]:
-    """Prepare through LangGraph, then expose true token/chunk streaming events."""
+    """Prepare context, then expose true token/chunk streaming events."""
     from app.services.rag_concurrency import rag_concurrency
 
     with rag_concurrency():
@@ -419,7 +442,10 @@ def stream(
             knowledge_base_id,
         )
         yield {"event": "route", "data": {"route": prepared["route"]}}
-        for chunk in stream_generate(query, prepared["context"], history, rt):
+        collected = []
+        for chunk in stream_generate(query, prepared["context"], history, rt,
+                                     sources=prepared["sources"], route=prepared["route"]):
+            collected.append(chunk)
             yield {"event": "delta", "data": {"content": chunk}}
         images, code_snippets = collect_source_artifacts(prepared["sources"])
         yield {"event": "sources", "data": {
@@ -427,6 +453,7 @@ def stream(
             "images": images,
             "code_snippets": code_snippets,
         }}
+        yield from _validated_stream_result(collected, prepared)
 
 
 def stream_multi(
@@ -447,7 +474,10 @@ def stream_multi(
         )
         runtime = _active_runtime_for_knowledge_base(knowledge_bases[0]["id"])
         yield {"event": "route", "data": {"route": prepared["route"]}}
-        for chunk in stream_generate(query, prepared["context"], history, runtime):
+        collected = []
+        for chunk in stream_generate(query, prepared["context"], history, runtime,
+                                     sources=prepared["sources"], route=prepared["route"]):
+            collected.append(chunk)
             yield {"event": "delta", "data": {"content": chunk}}
         images, code_snippets = collect_source_artifacts(prepared["sources"])
         yield {"event": "sources", "data": {
@@ -455,6 +485,15 @@ def stream_multi(
             "images": images,
             "code_snippets": code_snippets,
         }}
+        yield from _validated_stream_result(collected, prepared)
+
+
+def _validated_stream_result(collected, prepared):
+    from rag.answer_validation import validate_answer
+    answer, validation = validate_answer("".join(collected), prepared["sources"], prepared["route"])
+    prepared["route"]["citation_validation"] = validation
+    yield {"event": "answer", "data": {"content": answer}}
+    yield {"event": "route", "data": {"route": prepared["route"]}}
 
 
 def inspect_retrieval(

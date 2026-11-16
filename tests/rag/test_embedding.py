@@ -61,7 +61,7 @@ def test_openai_compatible_embeddings_do_not_download_openai_tokenizer(monkeypat
         captured.update(kwargs)
         return sentinel
 
-    monkeypatch.setattr("langchain_openai.OpenAIEmbeddings", fake_embeddings)
+    monkeypatch.setattr("rag.providers.embedding.OpenAIEmbeddings", fake_embeddings)
     provider = OpenAICompatibleEmbeddingProvider(
         model="BAAI/bge-m3",
         api_key="test-key",

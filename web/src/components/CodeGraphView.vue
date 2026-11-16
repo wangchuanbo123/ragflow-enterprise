@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import * as api from '../api/client'
-import type { CodeFileIssue, CodeGraphStats, CodeSnapshot, CodeSnapshotDiff, CodeSubgraph, CodeSymbol, DataSource, IndexJob } from '../types'
+import type { ConnectorCredential, CodeFileIssue, CodeGraphStats, CodeSnapshot, CodeSnapshotDiff, CodeSubgraph, CodeSymbol, DataSource, IndexJob } from '../types'
+import { usePermissions } from '../composables/usePermissions'
+const { canEdit } = usePermissions()
 
 const props = defineProps<{ knowledgeBaseId: string }>()
 const stats = ref<CodeGraphStats | null>(null)
 const snapshots = ref<CodeSnapshot[]>([])
 const sources = ref<DataSource[]>([])
+const credentials = ref<ConnectorCredential[]>([])
 const sourceId = ref('')
 const query = ref('')
 const symbols = ref<CodeSymbol[]>([])
@@ -43,6 +46,7 @@ async function load(): Promise<void> {
       api.listDataSources(props.knowledgeBaseId),
       api.listIndexJobs(props.knowledgeBaseId),
     ])
+    credentials.value = canEdit.value ? await api.listConnectorCredentials(props.knowledgeBaseId) : []
     const valid = sources.value.filter((item) => ['local_directory', 'git'].includes(item.source_type))
     if (!valid.some((item) => item.id === sourceId.value)) sourceId.value = valid[0]?.id ?? ''
     if(!targetSnapshotId.value)targetSnapshotId.value=snapshots.value[0]?.id||''
@@ -55,7 +59,7 @@ async function load(): Promise<void> {
 async function uploadArchive(event:Event):Promise<void>{
   const input=event.target as HTMLInputElement;const file=input.files?.[0];if(!file)return
   loading.value=true;error.value=''
-  try{const source=await api.uploadCodeArchive(props.knowledgeBaseId,file);sourceId.value=source.id;message.value='压缩包已安全上传，请检查代码源后开始构建。';input.value='';await load()}
+  try{const source=await api.uploadCodeArchive(props.knowledgeBaseId,file);sourceId.value=source.id;message.value=source.last_sync_job_id?'压缩包已接收，正在后台解压并建立代码索引。可在任务中心查看进度。':'压缩包已接收，请检查代码源后创建索引任务。';input.value='';await load()}
   catch(e){error.value=(e as Error).message}finally{loading.value=false}
 }
 
@@ -75,6 +79,7 @@ async function indexCode(): Promise<void> {
   loading.value = true
   try {
     const job = await api.requestCodeIndex(props.knowledgeBaseId, sourceId.value)
+    jobs.value.unshift(job)
     message.value = `代码索引任务已创建：${job.id.slice(0, 8)}`
     error.value = ''
   } catch (e) { error.value = (e as Error).message }
@@ -99,6 +104,7 @@ async function createAndIndexCode(): Promise<void> {
     })
     sourceId.value = source.id
     const job = await api.requestCodeIndex(props.knowledgeBaseId, source.id)
+    jobs.value.unshift(job)
     message.value = `已保存代码源并开始构建，任务：${job.id.slice(0, 8)}。Git 提交版本将自动识别。`
     Object.assign(sourceForm, { name: '', location: '', branch: '', subdirectory: '', connection_ref: '' })
     await load()
@@ -124,6 +130,7 @@ async function inspect(symbol: CodeSymbol): Promise<void> {
   catch (e) { error.value = (e as Error).message }
 }
 
+watch(() => sourceForm.source_type, () => { sourceForm.connection_ref='' })
 watch(() => props.knowledgeBaseId, () => { query.value = ''; symbols.value = []; graph.value = null; snapshotDiff.value=null; void load() })
 onMounted(()=>{void load();pollTimer=window.setInterval(()=>{if(codeJob.value&&['pending','running'].includes(codeJob.value.status))void load()},2500)})
 onBeforeUnmount(()=>{if(pollTimer)window.clearInterval(pollTimer)})
@@ -140,14 +147,14 @@ onBeforeUnmount(()=>{if(pollTimer)window.clearInterval(pollTimer)})
     </div>
     <p v-if="error" class="error">{{ error }}</p><p v-if="message" class="message">{{ message }}</p>
 
-    <section class="toolbar-card">
+    <section v-if="canEdit" class="toolbar-card">
       <div><strong>构建代码图谱</strong><small>解析临时 AST、符号索引、调用图和模块依赖图</small></div>
       <select v-model="sourceId"><option value="">选择本地目录或 Git 数据源</option><option v-for="source in sources.filter((item) => ['local_directory','git'].includes(item.source_type))" :key="source.id" :value="source.id">{{ source.name }} · {{ source.source_type }}</option></select>
       <button class="check" :disabled="!sourceId || loading" @click="checkSource">检查连接</button><button :disabled="!sourceId || loading" @click="indexCode">创建索引任务</button>
     </section>
     <section v-if="codeJob" class="build-progress"><header><div><strong>最近一次构建：{{statusNames[codeJob.status]||codeJob.status}}</strong><small>{{codeJob.processed_items}} / {{codeJob.total_items||'待统计'}} 个文件 · 成功 {{codeJob.succeeded_items}} · 失败 {{codeJob.failed_items}}</small></div><b>{{jobProgress}}%</b></header><div><i :style="{width:`${jobProgress}%`}"></i></div><p v-if="codeJob.error_message">{{codeJob.error_message}}</p></section>
 
-    <details class="source-builder">
+    <details v-if="canEdit" class="source-builder">
       <summary><div><strong>首次接入代码仓库</strong><small>不需要填写仓库 ID 或 Commit SHA，系统会自动创建内部编号并识别版本</small></div><span>添加代码源</span></summary>
       <div class="upload-choice"><div><strong>直接上传代码压缩包</strong><small>适合本机代码或一次性分析；无需仓库地址，支持 ZIP。</small></div><label>{{loading?'正在上传…':'选择 ZIP 文件'}}<input type="file" accept=".zip,application/zip" hidden :disabled="loading" @change="uploadArchive" /></label></div>
       <form @submit.prevent="createAndIndexCode">
@@ -155,8 +162,8 @@ onBeforeUnmount(()=>{if(pollTimer)window.clearInterval(pollTimer)})
         <label>显示名称<input v-model="sourceForm.name" required placeholder="例如：订单服务" /></label>
         <label class="wide">{{ sourceForm.source_type === 'git' ? '仓库地址' : '目录路径' }}<input v-model="sourceForm.location" required :placeholder="sourceForm.source_type === 'git' ? 'https://git.example.com/team/order-service.git' : '例如 /data/repos/order-service（容器需挂载）'" /></label>
         <template v-if="sourceForm.source_type === 'git'"><label>分支（可选）<input v-model="sourceForm.branch" placeholder="默认仓库分支" /></label><label>子目录（可选）<input v-model="sourceForm.subdirectory" placeholder="例如 services/order" /></label></template>
-        <label class="wide">凭据引用（可选）<input v-model="sourceForm.connection_ref" placeholder="env://GIT_TOKEN，不直接保存密码或 Token" /></label>
-        <p class="wide">{{ sourceForm.source_type === 'git' ? '笔记本和服务器部署都可使用仓库地址，服务会自动拉取并记录 Commit SHA。' : '“本地目录”指运行服务的笔记本或服务器可访问的目录；容器部署时需先把目录挂载进容器。' }}</p>
+        <label v-if="sourceForm.source_type==='git'" class="wide">授权凭据<select v-model="sourceForm.connection_ref"><option value="">公开仓库，无需凭据</option><option v-for="credential in credentials.filter(item=>item.source_type==='git')" :key="credential.id" :value="credential.connection_ref">{{credential.id}}</option></select></label>
+        <p class="wide">{{ sourceForm.source_type === 'git' ? '使用仓库地址即可，服务会自动拉取并记录 Commit SHA。' : '“本地目录”需要管理员在服务器为本知识库登记允许读取的目录，也可直接上传 ZIP。' }}</p>
         <button class="wide" :disabled="loading">保存并构建代码图谱</button>
       </form>
     </details>

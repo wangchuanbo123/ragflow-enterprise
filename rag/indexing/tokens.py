@@ -9,6 +9,7 @@ import tiktoken
 
 _ENCODER: tiktoken.Encoding | None = None
 _ENCODER_LOADED = False
+TOKEN_ENCODING_NAME = "cl100k_base"
 
 
 def _get_encoder() -> tiktoken.Encoding | None:
@@ -16,7 +17,7 @@ def _get_encoder() -> tiktoken.Encoding | None:
     if not _ENCODER_LOADED:
         _ENCODER_LOADED = True
         try:
-            _ENCODER = tiktoken.get_encoding("cl100k_base")
+            _ENCODER = tiktoken.get_encoding(TOKEN_ENCODING_NAME)
         except Exception:
             _ENCODER = None
     return _ENCODER

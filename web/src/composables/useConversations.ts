@@ -10,62 +10,109 @@ const errorMsg = ref('')
 const loadingList = ref(false)
 const loadingDetail = ref(false)
 let activeController: AbortController | null = null
+let detailController: AbortController | null = null
+let generation = 0
+let selection = 0
 
 function resetDetail(): void {
+  selection += 1
+  detailController?.abort()
+  detailController = null
   messages.value = []
   errorMsg.value = ''
+  loadingDetail.value = false
+}
+
+export function resetConversations(): void {
+  generation += 1
+  activeController?.abort()
+  activeController = null
+  conversations.value = []
+  activeId.value = null
+  sending.value = false
+  loadingList.value = false
+  resetDetail()
 }
 
 async function loadList(): Promise<void> {
+  const started = generation
   loadingList.value = true
   try {
-    conversations.value = await api.listConversations()
+    const loaded = await api.listConversations()
+    if (started !== generation) return
+    conversations.value = loaded
+    if (activeId.value && !loaded.some(item => item.id === activeId.value)) {
+      activeId.value = null
+      resetDetail()
+    }
   } catch (e) {
-    errorMsg.value = (e as Error).message
+    if (started === generation && (e as Error).name !== 'AbortError') errorMsg.value = (e as Error).message
   } finally {
-    loadingList.value = false
+    if (started === generation) loadingList.value = false
   }
 }
 
 async function select(id: string): Promise<void> {
   activeId.value = id
   resetDetail()
+  const selected = selection
+  detailController = new AbortController()
   loadingDetail.value = true
   try {
-    const detail: ConversationDetail = await api.getConversation(id)
+    const detail: ConversationDetail = await api.getConversation(id, detailController.signal)
+    if (selected !== selection || activeId.value !== id) return
     messages.value = detail.messages
   } catch (e) {
-    errorMsg.value = (e as Error).message
+    if (selected === selection && (e as Error).name !== 'AbortError') errorMsg.value = (e as Error).message
   } finally {
-    loadingDetail.value = false
+    if (selected === selection) loadingDetail.value = false
   }
 }
 
 async function create(knowledgeBaseId?: string): Promise<void> {
-  const conv = await api.createConversation('新会话', knowledgeBaseId)
-  conversations.value.unshift(conv)
-  await select(conv.id)
-}
-
-async function rename(id: string, title: string): Promise<void> {
-  const conv = await api.renameConversation(id, title)
-  const idx = conversations.value.findIndex((c) => c.id === id)
-  if (idx !== -1) conversations.value[idx] = { ...conversations.value[idx], ...conv }
-}
-
-async function remove(id: string): Promise<void> {
-  await api.deleteConversation(id)
-  conversations.value = conversations.value.filter((c) => c.id !== id)
-  if (activeId.value === id) {
-    activeId.value = null
+  const started = generation
+  try {
+    const conv = await api.createConversation('新会话', knowledgeBaseId)
+    if (started !== generation) return
+    conversations.value.unshift(conv)
+    activeId.value = conv.id
     resetDetail()
+  } catch (e) {
+    if (started === generation && (e as Error).name !== 'AbortError') errorMsg.value = (e as Error).message
+    throw e
   }
 }
 
-async function send(content: string, strategy: RetrievalStrategy = 'standard', scope?: Partial<RetrievalScope>): Promise<void> {
-  if (!activeId.value || sending.value) return
-  const convId = activeId.value
+async function rename(id: string, title: string): Promise<void> {
+  const started = generation
+  try {
+    const conv = await api.renameConversation(id, title)
+    if (started !== generation) return
+    const idx = conversations.value.findIndex((c) => c.id === id)
+    if (idx !== -1) conversations.value[idx] = { ...conversations.value[idx], ...conv }
+  } catch(e) { if(started===generation&&(e as Error).name!=='AbortError')errorMsg.value=(e as Error).message }
+}
+
+async function remove(id: string): Promise<void> {
+  const started = generation
+  try {
+    await api.deleteConversation(id)
+    if (started !== generation) return
+    conversations.value = conversations.value.filter((c) => c.id !== id)
+    if (activeId.value === id) { activeId.value = null; resetDetail() }
+  } catch(e) { if(started===generation&&(e as Error).name!=='AbortError')errorMsg.value=(e as Error).message }
+}
+
+async function send(content: string, strategy: RetrievalStrategy = 'standard', scope?: Partial<RetrievalScope>, knowledgeBaseId?: string): Promise<boolean> {
+  if (!content.trim() || sending.value) return false
+  const started = generation
   sending.value = true
+  if (!activeId.value) {
+    try { await create(knowledgeBaseId) }
+    catch { if (started === generation) sending.value = false; return false }
+  }
+  if (started !== generation || !activeId.value) return false
+  const convId = activeId.value
   activeController = new AbortController()
   errorMsg.value = ''
 
@@ -116,6 +163,13 @@ async function send(content: string, strategy: RetrievalStrategy = 'standard', s
           deltaBuffer += chunk
           scheduleDelta()
         },
+        onAnswer: (content) => {
+          if (started !== generation) return
+          if (deltaFrame != null) window.cancelAnimationFrame(deltaFrame)
+          deltaFrame = null
+          deltaBuffer = ''
+          assistantMsg.content = content
+        },
         onRoute: (route) => {
           assistantMsg.route = route
         },
@@ -131,10 +185,11 @@ async function send(content: string, strategy: RetrievalStrategy = 'standard', s
           assistantMsg.status = status
         },
         onError: (code, message) => {
+          if (started !== generation) return
           void code
           assistantMsg.status = 'failed'
           assistantMsg.error_message = message
-          errorMsg.value = message
+          if(activeId.value===convId)errorMsg.value = message
         },
       },
       { strategy, scope },
@@ -144,19 +199,23 @@ async function send(content: string, strategy: RetrievalStrategy = 'standard', s
     if (deltaFrame != null) window.cancelAnimationFrame(deltaFrame)
     deltaFrame = null
     flushDelta()
+    if (started !== generation) return false
     if ((e as Error).name === 'AbortError') {
-      assistantMsg.status = 'stopped'
+      assistantMsg.status = 'interrupted'
       assistantMsg.error_message = null
     } else {
       assistantMsg.status = 'failed'
       assistantMsg.error_message = (e as Error).message
-      errorMsg.value = (e as Error).message
+      if(activeId.value===convId)errorMsg.value = (e as Error).message
     }
   } finally {
     flushDelta()
-    sending.value = false
-    activeController = null
+    if (started === generation) {
+      sending.value = false
+      activeController = null
+    }
   }
+  return started === generation && assistantMsg.status !== 'failed'
 }
 
 function stop(): void {
@@ -166,8 +225,10 @@ function stop(): void {
 async function feedback(messageId:string, rating:'helpful'|'unhelpful', comment?:string):Promise<void> {
   const message = messages.value.find(item=>item.id===messageId)
   if (!message?.conversation_id || !message.id) return
-  await api.saveMessageFeedback(message.conversation_id, message.id, rating, comment)
-  message.feedback = rating
+  try {
+    await api.saveMessageFeedback(message.conversation_id, message.id, rating, comment)
+    message.feedback = rating
+  } catch(e) { if((e as Error).name!=='AbortError')errorMsg.value=(e as Error).message }
 }
 
 export function useConversations() {

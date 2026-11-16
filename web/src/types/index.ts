@@ -13,6 +13,16 @@ export interface KnowledgeBase {
   description: string | null
   is_default: boolean
   is_active: boolean
+  owner_id?: string | null
+  current_user_role?: 'admin' | 'owner' | 'editor' | 'viewer'
+  capabilities?: { can_read: boolean; can_edit: boolean; can_manage_members: boolean; can_archive: boolean }
+}
+
+export interface ConnectorCredential {
+  id: string
+  connection_ref: string
+  source_type: 'git' | 's3'
+  allowed_locations: string[]
 }
 
 export interface KnowledgeBaseMember {
@@ -88,6 +98,7 @@ export interface Conversation {
 }
 
 export interface RetrievalScope {
+  selection_kind?: 'all' | 'knowledge_base' | 'document' | 'folder' | 'tag'
   knowledge_base_ids: string[]
   document_ids: string[]
   tag_ids: string[]
@@ -112,6 +123,9 @@ export interface RouteDecision {
   rewrite?: { applied?: boolean; requested?: boolean; reason?: string }
   query_embedding?: { status?: string; shared?: boolean; dimensions?: number; elapsed_ms?: number }
   knowledge_bases?: Array<{ id: string; name: string; status?: string }>
+  retrieval_diagnostics?: Array<{ channel: string; status: 'ok' | 'degraded' | 'error' | 'skipped'; code: string; count: number; elapsed_ms: number; detail?: string }>
+  evidence_status?: 'sufficient' | 'insufficient' | 'unavailable'
+  citation_validation?: { status?: 'valid' | 'invalid' | 'unverified' | 'not_applicable'; invalid_ids?: string[]; valid_ids?: string[]; support_status?: 'not_checked' | 'no_evidence' | 'lexical_overlap_only' }
 }
 
 export interface Message {
@@ -241,7 +255,20 @@ export interface KnowledgeDocument {
   created_at: string
   updated_at: string
   indexed_at: string | null
+  processing?: ProcessingState | null
 }
+
+export interface ProcessingStage { name: string; status: string }
+export interface ProcessingState {
+  job_id: string
+  stage: string | null
+  status: string
+  message: string | null
+  updated_at: string | null
+  waiting_reason: string | null
+  stages: ProcessingStage[]
+}
+export interface PageResult<T> { items: T[]; total: number; offset: number; limit: number }
 
 export interface DocumentChunk {
   id: string
@@ -294,6 +321,12 @@ export interface IndexJob {
   created_at: string
   started_at: string | null
   finished_at: string | null
+  document_ids?: string[]
+  document_names?: string[]
+  current_stage?: string | null
+  waiting_reason?: string | null
+  stages?: ProcessingStage[]
+  priority?:number
 }
 
 export interface GraphStats {
@@ -377,7 +410,14 @@ export interface RetrievalDebugResult {
 export interface Readiness {
   status: string
   checked_at: string
+  model_inference_verified?: boolean
   components: Record<string, { status: string; detail?: string; [key: string]: unknown }>
+}
+
+export interface ModelProbe {
+  status: 'verified' | 'failed'
+  checked_at: string
+  profiles: Record<string, { status: 'ok'|'fail'; elapsed_ms: number; error_type?: string; http_status?: number | null; detail?: string }>
 }
 
 export interface CodeGraphStats {
@@ -464,7 +504,7 @@ export interface GraphSchema {
   created_at: string
 }
 
-export type GraphKind = 'general' | 'concept' | 'functional' | 'configuration' | 'standard'
+export type GraphKind = 'general'
 
 export interface GraphProfileEntityType {
   name: string
@@ -610,5 +650,18 @@ export interface DocumentGraphCoverage {
 }
 
 export interface ApiError {
-  error: { code: string; message: string }
+  error: { code: string; message: string; details?: unknown }
 }
+
+export interface GraphFilterPreview {
+  per_principle_counts?:Array<{index:number;matched_nodes:number;matched_edges:number}>
+  nodes: SubgraphNode[]
+  edges: SubgraphEdge[]
+  stats: { total_nodes:number;total_edges:number;matched_nodes:number;matched_edges:number;returned_nodes:number;returned_edges:number;truncated:boolean }
+  plan: {version:number;principles:Array<{index:number;status:string;summary:string;alternatives?:unknown}>}
+  summary:string
+  warnings:string[]
+  unapplied_principles:Array<{index:number;principle:string;reason:string}>
+  schema_fingerprint:string
+}
+export interface SavedGraphFilter {id:string;name:string;principles:string[];created_at:string;updated_at:string;schema_fingerprint:string}

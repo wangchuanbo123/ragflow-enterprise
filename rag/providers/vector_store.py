@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from langchain_community.vectorstores import Chroma
 
 from rag.providers.interfaces import (
     ProviderHealth,
@@ -44,13 +43,37 @@ class ChromaVectorStoreProvider:
         )
 
     def open(self, embedding, index_ref: VectorIndexRef):
+        from langchain_community.vectorstores import Chroma
         kwargs = {
             "persist_directory": self.persist_dir,
             "embedding_function": embedding,
         }
         if index_ref.name:
             kwargs["collection_name"] = index_ref.name
-        return Chroma(**kwargs)
+        store = Chroma(**kwargs)
+        collection = store._collection
+        metadata = dict(collection.metadata or {})
+        changes = {}
+        for key in ("index_version", "embedding_profile_id"):
+            requested = getattr(index_ref, key)
+            if not requested:
+                continue
+            if metadata.get(key) and metadata[key] != requested:
+                raise ValueError(f"Vector collection {key} does not match")
+            if not metadata.get(key):
+                if collection.count():
+                    raise ValueError("Legacy vector identity is unverified; rebuild into a new shadow collection before use")
+                changes[key] = requested
+        if changes:
+            collection.modify(metadata={**metadata, **changes})
+        return store
+
+    def probe(self):
+        try:
+            self.client.heartbeat()
+            return ProviderHealth.ok(provider="chroma_embedded")
+        except Exception as exc:
+            return ProviderHealth.fail(f"Chroma unavailable ({type(exc).__name__})")
 
     def health(
         self,
@@ -146,66 +169,3 @@ class ChromaVectorStoreProvider:
         if where is not None:
             kwargs["where"] = dict(where)
         self._collection(index_ref).delete(**kwargs)
-
-
-class ChromaHttpVectorStoreProvider(ChromaVectorStoreProvider):
-    """Chroma server adapter used by horizontally scaled deployments."""
-
-    def __init__(
-        self,
-        *,
-        host: str,
-        port: int = 8000,
-        ssl: bool = False,
-        tenant: str = "default_tenant",
-        database: str = "default_database",
-        auth_token: str = "",
-        client=None,
-    ):
-        if not host:
-            raise ValueError("CHROMA_HTTP_HOST is required")
-        super().__init__(persist_dir="", client=client)
-        self.host = host
-        self.port = port
-        self.ssl = ssl
-        self.tenant = tenant
-        self.database = database
-        self.auth_token = auth_token
-
-    @property
-    def client(self):
-        if self._client is None:
-            import chromadb
-
-            headers = None
-            if self.auth_token:
-                headers = {"Authorization": f"Bearer {self.auth_token}"}
-            self._client = chromadb.HttpClient(
-                host=self.host,
-                port=self.port,
-                ssl=self.ssl,
-                headers=headers,
-                tenant=self.tenant,
-                database=self.database,
-            )
-        return self._client
-
-    def identity(self) -> ProviderIdentity:
-        return ProviderIdentity(
-            kind="vector_store",
-            provider="chroma_http",
-            capabilities=(
-                "metadata_filter",
-                "versioned_collection",
-                "shared_service",
-            ),
-        )
-
-    def open(self, embedding, index_ref: VectorIndexRef):
-        kwargs = {
-            "client": self.client,
-            "embedding_function": embedding,
-        }
-        if index_ref.name:
-            kwargs["collection_name"] = index_ref.name
-        return Chroma(**kwargs)

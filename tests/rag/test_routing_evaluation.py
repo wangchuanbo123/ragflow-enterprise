@@ -5,7 +5,7 @@ from scripts.evaluate_routing import evaluate_cases, load_cases
 
 
 def test_rule_router_passes_versioned_golden_cases():
-    cases = load_cases(Path("eval/data/routing_cases.jsonl"))
+    cases = load_cases(Path("eval/routing_cases.jsonl"))
     result = evaluate_cases(cases)
 
     assert result["case_count"] >= 10

@@ -31,6 +31,14 @@ def _seed(db):
 
 def test_knowledge_base_backup_is_versioned_and_restorable(db_engine, tmp_path, monkeypatch):
     from sqlalchemy.orm import Session
+    from types import SimpleNamespace
+    from tests.test_index import FakeVectorProvider
+
+    container = SimpleNamespace(
+        vector_store=FakeVectorProvider(),
+        embedding=SimpleNamespace(get_model=lambda: object()),
+    )
+    monkeypatch.setattr("app.bootstrap.container.get_provider_container", lambda: container)
 
     store = LocalObjectStore(tmp_path / "objects")
     store.put_bytes("documents/doc.txt", b"hello")

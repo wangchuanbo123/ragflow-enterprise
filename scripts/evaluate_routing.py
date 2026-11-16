@@ -68,7 +68,7 @@ def main() -> int:
     parser.add_argument(
         "--cases",
         type=Path,
-        default=Path("eval/data/routing_cases.jsonl"),
+        default=Path(__file__).resolve().parents[1] / "eval" / "routing_cases.jsonl",
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--min-exact-match", type=float, default=1.0)

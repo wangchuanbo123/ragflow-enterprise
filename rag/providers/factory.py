@@ -1,13 +1,6 @@
 from functools import lru_cache
 
 from app.core.config import (
-    APP_PROFILE,
-    CHROMA_HTTP_AUTH_TOKEN,
-    CHROMA_HTTP_DATABASE,
-    CHROMA_HTTP_HOST,
-    CHROMA_HTTP_PORT,
-    CHROMA_HTTP_SSL,
-    CHROMA_HTTP_TENANT,
     EMBEDDING_API_KEY,
     EMBEDDING_BASE_URL,
     EMBEDDING_MODEL,
@@ -48,7 +41,7 @@ def create_llm_provider(
 ) -> LLMProvider:
     provider = provider.lower()
     if allow_ollama_fallback is None:
-        allow_ollama_fallback = APP_PROFILE != "enterprise"
+        allow_ollama_fallback = True
 
     if provider == "ollama":
         from rag.providers.llm import OllamaLLMProvider
@@ -71,8 +64,8 @@ def create_llm_provider(
         if not api_key.strip() or not base_url.strip():
             if not allow_ollama_fallback:
                 raise ValueError(
-                    "Enterprise profile requires explicit LLM_API_KEY and "
-                    "LLM_BASE_URL; implicit Ollama fallback is disabled"
+                    "Remote LLM provider requires explicit API key and "
+                    "base URL; implicit Ollama fallback is disabled"
                 )
             from rag.providers.llm import OllamaLLMProvider
 
@@ -173,29 +166,23 @@ def get_reranker() -> Reranker:
 
 @lru_cache(maxsize=1)
 def get_vector_store_provider() -> VectorStoreProvider:
+    if VECTOR_STORE_PROVIDER in {"pgvector", "postgresql"}:
+        from app.core.database import engine
+        from rag.providers.pgvector_store import PgVectorStoreProvider
+
+        return PgVectorStoreProvider(engine)
+
     if VECTOR_STORE_PROVIDER in {"chroma", "chroma_embedded"}:
         from rag.providers.vector_store import ChromaVectorStoreProvider
 
         return ChromaVectorStoreProvider(persist_dir=VECTOR_DB_DIR)
-
-    if VECTOR_STORE_PROVIDER in {"chroma_http", "chroma_server"}:
-        from rag.providers.vector_store import ChromaHttpVectorStoreProvider
-
-        return ChromaHttpVectorStoreProvider(
-            host=CHROMA_HTTP_HOST,
-            port=CHROMA_HTTP_PORT,
-            ssl=CHROMA_HTTP_SSL,
-            tenant=CHROMA_HTTP_TENANT,
-            database=CHROMA_HTTP_DATABASE,
-            auth_token=CHROMA_HTTP_AUTH_TOKEN,
-        )
 
     raise ValueError(f"Unsupported vector store provider: {VECTOR_STORE_PROVIDER}")
 
 
 def get_graph_store(db, knowledge_base_id=None):
     """Create a session-scoped graph store adapter."""
-    if GRAPH_STORE_PROVIDER in {"sqlite", "sqlalchemy", "postgres", "postgresql"}:
+    if GRAPH_STORE_PROVIDER in {"sqlite", "sqlalchemy"}:
         from rag.knowledge_graph.sqlite_store import SqliteGraphStore
 
         return SqliteGraphStore(db, knowledge_base_id=knowledge_base_id)

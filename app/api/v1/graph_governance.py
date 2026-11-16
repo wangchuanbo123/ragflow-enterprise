@@ -1,6 +1,6 @@
 """Scoped graph build, schema, quality, and human-governance APIs."""
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
@@ -53,12 +53,14 @@ def _require(db: Session, knowledge_base_id: str, user: User, *, edit: bool = Fa
 
 
 @router.get("/{knowledge_base_id}/knowledge-graph/schemas", response_model=list[GraphSchemaOut])
-def list_graph_schemas(knowledge_base_id: str, graph_kind: str | None = Query(default=None), current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def list_graph_schemas(knowledge_base_id: str, graph_kind: str | None = Query(default=None), include_legacy: bool = Query(default=False), current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     _require(db, knowledge_base_id, current_user)
     service = GraphGovernanceService(db, knowledge_base_id)
-    for kind in ("general", "concept", "functional", "configuration", "standard"):
-        service.active_schema(graph_kind=kind)
-    return service.list_schemas(graph_kind=graph_kind)
+    service.ensure_total_schema()
+    try:
+        return service.list_schemas(graph_kind=graph_kind, include_legacy=include_legacy)
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
 
 
 @router.get(
@@ -70,7 +72,7 @@ def list_graph_profiles(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Return the general document graph and four professional graph contracts."""
+    """Return the sole knowledge-base total graph contract."""
     _require(db, knowledge_base_id, current_user)
     return GraphGovernanceService(db, knowledge_base_id).list_graph_profiles()
 
@@ -103,15 +105,9 @@ def create_profile_schema_template(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Create a draft for one professional graph; activation remains explicit."""
+    """Retired templates never silently create an unrelated total Schema."""
     _require(db, knowledge_base_id, current_user, edit=True)
-    try:
-        return GraphGovernanceService(db, knowledge_base_id).create_profile_schema(
-            graph_kind=payload.graph_kind,
-            created_by=current_user.id,
-        )
-    except ValueError as exc:
-        raise bad_request(str(exc)) from exc
+    raise HTTPException(status_code=410, detail="独立专业图谱模板已停用，请使用知识库总Schema")
 
 
 @router.post(

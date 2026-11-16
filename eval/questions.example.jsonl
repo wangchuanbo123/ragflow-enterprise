@@ -1,0 +1,6 @@
+{"id":"example-001","split":"tuning","category":"exact_term","question":"演示系统支持哪个数据库？","ground_truth":"SQLite","answer_keywords":["SQLite"],"relevant_sources":[{"source":"demo.txt"}],"unanswerable":false}
+{"id":"example-002","split":"tuning","category":"semantic","question":"演示系统如何持久化数据？","ground_truth":"使用SQLite和本地文件","answer_keywords":["SQLite","文件"],"relevant_sources":[{"source":"demo.txt"}],"unanswerable":false}
+{"id":"example-003","split":"tuning","category":"procedure","question":"如何启动演示系统？","ground_truth":"运行start.cmd","answer_keywords":["start.cmd"],"relevant_sources":[{"source":"demo.txt"}],"unanswerable":false}
+{"id":"example-004","split":"holdout","category":"multi_source","question":"演示系统有哪些存储组件？","ground_truth":"SQLite和Chroma","answer_keywords":["SQLite","Chroma"],"relevant_sources":[{"source":"demo.txt"},{"source":"storage.txt"}],"unanswerable":false}
+{"id":"example-005","split":"holdout","category":"relationship","question":"演示系统和Chroma是什么关系？","ground_truth":"系统用Chroma存储向量","answer_keywords":["向量"],"relevant_sources":[{"source":"storage.txt"}],"unanswerable":false}
+{"id":"example-006","split":"holdout","category":"unanswerable","question":"演示系统明年的营收是多少？","ground_truth":"资料不足","answer_keywords":[],"relevant_sources":[],"unanswerable":true}

@@ -1,8 +1,56 @@
 from functools import cached_property
 
 import httpx
+import math
+from openai import OpenAI
 
 from rag.providers.interfaces import ProviderHealth, ProviderIdentity
+
+
+class OpenAIEmbeddings:
+    """Raw-string embedding requests; compatible endpoints own tokenization."""
+    def __init__(self, *, model, api_key, base_url, request_timeout=120, max_retries=2,
+                 http_client=None, dimensions=None, **_compatibility):
+        self.model, self.base_url, self.dimensions = model, base_url, dimensions
+        self.embed_instruction = self.query_instruction = ''
+        self._sdk = OpenAI(api_key=api_key, base_url=base_url, timeout=request_timeout,
+                           max_retries=max_retries, http_client=http_client)
+        self.client = self._sdk.embeddings
+
+    @property
+    def max_retries(self):
+        return self._sdk.max_retries
+
+    @max_retries.setter
+    def max_retries(self, value):
+        self._sdk.max_retries = value
+
+    def embed_documents(self, texts):
+        if not texts:
+            return []
+        vectors = []
+        for offset in range(0, len(texts), 128):
+            batch = texts[offset:offset+128]
+            payload = {'model': self.model, 'input': batch, 'encoding_format': 'float'}
+            if self.dimensions is not None:
+                payload['dimensions'] = self.dimensions
+            response = self.client.create(**payload)
+            rows = sorted(response.data, key=lambda row: row.index)
+            if [row.index for row in rows] != list(range(len(batch))):
+                raise ValueError('Embedding response does not match the requested inputs')
+            values = [row.embedding for row in rows]
+            if any(not vector or not all(math.isfinite(float(value)) for value in vector) for vector in values):
+                raise ValueError('Embedding response contains empty or non-finite vectors')
+            vectors.extend(values)
+        if len({len(vector) for vector in vectors}) > 1:
+            raise ValueError('Embedding response contains inconsistent vector dimensions')
+        return vectors
+
+    def embed_query(self, text):
+        return self.embed_documents([text])[0]
+
+    def close(self):
+        self._sdk.close()
 
 
 class OllamaBatchEmbeddings:
@@ -86,7 +134,7 @@ class OllamaEmbeddingProvider:
 
 
 class OpenAICompatibleEmbeddingProvider:
-    """Embedding adapter for OpenAI-compatible enterprise endpoints."""
+    """Embedding adapter for OpenAI-compatible endpoints."""
 
     def __init__(self, model: str, api_key: str, base_url: str, timeout: float = 120):
         self.model = model
@@ -98,8 +146,6 @@ class OpenAICompatibleEmbeddingProvider:
     def _model(self):
         if not self.api_key or not self.base_url:
             raise RuntimeError("Embedding API key and base URL are required")
-        from langchain_openai import OpenAIEmbeddings
-
         return OpenAIEmbeddings(
             model=self.model,
             api_key=self.api_key,

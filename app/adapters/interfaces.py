@@ -26,6 +26,9 @@ class ObjectStoreProvider(Protocol):
     def put_bytes(self, key: str, data: bytes) -> ObjectRef:
         """Atomically store bytes and return their logical reference."""
 
+    def put_file(self, key: str, path: Path) -> ObjectRef:
+        """Atomically copy a file with bounded memory and return its reference."""
+
     def exists(self, key: str) -> bool:
         """Return whether an object exists."""
 

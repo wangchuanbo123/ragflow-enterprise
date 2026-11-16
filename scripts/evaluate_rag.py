@@ -19,6 +19,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import platform
 import statistics
 import subprocess
@@ -29,6 +30,8 @@ from pathlib import Path
 from typing import Any
 
 import tiktoken
+
+from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 EVAL_DIR = PROJECT_ROOT / "eval"
@@ -70,6 +73,11 @@ def _validate_question(q: dict, line_num: int) -> None:
     else:
         if q.get("relevant_sources"):
             raise ValueError(f"题目 {qid} 标记为 unanswerable 但 relevant_sources 非空")
+    for fact in q.get("required_facts") or []:
+        if not isinstance(fact, dict) or not (fact.get("phrases") or fact.get("text")):
+            raise ValueError(f"题目 {qid} 的 required_facts 需要 text 或 phrases")
+        if any(not isinstance(item, dict) or not item.get("source") or not item.get("quote") for item in fact.get("evidence") or []):
+            raise ValueError(f"题目 {qid} 的事实证据需要 source 和 quote")
 
 
 def filter_by_split(questions: list[dict], split: str) -> list[dict]:
@@ -164,13 +172,17 @@ def _normalize_source(source: str | None) -> str:
     parts = [part for part in raw.split("/") if part not in ("", ".")]
     lowered = [part.casefold() for part in parts]
 
-    for index in range(len(parts) - 1):
-        if lowered[index:index + 2] == ["data", "docs"]:
-            return "/".join(parts[index + 2:])
-
-    if "docs" in lowered:
-        docs_index = lowered.index("docs")
-        return "/".join(parts[docs_index + 1:])
+    # Strip only a known storage-root prefix. Business paths may legitimately
+    # contain a docs directory and must remain distinct from one another.
+    absolute = raw.startswith("/") or bool(re.match(r"^[A-Za-z]:/", raw))
+    if absolute:
+        for index in range(len(parts) - 1):
+            if lowered[index:index + 2] == ["data", "docs"]:
+                return "/".join(parts[index + 2:])
+    elif lowered[:2] == ["data", "docs"]:
+        return "/".join(parts[2:])
+    elif lowered[:1] == ["docs"]:
+        return "/".join(parts[1:])
 
     return "/".join(parts)
 
@@ -224,6 +236,47 @@ def compute_answer_keyword_recall(answer: str, keywords: list[str]) -> float:
     return hits / len(keywords)
 
 
+def fact_evidence_metrics(answer: str, question: dict, sources: list[dict], context: str = "") -> dict:
+    """Deterministic gold phrase/evidence proxies, never semantic truth scores.
+
+    required_facts: [{text, phrases: [all required phrases], evidence: [{source, quote}]}].
+    Gold quotes must occur in retrieved evidence; copying a fact without its
+    expected source and quote does not receive evidence credit.
+    """
+    facts = question.get("required_facts") or []
+    folded = answer.casefold()
+    covered, supported = 0, 0
+    for fact in facts:
+        phrases = fact.get("phrases") or [fact.get("text", "")]
+        present = bool(phrases) and all(str(phrase).casefold() in folded for phrase in phrases if phrase)
+        covered += int(present)
+        evidence_found = False
+        for expected in fact.get("evidence") or []:
+            quote = str(expected.get("quote") or "").strip()
+            for source in sources:
+                if _normalize_source(source.get("source")) != _normalize_source(expected.get("source")):
+                    continue
+                identifier = source.get("citation_id", "")
+                match = re.search(rf"([^。！？\n]*\[{re.escape(identifier)}\][^。！？\n]*)", answer)
+                citation_has_fact = bool(match and all(str(phrase).casefold() in match.group(1).casefold() for phrase in phrases if phrase))
+                evidence_text = str(source.get("evidence_text") or source.get("preview") or "")
+                # Context includes citation blocks with full selected text.
+                block = re.search(rf"\[{re.escape(identifier)}\](.*?)(?=\[来源\d+\]|\Z)", context, re.S)
+                if block:
+                    evidence_text = block.group(1)
+                if quote and quote in evidence_text and citation_has_fact:
+                    evidence_found = True
+        supported += int(present and evidence_found)
+    forbidden = [str(item) for item in question.get("forbidden_claims") or []]
+    return {
+        "fact_annotations": len(facts),
+        "fact_phrase_coverage": covered / len(facts) if facts else None,
+        "fact_evidence_coverage": supported / len(facts) if facts else None,
+        "forbidden_claim_absence": 1 - sum(item.casefold() in folded for item in forbidden) / len(forbidden) if forbidden else None,
+        "fact_metric_kind": "literal_gold_phrase_and_cited_quote_proxy",
+    }
+
+
 # ---------------------------------------------------------------------------
 # 评估执行
 # ---------------------------------------------------------------------------
@@ -256,16 +309,11 @@ def _extract_sources_from_result(sources_list: list[dict]) -> list[str]:
     return sources
 
 
-def run_retrieval_eval(questions: list[dict], limit: int | None = None) -> dict:
-    from app.services.rag_service import active_runtime
-    from rag.nodes.retrieve_node import create_retrieve_node
-    from rag.nodes.rerank_node import create_rerank_node
-    from rag.nodes.rewrite_node import create_rewrite_node
-
-    rt = active_runtime()
-    rewrite_fn = create_rewrite_node(rt.llm)
-    retrieve_fn = create_retrieve_node(rt.retriever)
-    rerank_fn = create_rerank_node(rt.reranker)
+def run_retrieval_eval(
+    questions: list[dict], limit: int | None = None, *,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+) -> dict:
+    from app.services.rag_service import prepare_context
 
     results: list[dict] = []
     qs = questions[:limit] if limit else questions
@@ -275,21 +323,13 @@ def run_retrieval_eval(questions: list[dict], limit: int | None = None) -> dict:
         record: dict[str, Any] = {"id": q["id"], "category": q["category"], "question": q["question"]}
 
         try:
-            state: dict[str, Any] = {"original_query": q["question"], "history": []}
-
             t0 = time.perf_counter()
-            state.update(rewrite_fn(state))
-            t_rewrite = time.perf_counter() - t0
-
-            t0 = time.perf_counter()
-            state.update(retrieve_fn(state))
-            t_retrieve = time.perf_counter() - t0
-
-            t0 = time.perf_counter()
-            state.update(rerank_fn(state))
-            t_rerank = time.perf_counter() - t0
-
-            retrieved_sources = _extract_sources_from_docs(state.get("docs", []))
+            prepared = prepare_context(
+                q["question"], [], retrieval_options=q.get("retrieval"),
+                knowledge_base_id=knowledge_base_id,
+            )
+            t_prepare = time.perf_counter() - t0
+            retrieved_sources = _extract_sources_from_docs(prepared.get("docs", []))
             relevant = [s["source"] for s in q.get("relevant_sources", [])]
 
             record.update({
@@ -299,7 +339,8 @@ def run_retrieval_eval(questions: list[dict], limit: int | None = None) -> dict:
                 "mrr@10": compute_mrr_at_k(retrieved_sources, relevant, 10),
                 "ndcg@10": compute_ndcg_at_k(retrieved_sources, relevant, 10),
                 "source_hit": compute_source_hit_rate(retrieved_sources, relevant),
-                "timings": {"rewrite": t_rewrite, "retrieve": t_retrieve, "rerank": t_rerank},
+                "timings": {"prepare": t_prepare},
+                "route": prepared.get("route", {}),
                 "status": "ok",
             })
         except Exception as exc:
@@ -309,11 +350,17 @@ def run_retrieval_eval(questions: list[dict], limit: int | None = None) -> dict:
         record["total_time"] = time.perf_counter() - t_start
         results.append(record)
 
-    return _summarize(results, questions, "retrieval")
+    result = _summarize(results, questions, "retrieval")
+    result["knowledge_base_id"] = knowledge_base_id
+    return result
 
 
-def run_full_eval(questions: list[dict], limit: int | None = None) -> dict:
+def run_full_eval(
+    questions: list[dict], limit: int | None = None, *,
+    knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
+) -> dict:
     from app.services.rag_service import prepare_context, generate
+    from rag.answer_validation import validate_answer
 
     results: list[dict] = []
     qs = questions[:limit] if limit else questions
@@ -325,33 +372,50 @@ def run_full_eval(questions: list[dict], limit: int | None = None) -> dict:
         try:
             history: list[dict] = []
             t0 = time.perf_counter()
-            prepared = prepare_context(q["question"], history)
+            prepared = prepare_context(
+                q["question"], history, retrieval_options=q.get("retrieval"),
+                knowledge_base_id=knowledge_base_id,
+            )
             t_prepare = time.perf_counter() - t0
+            sources = prepared.get("sources", [])
+            route = prepared.get("route") or {}
 
-            retrieved_sources = _extract_sources_from_result(prepared.get("sources", []))
+            retrieved_sources = _extract_sources_from_result(sources)
             relevant = [s["source"] for s in q.get("relevant_sources", [])]
 
             record.update({
+                "retrieved_sources": retrieved_sources,
                 "recall@5": compute_recall_at_k(retrieved_sources, relevant, 5),
                 "recall@10": compute_recall_at_k(retrieved_sources, relevant, 10),
                 "mrr@10": compute_mrr_at_k(retrieved_sources, relevant, 10),
                 "ndcg@10": compute_ndcg_at_k(retrieved_sources, relevant, 10),
                 "source_hit": compute_source_hit_rate(retrieved_sources, relevant),
+                "route": route,
             })
 
             if q.get("unanswerable"):
                 record["expected_unanswerable"] = True
 
             t0 = time.perf_counter()
-            answer = generate(q["question"], prepared["context"], history)
+            answer = generate(q["question"], prepared["context"], history,
+                              sources=sources, route=route)
+            # Generation returns early for empty evidence. Record validation in
+            # that case too, and retain any invalid IDs detected by generation.
+            answer, validation = validate_answer(answer, sources, route)
+            route["citation_validation"] = validation
             t_generate = time.perf_counter() - t0
 
             keywords = q.get("answer_keywords", [])
             record.update({
                 "answer_preview": answer[:200],
                 "answer_keyword_recall": compute_answer_keyword_recall(answer, keywords),
+                # Sanitization must not hide the model's original unknown IDs
+                # from the release acceptance threshold.
+                "citation_validity": 0.0 if validation["invalid_ids"] else citation_validity(answer, sources),
+                "refusal_phrase_detected": bool(re.search(r"无法|未找到|没有.*(?:资料|信息|依据)|不足以|cannot|insufficient|not enough", answer, re.I)),
                 "timings": {"prepare": t_prepare, "generate": t_generate},
                 "status": "ok",
+                **fact_evidence_metrics(answer, q, sources, prepared.get("context", "")),
             })
         except Exception as exc:
             record.update({"status": "error", "error": str(exc)[:500], "recall@5": 0, "recall@10": 0,
@@ -361,7 +425,9 @@ def run_full_eval(questions: list[dict], limit: int | None = None) -> dict:
         record["total_time"] = time.perf_counter() - t_start
         results.append(record)
 
-    return _summarize(results, questions, "full")
+    result = _summarize(results, questions, "full")
+    result["knowledge_base_id"] = knowledge_base_id
+    return result
 
 
 def _percentile(values: list[float], p: float) -> float:
@@ -372,13 +438,22 @@ def _percentile(values: list[float], p: float) -> float:
     return sorted_vals[idx]
 
 
+def citation_validity(answer: str, sources: list[dict]) -> float:
+    citations = re.findall(r"\[(来源\d+)\]", answer)
+    valid_ids = {source.get("citation_id") for source in sources}
+    return sum(citation in valid_ids for citation in citations) / len(citations) if citations else 0.0
+
+
 def _summarize(results: list[dict], questions: list[dict], mode: str) -> dict:
-    answerable = [r for r in results if not questions[[q["id"] for q in questions].index(r["id"])].get("unanswerable")]
-    unanswerable = [r for r in results if questions[[q["id"] for q in questions].index(r["id"])].get("unanswerable")]
+    by_id = {question["id"]: question for question in questions}
+    answerable = [r for r in results if not by_id[r["id"]].get("unanswerable")]
+    unanswerable = [r for r in results if by_id[r["id"]].get("unanswerable")]
 
     def avg(key: str, subset=None) -> float:
         pool = subset if subset is not None else answerable
-        vals = [r.get(key, 0) for r in pool if r.get("status") != "error"]
+        # Failed questions must lower the score instead of disappearing from
+        # its denominator and making a broken provider look successful.
+        vals = [r.get(key, 0) for r in pool]
         return statistics.mean(vals) if vals else 0.0
 
     timing_keys: set[str] = set()
@@ -418,10 +493,20 @@ def _summarize(results: list[dict], questions: list[dict], mode: str) -> dict:
 
     if mode == "full":
         summary["metrics"]["answer_keyword_recall"] = avg("answer_keyword_recall")
+        summary["metrics"]["citation_validity"] = avg("citation_validity")
+        annotated = [r for r in answerable if by_id[r["id"]].get("required_facts")]
+        summary["metrics"]["fact_annotation_rate"] = len(annotated) / len(answerable) if answerable else 1
+        for metric in ("fact_phrase_coverage", "fact_evidence_coverage"):
+            summary["metrics"][metric] = avg(metric, annotated)
+        annotated_forbidden = [r for r in answerable if by_id[r["id"]].get("forbidden_claims")]
+        if annotated_forbidden:
+            summary["metrics"]["forbidden_claim_absence"] = avg("forbidden_claim_absence", annotated_forbidden)
 
     if unanswerable:
-        wrong_hits = [r for r in unanswerable if r.get("source_hit", 0) > 0 and r.get("status") != "error"]
-        summary["metrics"]["unanswerable_wrong_hit_rate"] = len(wrong_hits) / len(unanswerable) if unanswerable else 0
+        retrieved = [r for r in unanswerable if r.get("retrieved_sources")]
+        summary["metrics"]["unanswerable_retrieval_rate"] = len(retrieved) / len(unanswerable)
+        if mode == "full":
+            summary["metrics"]["refusal_phrase_rate"] = avg("refusal_phrase_detected", unanswerable)
         summary["metrics"]["unanswerable_count"] = len(unanswerable)
 
     return {"per_question": results, "summary": summary}
@@ -431,12 +516,13 @@ def _summarize(results: list[dict], questions: list[dict], mode: str) -> dict:
 # 结果保存与对比
 # ---------------------------------------------------------------------------
 
-def save_result(result: dict, label: str, split: str, output: str | None = None) -> Path:
+def save_result(result: dict, label: str, split: str, output: str | None = None, questions=None) -> Path:
     meta = {
         "run_at": datetime.now(timezone.utc).isoformat(),
         "label": label,
         "split": split,
-        "question_set_hash": question_set_hash(load_questions()),
+        "knowledge_base_id": result.get("knowledge_base_id", DEFAULT_KNOWLEDGE_BASE_ID),
+        "question_set_hash": question_set_hash(questions if questions is not None else load_questions()),
         "python_version": platform.python_version(),
         "provider_info": _safe_call(_provider_info, {}),
         "retrieval_config": _safe_call(_retrieval_config, {}),
@@ -511,6 +597,17 @@ def main():
     parser.add_argument("--label", default="run")
     parser.add_argument("--limit", type=int, default=None, help="快速冒烟测试")
     parser.add_argument("--output", default=None, help="自定义输出路径")
+    parser.add_argument("--questions", type=Path, default=QUESTIONS_PATH)
+    parser.add_argument("--knowledge-base", default=DEFAULT_KNOWLEDGE_BASE_ID, help="目标知识库 ID，默认兼容原单知识库")
+    parser.add_argument("--min-recall", type=float, default=0.8)
+    parser.add_argument("--min-source-hit", type=float, default=0.9)
+    parser.add_argument("--max-p95-seconds", type=float, default=120)
+    parser.add_argument("--min-answer-keyword-recall", type=float, default=0.8)
+    parser.add_argument("--min-citation-validity", type=float, default=0.95)
+    parser.add_argument("--min-refusal-phrase-rate", type=float, default=1.0)
+    parser.add_argument("--min-fact-phrase-coverage", type=float, default=0.9)
+    parser.add_argument("--min-fact-evidence-coverage", type=float, default=0.9)
+    parser.add_argument("--allow-unannotated-facts", action="store_true", help="仅用于调试；允许缺少事实证据标注的结果")
     parser.add_argument("--compare", nargs=2, metavar=("BASELINE", "FINAL"), default=None)
     args = parser.parse_args()
 
@@ -518,21 +615,25 @@ def main():
         compare_results(args.compare[0], args.compare[1])
         return
 
-    questions = load_questions()
+    if not args.questions.is_file():
+        parser.error("缺少评测集；请使用 --questions 指定业务金标准集，格式见 eval/questions.example.jsonl")
+    questions = load_questions(args.questions)
     if args.split == "all":
         qs = questions
     else:
         qs = filter_by_split(questions, args.split)
 
-    print(f"\n评估模式: {args.mode} | split: {args.split} | 题目数: {len(qs)}")
+    print(f"\n评估模式: {args.mode} | 知识库: {args.knowledge_base} | split: {args.split} | 题目数: {len(qs)}")
     if args.limit:
         qs = qs[:args.limit]
         print(f"限制为前 {args.limit} 题")
+    if not qs:
+        parser.error("所选评测集为空")
 
     if args.mode == "retrieval":
-        result = run_retrieval_eval(qs)
+        result = run_retrieval_eval(qs, knowledge_base_id=args.knowledge_base)
     else:
-        result = run_full_eval(qs)
+        result = run_full_eval(qs, knowledge_base_id=args.knowledge_base)
 
     summary = result["summary"]
     print(f"\n{'=' * 50}")
@@ -542,8 +643,31 @@ def main():
         print(f"  {k:<30} {v:.4f}")
     print(f"\n总耗时 p50: {summary['total_time']['p50']:.3f}s | p95: {summary['total_time']['p95']:.3f}s")
 
-    save_result(result, args.label, args.split, args.output)
+    result["acceptance"] = evaluate_acceptance(summary, {
+        "recall@5": args.min_recall, "source_hit_rate": args.min_source_hit,
+        "p95_seconds": args.max_p95_seconds,
+        **({"answer_keyword_recall": args.min_answer_keyword_recall,
+            "citation_validity": args.min_citation_validity,
+            **({"fact_annotation_rate": 1.0, "fact_phrase_coverage": args.min_fact_phrase_coverage,
+                "fact_evidence_coverage": args.min_fact_evidence_coverage} if not args.allow_unannotated_facts else {}),
+            **({"refusal_phrase_rate": args.min_refusal_phrase_rate} if any(q.get("unanswerable") for q in qs) else {}),
+        } if args.mode == "full" else {}),
+    })
+    save_result(result, args.label, args.split, args.output, qs)
+    return 0 if result["acceptance"]["passed"] else 1
+
+
+def evaluate_acceptance(summary: dict, thresholds: dict) -> dict:
+    failures = []
+    if summary["failed_count"]:
+        failures.append("provider_or_pipeline_errors")
+    for name, target in thresholds.items():
+        actual = summary["total_time"]["p95"] if name == "p95_seconds" else summary["metrics"].get(name, 0)
+        violated = actual > target if name == "p95_seconds" else actual < target
+        if violated:
+            failures.append(name)
+    return {"passed": not failures, "thresholds": thresholds, "failures": failures}
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

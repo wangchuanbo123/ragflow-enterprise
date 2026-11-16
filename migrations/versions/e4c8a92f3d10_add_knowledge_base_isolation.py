@@ -158,12 +158,20 @@ def upgrade() -> None:
         )
     )
 
+    source_path_constraint = "uq_knowledge_documents_source_path"
+    if op.get_bind().dialect.name == "postgresql":
+        # Releases created before explicit naming used PostgreSQL's generated
+        # name. SQLite's batch naming convention already handles this case.
+        source_path_constraint = next(
+            item["name"] for item in sa.inspect(op.get_bind()).get_unique_constraints("knowledge_documents")
+            if item["column_names"] == ["source_path"]
+        )
     with op.batch_alter_table(
         "knowledge_documents", naming_convention=NAMING_CONVENTION
     ) as batch_op:
         batch_op.add_column(_kb_column())
         batch_op.drop_constraint(
-            "uq_knowledge_documents_source_path", type_="unique"
+            source_path_constraint, type_="unique"
         )
         batch_op.create_unique_constraint(
             "uq_knowledge_documents_kb_source",

@@ -38,7 +38,7 @@ def enqueue_stale_community_rebuilds(limit: int = 20) -> int:
     from app.bootstrap.container import get_provider_container
     from app.models.graph_governance import GraphCommunityState
     from app.models.index_job import IndexJob
-    from app.repositories.index_job_repository import IndexJobRepository
+    from app.repositories.index_job_repository import IndexJobRepository, signal_persisted_job
     from sqlalchemy import select
 
     if not GRAPH_COMMUNITY_MAINTENANCE_ENABLED:
@@ -69,7 +69,7 @@ def enqueue_stale_community_rebuilds(limit: int = 20) -> int:
                 max_attempts=INDEX_JOB_MAX_ATTEMPTS,
                 options_json={"trigger": "community_maintenance"},
             ))
-            container.task_queue.enqueue(job.id)
+            signal_persisted_job(container.task_queue, job.id)
             queued += 1
     if queued:
         logger.info("Queued %d community maintenance jobs", queued)

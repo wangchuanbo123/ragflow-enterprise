@@ -1,13 +1,16 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import * as api from '../api/client'
 import type { Folder, KnowledgeBase, KnowledgeDocument, RetrievalScope, RetrievalStrategy, Tag } from '../types'
 import { useConversations } from '../composables/useConversations'
 import ConversationSidebar from './ConversationSidebar.vue'
 import MessageList from './MessageList.vue'
+import { navigate, navigationState } from '../composables/useNavigation'
 
 const props = defineProps<{ knowledgeBaseId: string; knowledgeBases: KnowledgeBase[] }>()
 const conv = useConversations()
+let disposed = false
+onBeforeUnmount(() => { disposed = true })
 const documents = ref<KnowledgeDocument[]>([])
 const folders = ref<Folder[]>([])
 const tags = ref<Tag[]>([])
@@ -16,19 +19,33 @@ const visibleConversations = computed(() =>
 )
 
 async function loadScopeOptions():Promise<void>{
-  ;[documents.value,folders.value,tags.value]=await Promise.all([
+  try { ;[documents.value,folders.value,tags.value]=await Promise.all([
     api.listDocuments(props.knowledgeBaseId),api.listFolders(props.knowledgeBaseId),api.listTags(props.knowledgeBaseId),
-  ])
+  ]) } catch (error) { if ((error as Error).name !== 'AbortError') conv.errorMsg.value = (error as Error).message }
 }
 
-onMounted(() => { void conv.loadList(); void loadScopeOptions() })
+onMounted(async () => {
+  await conv.loadList()
+  if (disposed) return
+  const id = navigationState.value.conversation
+  if (id && visibleConversations.value.some(item => item.id === id)) await conv.select(id)
+  else if (!visibleConversations.value.some(item => item.id === conv.activeId.value)) { conv.activeId.value = null; conv.resetDetail() }
+  void loadScopeOptions()
+})
+watch(conv.activeId, id => {
+  if (navigationState.value.page === 'chat' && navigationState.value.kb === props.knowledgeBaseId) navigate({ conversation: id || '' })
+})
+watch(() => navigationState.value.conversation, id => {
+  if (id && id !== conv.activeId.value && visibleConversations.value.some(item => item.id === id)) void conv.select(id)
+  else if (!id && conv.activeId.value) { conv.activeId.value = null; conv.resetDetail() }
+})
 
-function onSend(payload: { content: string; strategy: RetrievalStrategy; scope?: Partial<RetrievalScope> }): void {
-  void conv.send(payload.content, payload.strategy, payload.scope)
+function onSend(payload: { content: string; strategy: RetrievalStrategy; scope?: Partial<RetrievalScope> }): Promise<boolean> {
+  return conv.send(payload.content, payload.strategy, payload.scope, props.knowledgeBaseId)
 }
 
 function onCreate(): void {
-  void conv.create(props.knowledgeBaseId)
+  void conv.create(props.knowledgeBaseId).catch(() => {})
 }
 
 watch(() => props.knowledgeBaseId, () => {
@@ -67,12 +84,13 @@ watch(() => props.knowledgeBaseId, () => {
         :messages="conv.messages.value"
         :loading="conv.loadingDetail.value"
         :sending="conv.sending.value"
+        :conversation-id="conv.activeId.value"
         :knowledge-base-id="knowledgeBaseId"
         :knowledge-bases="knowledgeBases"
         :documents="documents"
         :folders="folders"
         :tags="tags"
-        @retry="onSend"
+        :submit-message="onSend"
         @stop="conv.stop"
         @feedback="({messageId,rating})=>conv.feedback(messageId,rating)"
       />

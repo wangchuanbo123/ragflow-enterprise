@@ -1,4 +1,4 @@
-"""Index job execution shared by local threads and distributed Celery workers."""
+"""Index job execution shared by local worker threads."""
 
 from __future__ import annotations
 
@@ -7,20 +7,25 @@ import os
 import socket
 import threading
 import uuid
+import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import datetime, timezone
 
 from app.core.config import (
     INDEX_JOB_HEARTBEAT_SECONDS,
     INDEX_JOB_LEASE_SECONDS,
     INDEX_JOB_MAX_ATTEMPTS,
+    INDEX_MAX_CONCURRENCY,
     INDEX_WORKER_ENABLED,
 )
-from app.repositories.index_job_repository import IndexJobRepository
+from app.repositories.index_job_repository import IndexJobRepository, JobLeaseLostError, signal_persisted_job
 
 logger = logging.getLogger(__name__)
 
 _worker_thread: threading.Thread | None = None
 _worker_stop = threading.Event()
+_worker_failure: str | None = None
 _WORKER_ID = (
     f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 )
@@ -55,6 +60,8 @@ class _LeaseHeartbeat:
                     return
             except Exception as exc:
                 logger.warning("Heartbeat failed for job %s: %s", self.job_id, exc)
+                self.lease_lost = True
+                return
 
     def __enter__(self):
         self.thread = threading.Thread(
@@ -72,11 +79,10 @@ class _LeaseHeartbeat:
             self.thread.join(timeout=2)
 
 
-def _request_document_code_rebuild(db, knowledge_base_id: str, container) -> None:
+def _request_document_code_rebuild(db, knowledge_base_id: str, container):
     """文档索引完成后，排一个文档内代码图谱重建任务（幂等）。
 
-    只在该知识库没有活动代码目录源时触发；目录源重建时已通过
-    ``merge_document_code=True`` 合并文档代码，无需重复任务。
+    有活动目录源时重建该源并合并文档代码，否则重建文档代码快照。
     """
     from app.core.config import DOCUMENT_CODE_GRAPH_ENABLED
     from app.models.index_job import IndexJob
@@ -87,37 +93,127 @@ def _request_document_code_rebuild(db, knowledge_base_id: str, container) -> Non
         return
     repository = CodeGraphRepository(db, knowledge_base_id)
     active = repository.active_snapshot()
-    if active is not None and active.data_source_id is not None:
-        return
+    source_id = active.data_source_id if active is not None and active.data_source_id else "documents"
     job_repository = IndexJobRepository(db, knowledge_base_id)
     existing = job_repository.find_open(
-        "code_index", option_key="data_source_id", option_value="documents"
+        "code_index", option_key="data_source_id", option_value=source_id
     )
     if existing is not None:
-        return
+        return existing
     job = job_repository.create(IndexJob(
         job_type="code_index",
         status="pending",
         requested_by="system:document-code",
         total_items=1,
         max_attempts=INDEX_JOB_MAX_ATTEMPTS,
-        options_json={"data_source_id": "documents"},
+        options_json={"data_source_id": source_id},
     ))
-    container.task_queue.enqueue(job.id)
+    signal_persisted_job(container.task_queue, job.id)
+    return job
+
+
+def _link_followup_jobs(db, parent, children) -> None:
+    identifiers = set((parent.options_json or {}).get("followup_job_ids") or [])
+    run_id = (parent.options_json or {}).get("agent_run_id")
+    for child in children:
+        if child is None or child.id == parent.id:
+            continue
+        identifiers.add(child.id)
+        options = dict(child.options_json or {})
+        options.setdefault("parent_job_id", parent.id)
+        if run_id:
+            options.setdefault("agent_run_id", run_id)
+        child.options_json = options
+    if identifiers:
+        parent.options_json = {**(parent.options_json or {}), "followup_job_ids": sorted(identifiers)}
+        db.commit()
 
 
 def _process_job(
+    job_id: str, *, worker_id: str | None = None, already_claimed: bool = False,
+) -> bool:
+    from app.bootstrap.container import get_provider_container
+    from app.services.knowledge_mutation import knowledge_mutation_lock, KnowledgeLockBusyError
+
+    container = get_provider_container()
+    worker_id = worker_id or f"{_WORKER_ID[:80]}:{uuid.uuid4().hex}"
+    with container.metadata.session() as db:
+        repository = IndexJobRepository(db, knowledge_base_id=None)
+        job = repository.get(job_id) if already_claimed else repository.claim(
+            job_id, worker_id=worker_id, lease_seconds=INDEX_JOB_LEASE_SECONDS,
+        )
+        if job is None:
+            return False
+        if job.status != "running" or job.lease_owner != worker_id:
+            return False
+        knowledge_base_id = job.knowledge_base_id
+        job_type = job.job_type
+    try:
+        # Begin renewal before waiting for a busy knowledge base. Otherwise
+        # queued lock waiters expire and another process can reclaim them.
+        with _LeaseHeartbeat(job_id, worker_id) as heartbeat:
+            if job_type == "agent_workflow":
+                return _process_job_unlocked(job_id, worker_id=worker_id, already_claimed=True, _heartbeat=heartbeat)
+            with knowledge_mutation_lock(knowledge_base_id, cancelled=lambda: _job_cancel_requested(container, job_id, heartbeat)):
+                return _process_job_unlocked(job_id, worker_id=worker_id, already_claimed=True, _heartbeat=heartbeat)
+    except Exception as exc:
+        from app.agents.contracts import AgentCancelledError
+        if isinstance(exc, JobLeaseLostError):
+            logger.error("Lost execution lease for job %s", job_id)
+            return False
+        if isinstance(exc, KnowledgeLockBusyError):
+            with container.metadata.session() as db:
+                if IndexJobRepository(db, None).defer_lock_waiter(job_id, worker_id):
+                    signal_persisted_job(container.task_queue, job_id)
+                    return False
+        with container.metadata.session() as db:
+            repository = IndexJobRepository(db, knowledge_base_id=None)
+            current = repository.get(job_id)
+            if current is not None and current.status == "running" and current.lease_owner == worker_id:
+                db.info["index_job_lease"] = (job_id, worker_id)
+                repository.update(current, status="cancelled" if isinstance(exc, AgentCancelledError) else "failed",
+                                  error_message="任务已取消" if isinstance(exc, AgentCancelledError) else "任务协调或知识库锁失败")
+        logger.error("Job %s could not enter its execution scope: %s", job_id, type(exc).__name__)
+        return False
+
+
+def _total_schema_options(db, job):
+    """Retry legacy schema jobs against the single KB schema, preserving audit."""
+    if job.job_type not in {"schema_generation", "schema_drift"}:
+        return
+    options = dict(job.options_json or {})
+    previous = options.get("graph_kind") or "general"
+    if previous not in {"general", "concept", "functional", "configuration", "standard"}:
+        raise ValueError("图谱类型不可用")
+    if previous != "general":
+        options["legacy_graph_kind"] = previous
+    options["graph_kind"] = "general"
+    target_id = options.get("target_schema_id")
+    if target_id:
+        from app.models.graph_governance import GraphSchemaDefinition
+        target = db.get(GraphSchemaDefinition, target_id)
+        if target is not None and target.knowledge_base_id == job.knowledge_base_id and target.graph_kind != "general":
+            options["legacy_target_schema_id"] = target_id
+            options["target_schema_id"] = None
+    if options != (job.options_json or {}):
+        job.options_json = options
+        db.commit()
+
+
+def _process_job_unlocked(
     job_id: str,
     *,
     worker_id: str | None = None,
     already_claimed: bool = False,
+    _heartbeat=None,
 ) -> bool:
-    """Claim and process one persisted job; safe for local or Celery workers."""
+    """Claim and process one persisted job."""
     from app.bootstrap.container import get_provider_container
     from app.core.config import DOC_DIR
     from rag.indexing.index_manager import IndexManager
 
     worker_id = worker_id or _WORKER_ID
+    from app.agents.contracts import AgentCancelledError
     container = get_provider_container()
     with container.metadata.session() as db:
         job_repo = IndexJobRepository(db, knowledge_base_id=None)
@@ -138,398 +234,123 @@ def _process_job(
             if job is None:
                 return False
 
+        db.info["index_job_lease"] = (job_id, worker_id)
+
+        attached_service = None
+        attached_run_id = None
+        attached_result = None
+        attached_error_code = None
+        ownership_lost = False
         try:
-            with _LeaseHeartbeat(job_id, worker_id) as heartbeat:
+            from app.services.task_execution import stage_recorder, persist_stage
+            from app.services.observability import operation_context
+            with stage_recorder(lambda payload: persist_stage(db, job_repo, job, payload)), operation_context(
+                job_id=job_id, knowledge_base_id=job.knowledge_base_id,
+            ), (nullcontext(_heartbeat) if _heartbeat is not None else _LeaseHeartbeat(job_id, worker_id)) as heartbeat:
                 mgr = IndexManager(
                     db,
                     vector_provider=container.vector_store,
                     knowledge_base_id=job.knowledge_base_id,
                 )
+                from app.models.knowledge_base import KnowledgeBase
+
+                knowledge_base = db.get(KnowledgeBase, job.knowledge_base_id)
+                if knowledge_base is None or not knowledge_base.is_active:
+                    job_repo.update(job, status="cancelled", error_message="知识库已归档或不存在")
+                    return True
+                _total_schema_options(db, job)
+                parent_run_id = (job.options_json or {}).get("agent_run_id")
+                if parent_run_id:
+                    from app.models.agent_run import AgentRun
+
+                    parent_run = db.get(AgentRun, parent_run_id)
+                    if parent_run is not None and (parent_run.cancel_requested or parent_run.status == "cancelled"):
+                        job_repo.update(job, status="cancelled", error_message="所属Agent任务已取消")
+                        return True
 
                 if job_repo.is_cancel_requested(job_id):
                     job_repo.update(job, status="cancelled")
                     return True
 
-                if job.job_type == "sync":
-                    result = mgr.sync(DOC_DIR, dry_run=False)
-                    status = result.get("status", "completed")
-                    job_repo.update(
-                        job,
-                        status=status,
-                        total_items=result.get("indexed", 0) + result.get("deleted", 0),
-                        processed_items=result.get("indexed", 0) + result.get("deleted", 0),
-                        succeeded_items=result.get("indexed", 0),
-                        failed_items=result.get("failed", 0),
-                        error_message=(
-                            "; ".join(result.get("errors", []))[:500]
-                            if result.get("errors")
-                            else None
-                        ),
+                deferred_completion = None
+                agent_context = None
+                agent_document_ids = None
+                agent_event_callback = None
+                def agent_cancelled():
+                    return _job_cancel_requested(container, job_id, heartbeat) or (
+                        attached_service is not None and attached_service.attached_cancelled(attached_run_id)
                     )
-                elif job.job_type == "rebuild":
-                    result = mgr.rebuild(DOC_DIR, dry_run=False, job_id=job_id[:8])
-                    status = result.get("status", "completed")
-                    job_repo.update(
-                        job,
-                        status=status,
-                        total_items=result.get("documents_indexed", 0),
-                        processed_items=result.get("documents_indexed", 0),
-                        succeeded_items=result.get("documents_indexed", 0),
-                        failed_items=result.get("documents_failed", 0),
-                        error_message=(
-                            "; ".join(result.get("errors", []))[:500]
-                            if result.get("errors")
-                            else None
-                        ),
-                    )
-                elif job.job_type in {"file", "delete"}:
-                    all_items = job_repo.list_items(job_id)
-                    items = [item for item in all_items if item.status != "completed"]
-                    succeeded = sum(
-                        1 for item in all_items if item.status == "completed"
-                    )
-                    failed = 0
-                    for position, item in enumerate(items, start=1):
-                        if heartbeat.lease_lost:
-                            raise RuntimeError("Job lease was lost during processing")
-                        if job_repo.is_cancel_requested(job_id):
-                            job_repo.update(
-                                job,
-                                status="cancelled",
-                                processed_items=succeeded + failed,
-                                succeeded_items=succeeded,
-                                failed_items=failed,
-                            )
-                            return True
-
-                        item.started_at = datetime.now(timezone.utc)
-                        item.status = "running"
-                        db.commit()
-                        try:
-                            state = mgr.repo.get_index_state()
-                            active_coll = state.active_collection_name
-                            if active_coll is None:
-                                active_coll = mgr.ensure_active_collection(job_id[:8])
-
-                            if item.action == "delete":
-                                mgr.delete_document(item.source_path, active_coll)
-                            else:
-                                with container.object_store.materialize(
-                                    item.source_path
-                                ) as file_path:
-                                    from rag.utils.file_hash import file_hash as calc_hash
-
-                                    file_digest = calc_hash(file_path)
-                                    mgr.index_document(
-                                        item.source_path,
-                                        file_path,
-                                        file_digest,
-                                        active_coll,
-                                        document_id=item.document_id,
-                                    )
-
-                            item.status = "completed"
-                            item.finished_at = datetime.now(timezone.utc)
-                            succeeded += 1
-                        except Exception as exc:
-                            item.status = "failed"
-                            item.error_message = str(exc)[:500]
-                            item.finished_at = datetime.now(timezone.utc)
-                            failed += 1
-                        db.commit()
-                        job_repo.update(
-                            job,
-                            processed_items=succeeded + failed,
-                            succeeded_items=succeeded,
-                            failed_items=failed,
-                        )
-
-                    job_repo.update(
-                        job,
-                        status="completed" if failed == 0 else "partial",
-                        total_items=len(all_items),
-                        processed_items=succeeded + failed,
-                        succeeded_items=succeeded,
-                        failed_items=failed,
-                    )
-                elif job.job_type == "connector_sync":
-                    from app.services.data_source_service import DataSourceService
-
-                    source_id = str((job.options_json or {}).get("data_source_id", ""))
-                    result = DataSourceService(
-                        db, job.knowledge_base_id, task_queue=container.task_queue
-                    ).execute_sync(source_id, job.requested_by)
-                    failed = 1 if result.get("status") == "failed" else len(result.get("rejected", []))
-                    job_repo.update(
-                        job,
-                        status="failed" if result.get("status") == "failed" else ("partial" if failed else "completed"),
-                        total_items=1,
-                        processed_items=1,
-                        succeeded_items=0 if result.get("status") == "failed" else 1,
-                        failed_items=failed,
-                        error_message=result.get("detail"),
-                    )
-                elif job.job_type == "code_index":
-                    import tempfile
-                    from pathlib import Path
-
-                    from app.services.code_index_service import CodeIndexService
-                    from app.services.data_source_service import DataSourceService
-                    from app.repositories.knowledge_base_repository import KnowledgeBaseRepository
-
-                    source_id = str((job.options_json or {}).get("data_source_id", ""))
-                    service = CodeIndexService(db, job.knowledge_base_id)
-                    if not source_id or source_id == "documents":
-                        # 文档内代码图谱：直接从已入库 chunk 提取代码块。
-                        result = service.index_document_code()
-                    else:
-                        source = KnowledgeBaseRepository(db).get_data_source(job.knowledge_base_id, source_id)
-                        if source is None:
-                            raise ValueError("数据源不存在")
-                        if source.source_type == "local_directory":
-                            root = DataSourceService._resolve_local_directory(str((source.config_json or {}).get("location", "")))
-                            result = service.index_directory(
-                                root,
-                                data_source_id=source.id,
-                                merge_document_code=True,
-                            )
-                        elif source.source_type == "git":
-                            with tempfile.TemporaryDirectory(prefix="rag-code-git-") as temp_dir:
-                                root, revision = DataSourceService(db, job.knowledge_base_id)._checkout_git(source, Path(temp_dir))
-                                result = service.index_directory(
-                                    root,
-                                    data_source_id=source.id,
-                                    revision=revision,
-                                    merge_document_code=True,
-                                )
-                        else:
-                            raise ValueError("代码索引仅支持本地目录和 Git 数据源")
-                    from app.core.config import CODE_VECTOR_ENABLED
+                agent_job_types = {"graph_rebuild", "schema_generation", "schema_drift"}
+                from app.core.config import CODE_FUNCTION_VECTOR_ENABLED, CODE_FUNCTION_SUMMARY_LLM_ENABLED, CODE_VECTOR_ENABLED
+                if CODE_FUNCTION_VECTOR_ENABLED and CODE_FUNCTION_SUMMARY_LLM_ENABLED:
+                    agent_job_types.add("code_vector_rebuild")
                     if CODE_VECTOR_ENABLED:
-                        from app.services.code_vector_service import CodeVectorService
+                        agent_job_types.add("code_index")
+                if job.job_type in agent_job_types:
+                    from app.services.agent_workflow_service import AgentWorkflowService
 
-                        result["code_vectors"] = CodeVectorService(
-                            db, job.knowledge_base_id, container=container
-                        ).rebuild()
-                    job_repo.update(
-                        job, status="completed", total_items=1, processed_items=1,
-                        succeeded_items=1, failed_items=0,
+                    attached_service = AgentWorkflowService(db, job.knowledge_base_id)
+                    attached_run, agent_context = attached_service.attach_existing_job(
+                        job.id, task=("extraction" if job.job_type == "graph_rebuild" else "knowledge_organization"
+                                      if job.job_type in {"code_index", "code_vector_rebuild"} else "schema_governance"),
+                        document_ids=(job.options_json or {}).get("document_ids"),
                     )
-                elif job.job_type == "entity_vector_rebuild":
-                    from app.services.entity_vector_service import EntityVectorService
+                    attached_run_id = attached_run.id
+                    agent_document_ids = list(attached_run.document_ids_json)
+                    if job.job_type in {"code_index", "code_vector_rebuild"}:
+                        agent_context = {**agent_context, "scope_document_ids": agent_document_ids,
+                                         "allow_repository_symbols": not bool(getattr(attached_run, "parent_run_id", None))}
+                    agent_event_callback = lambda event: attached_service.append_attached_event(attached_run_id, event)
+                from app.services.job_handlers import JobContext, execute_job
+                from app.services.job_policy import STAGES
+                from app.services.task_execution import job_stage
+                with job_stage(STAGES.get(job.job_type, "task")):
+                    handled = execute_job(JobContext(
+                        db, job, job_repo, mgr, container, job_id, heartbeat,
+                        agent_context, agent_document_ids, agent_cancelled,
+                        agent_event_callback, _link_followup_jobs,
+                    ))
+                if handled.stop:
+                    return True
+                deferred_completion = handled.deferred_completion
+                attached_result = handled.attached_result
+                attached_error_code = handled.attached_error_code
 
-                    result = EntityVectorService(
-                        db, job.knowledge_base_id, container=container
-                    ).rebuild()
-                    job_repo.update(
-                        job, status="completed", total_items=1, processed_items=1,
-                        succeeded_items=1, failed_items=0,
-                    )
-                elif job.job_type == "relation_vector_rebuild":
-                    from app.services.relation_vector_service import RelationVectorService
-
-                    result = RelationVectorService(
-                        db, job.knowledge_base_id, container=container
-                    ).rebuild()
-                    job_repo.update(
-                        job, status="completed", total_items=1, processed_items=1,
-                        succeeded_items=1, failed_items=0,
-                    )
-                elif job.job_type == "code_vector_rebuild":
-                    from app.services.code_vector_service import CodeVectorService
-
-                    result = CodeVectorService(
-                        db, job.knowledge_base_id, container=container
-                    ).rebuild()
-                    job_repo.update(
-                        job, status="completed", total_items=1, processed_items=1,
-                        succeeded_items=1, failed_items=0,
-                    )
-                elif job.job_type == "graph_rebuild":
-                    from app.services.entity_vector_service import EntityVectorService
-                    from app.services.graph_governance_service import GraphGovernanceService
-                    from app.services.knowledge_graph_service import GraphBuildService
-                    from app.services.relation_vector_service import RelationVectorService
-
-                    options = job.options_json or {}
-                    mode = options.get("mode", "pending")
-                    vector_update = options.get("vector_update", "full")
-                    community_update = options.get("community_update", "full")
-                    result = GraphBuildService(
-                        db, knowledge_base_id=job.knowledge_base_id
-                    ).build_graph(
-                        only_pending=mode != "full",
-                        retry_failed=mode == "retry_failed",
-                    )
-                    changes = result.get("changes", {})
-                    governance = GraphGovernanceService(
-                        db, job.knowledge_base_id, task_queue=container.task_queue
-                    )
-                    report = governance.assess_quality(job.requested_by)
-                    if community_update == "defer":
-                        # 图谱立即可用，社区延迟到维护任务重建。
-                        if int(result.get("succeeded", 0)) or changes:
-                            governance.mark_communities_stale()
-                    elif community_update == "affected":
-                        result["communities"] = governance.rebuild_communities(
-                            changed_entity_ids=changes.get("community_entity_ids")
-                        )
-                    else:
-                        result["communities"] = governance.rebuild_communities()
-                    if vector_update == "incremental":
-                        result["entity_vectors"] = EntityVectorService(
-                            db, job.knowledge_base_id, container=container
-                        ).apply_changes(
-                            changes.get("changed_entity_ids"),
-                            changes.get("deleted_entity_ids"),
-                        )
-                        result["relation_vectors"] = RelationVectorService(
-                            db, job.knowledge_base_id, container=container
-                        ).apply_changes(
-                            changes.get("changed_relation_ids"),
-                            changes.get("deleted_relation_ids"),
-                        )
-                    elif vector_update == "full":
-                        result["entity_vectors"] = EntityVectorService(
-                            db, job.knowledge_base_id, container=container
-                        ).rebuild()
-                        result["relation_vectors"] = RelationVectorService(
-                            db, job.knowledge_base_id, container=container
-                        ).rebuild()
-                    try:
-                        result["entity_disambiguation"] = (
-                            governance.scan_semantic_merge_candidates()
-                        )
-                        result["relation_disambiguation"] = (
-                            governance.scan_relation_merge_candidates()
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Graph disambiguation candidate scan failed for %s: %s",
-                            job.knowledge_base_id,
-                            exc,
-                        )
-                    failed = int(result.get("failed", 0))
-                    skipped = int(result.get("skipped", 0))
-                    job_repo.update(
-                        job,
-                        status="partial" if failed or report.status != "ready" else "completed",
-                        total_items=int(result.get("total_chunks", 0)),
-                        processed_items=int(result.get("succeeded", 0)) + failed + skipped,
-                        succeeded_items=int(result.get("succeeded", 0)) + skipped,
-                        failed_items=failed,
-                        error_message=("图谱质量门禁未全部通过" if report.status != "ready" else None),
-                    )
-                elif job.job_type == "graph_maintenance":
-                    from app.services.graph_governance_service import GraphGovernanceService
-
-                    governance = GraphGovernanceService(
-                        db, job.knowledge_base_id, task_queue=container.task_queue
-                    )
-                    result = {}
-                    state = governance.community_state(create=False)
-                    if state is not None and state.status == "stale":
-                        result["communities"] = governance.rebuild_communities()
-                    report = governance.assess_quality(job.requested_by)
-                    job_repo.update(
-                        job,
-                        status="completed" if report.status == "ready" else "partial",
-                        total_items=1,
-                        processed_items=1,
-                        succeeded_items=1,
-                        failed_items=0,
-                        error_message=(
-                            None if report.status == "ready" else "图谱质量门禁未全部通过"
-                        ),
-                    )
-                elif job.job_type == "schema_generation":
-                    from app.services.graph_schema_induction_service import (
-                        GraphSchemaInductionService,
-                    )
-
-                    options = job.options_json or {}
-                    schema = GraphSchemaInductionService(
-                        db,
-                        job.knowledge_base_id,
-                        llm=container.extraction_llm,
-                    ).generate_draft(
-                        created_by=job.requested_by,
-                        document_ids=options.get("document_ids") or None,
-                        instructions=options.get("instructions") or None,
-                        target_schema_id=options.get("target_schema_id") or None,
-                        graph_kind=options.get("graph_kind") or "general",
-                    )
-                    options = dict(options)
-                    options["generated_schema_id"] = schema.id
-                    options["generated_schema_version"] = schema.version
-                    job.options_json = options
-                    job_repo.update(
-                        job,
-                        status="completed",
-                        total_items=len(schema.source_document_ids_json or []) or 1,
-                        processed_items=len(schema.source_document_ids_json or []) or 1,
-                        succeeded_items=len(schema.source_document_ids_json or []) or 1,
-                        failed_items=0,
-                    )
-                elif job.job_type == "schema_drift":
-                    from app.services.graph_schema_induction_service import (
-                        GraphSchemaInductionService,
-                    )
-
-                    options = dict(job.options_json or {})
-                    drift = GraphSchemaInductionService(
-                        db,
-                        job.knowledge_base_id,
-                        llm=container.extraction_llm,
-                    ).detect_drift(
-                        created_by=job.requested_by,
-                        document_ids=options.get("document_ids") or None,
-                        instructions=options.get("instructions") or None,
-                        graph_kind=options.get("graph_kind") or "general",
-                    )
-                    options["drift_result"] = drift
-                    job.options_json = options
-                    source_count = len(drift.get("source_document_ids") or []) or 1
-                    job_repo.update(
-                        job,
-                        status="completed",
-                        total_items=source_count,
-                        processed_items=source_count,
-                        succeeded_items=source_count,
-                        failed_items=0,
-                    )
-                else:
-                    raise ValueError(f"Unsupported index job type: {job.job_type}")
-
-                if job.job_type in {"sync", "rebuild", "file", "graph_rebuild"}:
-                    completed_document_job = job_repo.get(job_id)
+                if job.job_type in {"sync", "rebuild", "file", "delete", "graph_rebuild"}:
                     if (
-                        completed_document_job is not None
-                        and completed_document_job.status in {"completed", "partial"}
-                        and completed_document_job.succeeded_items > 0
+                        deferred_completion is not None
+                        and deferred_completion["status"] in {"completed", "partial"}
+                        and deferred_completion["succeeded_items"] > 0
                     ):
                         from app.services.graph_governance_service import GraphGovernanceService
 
+                        children = []
                         if job.job_type in {"sync", "rebuild", "file"}:
-                            GraphGovernanceService(
+                            children.append(GraphGovernanceService(
                                 db,
                                 job.knowledge_base_id,
                                 task_queue=container.task_queue,
                             ).request_automatic_schema_generation(
                                 job.requested_by,
                                 source_job_id=job.id,
-                            )
-                        GraphGovernanceService(
+                            ))
+                        children.append(GraphGovernanceService(
                             db,
                             job.knowledge_base_id,
                             task_queue=container.task_queue,
                         ).request_automatic_build(
                             job.requested_by,
                             source_job_id=job.id,
-                        )
-                        _request_document_code_rebuild(
+                        ))
+                        children.append(_request_document_code_rebuild(
                             db, job.knowledge_base_id, container
-                        )
+                        ))
+                        _link_followup_jobs(db, job, children)
+                # Publish the parent terminal status only after all derived
+                # jobs are linked. Lazy run reconciliation must not observe a
+                # completed parent in the gap before its children are enqueued.
+                if deferred_completion is not None:
+                    job_repo.update(job, **deferred_completion)
 
             from app.services.rag_service import invalidate_rag_caches
 
@@ -538,8 +359,23 @@ def _process_job(
 
             invalidate_readiness_cache()
             return True
+        except JobLeaseLostError:
+            ownership_lost = True
+            db.rollback()
+            db.info.pop("index_job_lease", None)
+            logger.error("Job %s stopped after losing its execution lease", job_id)
+            return False
+        except AgentCancelledError:
+            attached_error_code = "AGENT_CANCELLED"
+            db.rollback()
+            current = job_repo.get(job_id)
+            if current is not None and current.lease_owner == worker_id:
+                job_repo.update(current, status="cancelled", error_message="Agent任务已取消")
+            return True
         except Exception as exc:
+            attached_error_code = getattr(exc, "code", "AGENT_JOB_FAILED")
             logger.error("Job %s failed: %s", job_id, exc)
+            db.rollback()
             current = job_repo.get(job_id)
             if current is not None and current.lease_owner == worker_id:
                 job_repo.update(
@@ -548,41 +384,84 @@ def _process_job(
                     error_message=str(exc)[:500],
                 )
             return False
+        finally:
+            try:
+                from app.services.agent_workflow_service import reconcile_workflow_followups
+
+                if not ownership_lost and attached_service is not None and attached_run_id is not None:
+                    current = job_repo.get(job_id)
+                    status = "succeeded" if current and current.status == "completed" else (
+                        "cancelled" if current and current.status == "cancelled" else "failed"
+                    )
+                    attached_service.finish_attached(attached_run_id, result=attached_result, status=status, error_code=attached_error_code)
+                reconcile_workflow_followups(db, job.knowledge_base_id)
+            except Exception:
+                db.rollback()
+                logger.exception("Could not reconcile agent follow-up jobs")
+
+
+def _job_cancel_requested(container, job_id, heartbeat) -> bool:
+    if heartbeat.lease_lost:
+        raise JobLeaseLostError("任务租约心跳已丢失")
+    # Called from extraction threads: never reuse the worker's ORM session.
+    with container.metadata.session() as db:
+        return IndexJobRepository(db, knowledge_base_id=None).leased_cancel_requested(job_id, heartbeat.worker_id)
 
 
 def _worker_loop() -> None:
+    run_worker_forever()
+
+
+def run_worker_forever() -> None:
+    """Run a dedicated worker. Redis only wakes polling; DB claims own jobs."""
+    global _worker_failure
     from app.bootstrap.container import get_provider_container
+    from app.core import config
 
     container = get_provider_container()
+    distributed = container.task_queue.identity().provider == "redis"
+    if config.APP_PROFILE not in {"local", "test"} and not distributed:
+        raise RuntimeError("Server workers require the Redis wakeup adapter")
+    _worker_failure = None
     logger.info("Index worker started as %s", _WORKER_ID)
-    while not _worker_stop.is_set():
-        try:
-            claimed_job_id: str | None = None
-            with container.metadata.session() as db:
-                job_repo = IndexJobRepository(db, knowledge_base_id=None)
-                job_repo.recover_expired_leases()
-                if job_repo.has_running_write_job():
-                    _worker_stop.wait(2)
+    futures = set()
+    last_heartbeat = 0.0
+    try:
+        with ThreadPoolExecutor(max_workers=INDEX_MAX_CONCURRENCY, thread_name_prefix="index-job") as pool:
+            while not _worker_stop.is_set():
+                if distributed and time.monotonic() - last_heartbeat >= getattr(config, "WORKER_HEARTBEAT_SECONDS", 5):
+                    from app.adapters.redis import publish_worker_heartbeat
+                    publish_worker_heartbeat(_WORKER_ID, {
+                        "worker_id": _WORKER_ID, "pid": os.getpid(), "concurrency": INDEX_MAX_CONCURRENCY,
+                        "running_jobs": len(futures), "stopping": False,
+                    }, getattr(config, "WORKER_HEARTBEAT_TTL_SECONDS", 20))
+                    last_heartbeat = time.monotonic()
+                for future in tuple(futures):
+                    if future.done():
+                        futures.remove(future)
+                        future.result()
+                if len(futures) >= INDEX_MAX_CONCURRENCY:
+                    _worker_stop.wait(.1)
                     continue
-                job = job_repo.claim_next_pending(
-                    worker_id=_WORKER_ID,
-                    lease_seconds=INDEX_JOB_LEASE_SECONDS,
-                )
-                # 会话即将关闭；commit 后 ORM 对象属性已过期，
-                # 必须在 with 块内把需要的标量读出来，只向块外传递 job_id。
-                claimed_job_id = job.id if job is not None else None
-
-            if claimed_job_id is None:
-                container.task_queue.wait(5)
-                continue
-
-            logger.info("Processing index job: %s", claimed_job_id)
-            _process_job(claimed_job_id, worker_id=_WORKER_ID, already_claimed=True)
-        except Exception as exc:
-            logger.error("Worker error: %s", exc)
-            _worker_stop.wait(10)
-
-    logger.info("Index worker stopped")
+                owner = f"{_WORKER_ID[:80]}:{uuid.uuid4().hex}"
+                with container.metadata.session() as db:
+                    repository = IndexJobRepository(db, knowledge_base_id=None)
+                    repository.recover_expired_leases()
+                    job = repository.claim_next_pending(worker_id=owner, lease_seconds=INDEX_JOB_LEASE_SECONDS)
+                    job_id = job.id if job else None
+                if job_id is None:
+                    container.task_queue.wait(.5)
+                    continue
+                futures.add(pool.submit(_process_job, job_id, worker_id=owner, already_claimed=True))
+    except Exception as exc:
+        _worker_failure = type(exc).__name__
+        logger.exception("Worker stopped because shared coordination failed")
+        raise
+    finally:
+        if distributed:
+            from app.adapters.redis import remove_worker_heartbeat
+            remove_worker_heartbeat(_WORKER_ID)
+        logger.info("Index worker stopped")
 
 
 def reconcile_pending_jobs(limit: int = 500) -> dict:
@@ -606,7 +485,11 @@ def start_worker() -> None:
     if not INDEX_WORKER_ENABLED:
         return
     from app.bootstrap.container import get_provider_container
+    from app.core import config
 
+    if config.APP_PROFILE not in {"local", "test"} or getattr(config, "APP_ROLE", "all") not in {"all", "worker"}:
+        logger.info("API process does not embed index workers")
+        return
     if get_provider_container().task_queue.identity().provider != "inline":
         logger.info("In-process worker disabled for external task queue")
         return
@@ -628,6 +511,13 @@ def stop_worker() -> None:
 
 
 def get_worker_status() -> dict:
+    from app.core import config
+    if config.TASK_QUEUE_PROVIDER == "redis":
+        from app.adapters.redis import active_workers
+        workers = active_workers()
+        live = [worker for worker in workers if not worker.get("stopping")]
+        return {"enabled": True, "alive": bool(live), "stopping": False,
+                "workers": workers, "mode": "external", "worker_count": len(live)}
     if not INDEX_WORKER_ENABLED:
         return {"enabled": False, "alive": False, "stopping": False}
     thread = _worker_thread
@@ -637,4 +527,5 @@ def get_worker_status() -> dict:
         "stopping": _worker_stop.is_set(),
         "thread_name": thread.name if thread else None,
         "worker_id": _WORKER_ID,
+        "error": _worker_failure,
     }

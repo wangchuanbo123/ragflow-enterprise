@@ -2,7 +2,8 @@
 
 from fastapi import APIRouter, Depends, Response
 
-from app.api.deps import get_current_user
+from app.api.deps import get_admin_user
+from app.models.user import User
 from app.services.readiness_service import check_readiness
 
 router = APIRouter()
@@ -21,3 +22,11 @@ def ready(response: Response):
     if result["status"] != "ready":
         response.status_code = 503
     return result
+
+
+@router.post("/model-probe")
+def model_probe(current_user: User = Depends(get_admin_user)):
+    """Explicit admin action: send one small request per configured model."""
+    from app.services.model_probe_service import probe_models
+
+    return probe_models()

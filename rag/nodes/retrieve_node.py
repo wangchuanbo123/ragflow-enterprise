@@ -32,9 +32,14 @@ def create_retrieve_node(retriever: Retriever):
         allowed_document_ids = state.get("allowed_document_ids")
         retrieve_with_options = getattr(retriever, "retrieve_with_options", None)
         if callable(retrieve_with_options):
+            # Empty vector explicitly means a shared embedding attempt failed.
+            # None retains standalone callers' normal lazy embedding behavior.
+            query_embedding = state.get("query_embedding")
+            if ((state.get("route") or {}).get("query_embedding") or {}).get("status") == "error":
+                query_embedding = []
             docs = retrieve_with_options(
                 unique_queries,
-                query_embedding=state.get("query_embedding"),
+                query_embedding=query_embedding,
                 strategy=state.get("retrieval_strategy", "standard"),
                 allowed_document_ids=allowed_document_ids,
             )
@@ -69,6 +74,7 @@ def create_retrieve_node(retriever: Retriever):
         return {
             "docs": docs,
             "retrieval_candidates": docs,
+            "retrieval_diagnostics": list(getattr(docs, "diagnostics", [])),
         }
 
     return retrieve_node

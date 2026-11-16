@@ -31,7 +31,7 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
     """为每个请求分配或传递 X-Request-ID。"""
 
     async def dispatch(self, request: Request, call_next):
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+        request_id = getattr(request.state, "request_id", None) or str(uuid.uuid4())
         request.state.request_id = request_id
         response = await call_next(request)
         response.headers["X-Request-ID"] = request_id
@@ -45,8 +45,13 @@ async def lifespan(app: FastAPI):
     from app.core.logger import setup_logging
 
     setup_logging()
-    # Validate the selected profile and construct all phase-one providers before
-    # accepting traffic. Unsupported enterprise adapters fail fast here.
+    from app.services.observability import start_metrics, stop_metrics
+    start_metrics()
+    from app.core.config import APP_PROFILE, APP_ROLE
+    if APP_PROFILE == "server" and APP_ROLE != "api":
+        raise ValueError("API process requires APP_ROLE=api")
+    # Validate the selected profile and construct all providers before
+    # accepting traffic.
     container = get_provider_container()
 
     init_app()
@@ -79,11 +84,16 @@ async def lifespan(app: FastAPI):
         stop_graph_maintenance_scheduler()
         stop_connector_scheduler()
         stop_worker()
+        from app.agents.runtime import stop_managed_opencode
+        stop_managed_opencode()
+        stop_metrics()
 
 
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(RequestIDMiddleware)
+from app.services.operations_middleware import OperationsMiddleware
+app.add_middleware(OperationsMiddleware)
 
 if CORS_ORIGINS:
     app.add_middleware(

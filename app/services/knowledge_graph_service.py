@@ -10,11 +10,13 @@
 from __future__ import annotations
 
 import logging
+import hashlib
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from threading import Lock
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select, tuple_, update
 from sqlalchemy.orm import Session
 
 from app.core.config import (
@@ -35,6 +37,7 @@ from app.models.knowledge_chunk import KnowledgeChunk
 from app.models.knowledge_graph import KgEntity, KgRelation
 from app.repositories.knowledge_repository import KnowledgeRepository
 from rag.knowledge_graph.extractor import GraphExtractor
+from rag.knowledge_graph.agent_extractor import AgentGraphExtractor
 from rag.knowledge_graph.interfaces import GraphStore
 from rag.knowledge_graph.prefilter import has_graph_signal
 from rag.knowledge_graph.schemas import ChunkExtraction
@@ -64,22 +67,75 @@ class GraphBuildService:
         # workers also update the persistent cache, so serialize those writes
         # with progressive graph persistence to keep ORM sessions healthy.
         self._db_write_lock = Lock()
+        self._extractor_lock = Lock()
+        self._schema_configuration_lock = Lock()
+        self._configured_schema_signature = None
         self._escalation_provider = None
         self._escalation_loaded = False
+        self._cancelled = None
+        self._agent_context = None
+        self._on_event = None
+        self._document_scope = None
+        self._agent_usage = []
+        self._usage_lock = Lock()
 
     @property
     def extractor(self) -> GraphExtractor:
         if self._extractor is None:
-            self._extractor = GraphExtractor(
-                max_retries=GRAPH_EXTRACTION_MAX_RETRIES,
-                max_content_chars=GRAPH_EXTRACTION_MAX_CHARS,
-            )
+            with self._extractor_lock:
+                if self._extractor is None:
+                    self._extractor = AgentGraphExtractor(
+                        knowledge_base_id=self.knowledge_base_id,
+                        max_retries=GRAPH_EXTRACTION_MAX_RETRIES,
+                        max_content_chars=GRAPH_EXTRACTION_MAX_CHARS,
+                    )
         return self._extractor
 
     def build_graph(
+        self, only_pending: bool = True, retry_failed: bool = False,
+        document_ids: list[str] | None = None, cancelled=None,
+        agent_context: dict | None = None, on_event=None,
+    ) -> dict:
+        from app.agents.contracts import AgentCancelledError
+
+        self._cancelled = cancelled
+        self._agent_context = agent_context
+        self._on_event = on_event
+        self._document_scope = None if document_ids is None else sorted(set(document_ids))
+        self._agent_usage = []
+        try:
+            self._check_cancelled()
+            return self._build_graph(only_pending, retry_failed, document_ids)
+        except AgentCancelledError:
+            self.db.rollback()
+            statement = update(KnowledgeChunk).where(
+                KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+                KnowledgeChunk.graph_status == "processing",
+            )
+            if document_ids is not None:
+                statement = statement.where(KnowledgeChunk.document_id.in_(document_ids))
+            self.db.execute(statement.values(graph_status="pending", graph_error=None))
+            self.db.commit()
+            raise
+
+    def _check_cancelled(self) -> None:
+        if self._cancelled is not None and self._cancelled():
+            from app.agents.contracts import AgentCancelledError
+
+            raise AgentCancelledError("知识图谱抽取已取消")
+
+    def _record_agent_event(self, event: dict) -> None:
+        if event.get("event") == "usage" or event.get("type") == "usage":
+            with self._usage_lock:
+                self._agent_usage.append(dict(event))
+        if self._on_event is not None:
+            self._on_event(event)
+
+    def _build_graph(
         self,
         only_pending: bool = True,
         retry_failed: bool = False,
+        document_ids: list[str] | None = None,
     ) -> dict:
         """为所有 ready 文档的 chunk 构建知识图谱。
 
@@ -97,7 +153,7 @@ class GraphBuildService:
             self.db, self.knowledge_base_id
         ).extraction_schema()
         schema_version = schema.version if schema else GRAPH_SCHEMA_VERSION
-        chunks = self._get_chunks_to_process(only_pending, retry_failed)
+        chunks = self._get_chunks_to_process(only_pending, retry_failed, document_ids)
         total = len(chunks)
         succeeded = 0
         failed = 0
@@ -121,17 +177,24 @@ class GraphBuildService:
         if chunks:
             self.db.commit()
 
-        worker_count = 1 if self._extractor is not None else GRAPH_PARALLEL_WORKERS
+        worker_count = 1 if self._extractor_injected else GRAPH_PARALLEL_WORKERS
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {
                 executor.submit(self._extract_batch_cached, batch, schema): index
                 for index, batch in enumerate(batches)
             }
             for future in as_completed(futures):
+                self._check_cancelled()
                 index = futures[future]
                 try:
                     batch_result = (future.result(), None)
                 except Exception as exc:
+                    from app.agents.contracts import AgentCancelledError
+
+                    if isinstance(exc, AgentCancelledError):
+                        for pending_future in futures:
+                            pending_future.cancel()
+                        raise
                     batch_result = (None, exc)
 
                 # Persist each completed batch immediately. This makes a large
@@ -143,6 +206,7 @@ class GraphBuildService:
                     schema,
                 )
                 extractions, extraction_error = escalated[0]
+                self._check_cancelled()
                 with self._db_write_lock:
                     result = self._persist_batch(
                         batches[index],
@@ -177,6 +241,7 @@ class GraphBuildService:
             "graph_stats": self.store.stats(),
             "correction_reconciliation": correction_reconciliation,
             "changes": changes,
+            "agent_usage": list(self._agent_usage),
         }
         logger.info("Graph build completed: %s", stats)
         return stats
@@ -333,26 +398,12 @@ class GraphBuildService:
         }
 
     def _escalation_llm(self):
-        """懒加载升级模型；与抽取模型相同时视为未配置。"""
-        if not self._escalation_loaded:
-            self._escalation_loaded = True
-            self._escalation_provider = None
-            if GRAPH_ESCALATION_ENABLED and self._extractor is None:
-                try:
-                    from rag.providers.factory import (
-                        get_graph_escalation_llm_provider,
-                        get_graph_extraction_llm_provider,
-                    )
+        """Legacy overrides are allowed only for explicitly injected extractors.
 
-                    escalation = get_graph_escalation_llm_provider()
-                    if (
-                        escalation.identity().as_dict()
-                        != get_graph_extraction_llm_provider().identity().as_dict()
-                    ):
-                        self._escalation_provider = escalation
-                except Exception as exc:
-                    logger.debug("Graph escalation model unavailable: %s", exc)
-        return self._escalation_provider
+        Production agents perform their own bounded verify/repair rounds. A
+        failed OpenCode backend must never silently select an old LLM provider.
+        """
+        return self._escalation_provider if self._extractor_injected else None
 
     def _escalate_low_signal(
         self,
@@ -425,8 +476,37 @@ class GraphBuildService:
         logger.info("Graph escalation upgraded %d chunks", escalated)
         return extracted
 
-    @staticmethod
-    def _make_batches(chunks: list[KnowledgeChunk]) -> list[list[dict]]:
+    def _make_batches(self, chunks: list[KnowledgeChunk]) -> list[list[dict]]:
+        # Fetch immediate same-document context, including completed neighbors
+        # outside an incremental extraction scope. Chunk queries are bounded to
+        # avoid both N+1 lookups and SQLite's bind-parameter limit.
+        neighbors = {(chunk.document_id, index)
+                     for chunk in chunks for index in (chunk.chunk_index - 1, chunk.chunk_index + 1) if index >= 0}
+        neighboring = {}
+        pairs = sorted(neighbors)
+        for start in range(0, len(pairs), 300):
+            for item in self.db.scalars(select(KnowledgeChunk).where(
+                KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+                tuple_(KnowledgeChunk.document_id, KnowledgeChunk.chunk_index).in_(pairs[start:start + 300]),
+            )):
+                neighboring[(item.document_id, item.chunk_index)] = item.content
+        titles = {document.id: document.original_filename for document in self.knowledge_repo.list_ready_documents()}
+        from app.models.knowledge_graph import KgEntityMention
+
+        candidates_by_document = {}
+        document_ids = sorted({chunk.document_id for chunk in chunks})
+        if document_ids:
+            for entity, document_id, mention in self.db.execute(
+                select(KgEntity, KgEntityMention.document_id, KgEntityMention.mention)
+                .join(KgEntityMention, KgEntityMention.entity_id == KgEntity.id)
+                .where(KgEntity.knowledge_base_id == self.knowledge_base_id,
+                       KgEntityMention.knowledge_base_id == self.knowledge_base_id,
+                       KgEntityMention.document_id.in_(document_ids))
+                .order_by(KgEntity.canonical_name).limit(300)
+            ):
+                hints = candidates_by_document.setdefault(document_id, [])
+                if len(hints) < 15:
+                    hints.append({"name": entity.canonical_name, "type": entity.entity_type, "mention": mention})
         batches: list[list[dict]] = []
         batch: list[dict] = []
         batch_chars = 0
@@ -442,6 +522,13 @@ class GraphBuildService:
                 "chunk_id": chunk.id,
                 "document_id": chunk.document_id,
                 "content": chunk.content,
+                "metadata": {
+                    "document_id": chunk.document_id, "chunk_index": chunk.chunk_index,
+                    "section": chunk.section, "document_title": titles.get(chunk.document_id, ""),
+                    "before": neighboring.get((chunk.document_id, chunk.chunk_index - 1), "")[-750:],
+                    "after": neighboring.get((chunk.document_id, chunk.chunk_index + 1), "")[:750],
+                    "entity_candidates": candidates_by_document.get(chunk.document_id, []),
+                },
             })
             batch_chars += len(chunk.content)
         if batch:
@@ -451,25 +538,38 @@ class GraphBuildService:
     def _extract_batch_cached(
         self, batch: list[dict], schema, llm_override=None
     ) -> list:
+        self._check_cancelled()
+        if isinstance(self.extractor, AgentGraphExtractor):
+            self.extractor.configure_execution(self._agent_context, cancelled=self._cancelled, on_event=self._record_agent_event)
         configure_schema = getattr(self.extractor, "configure_schema", None)
         if callable(configure_schema) and schema is not None:
-            configure_schema(
-                entity_types=schema.entity_types_json,
-                relation_types=schema.relation_types_json,
-                relation_constraints=(
-                    (schema.generation_summary_json or {}).get(
-                        "relation_type_details", []
-                    )
-                ),
-                prompt_prefix=schema.extraction_prompt,
-            )
+            configuration = {
+                "entity_types": schema.entity_types_json,
+                "relation_types": schema.relation_types_json,
+                "relation_constraints": (schema.generation_summary_json or {}).get("relation_type_details", []),
+                "prompt_prefix": schema.extraction_prompt,
+            }
+            configuration_signature = json.dumps(configuration, sort_keys=True, ensure_ascii=False)
+            with self._schema_configuration_lock:
+                if configuration_signature != self._configured_schema_signature:
+                    configure_schema(**configuration)
+                    self._configured_schema_signature = configuration_signature
         if not GRAPH_CACHE_ENABLED or self._extractor_injected:
             if llm_override is not None:
                 return self.extractor.extract_batch(batch, llm=llm_override)
             return self.extractor.extract_batch(batch)
-        active_llm = llm_override or self.extractor.llm
-        model_identity = getattr(active_llm, "identity", None)
-        model_fingerprint = str(model_identity().as_dict()) if callable(model_identity) else type(active_llm).__name__
+        signature = {
+            "extractor": self.extractor.cache_identity(),
+            "schema_id": getattr(schema, "id", None),
+            "entity_types": sorted(self.extractor.entity_types),
+            "relation_types": sorted(self.extractor.relation_types),
+            "relation_constraints": {key: [sorted(a), sorted(b)] for key, (a, b) in self.extractor.relation_constraints.items()},
+            "endpoint_variants": {key: [[sorted(a), sorted(b)] for a, b in variants] for key, variants in getattr(self.extractor, "relation_constraint_variants", {}).items()},
+            "prompt": self.extractor.prompt_prefix,
+            "context": [{"chunk_id": item["chunk_id"], "metadata": item.get("metadata")} for item in batch],
+            "document_scope": self._document_scope,
+        }
+        model_fingerprint = hashlib.sha256(json.dumps(signature, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         schema_version = schema.version if schema else GRAPH_SCHEMA_VERSION
         from app.bootstrap.container import get_provider_container
         from app.services.graph_governance_service import GraphGovernanceService
@@ -530,7 +630,7 @@ class GraphBuildService:
             logger.warning("Recovered %d stale graph chunks", len(chunks))
         return len(chunks)
 
-    def _get_chunks_to_process(self, only_pending: bool, retry_failed: bool) -> list[KnowledgeChunk]:
+    def _get_chunks_to_process(self, only_pending: bool, retry_failed: bool, document_ids: list[str] | None = None) -> list[KnowledgeChunk]:
         from app.services.graph_governance_service import GraphGovernanceService
 
         schema = GraphGovernanceService(self.db, self.knowledge_base_id).extraction_schema()
@@ -542,15 +642,24 @@ class GraphBuildService:
             statuses = ["pending", "failed", "completed"]
 
         ready_doc_ids = [d.id for d in self.knowledge_repo.list_ready_documents()]
+        if document_ids is not None:
+            ready_doc_ids = [document_id for document_id in ready_doc_ids if document_id in set(document_ids)]
         if not ready_doc_ids:
             return []
 
         status_filter = KnowledgeChunk.graph_status.in_(statuses)
         if only_pending:
-            status_filter = or_(
-                status_filter,
-                KnowledgeChunk.graph_schema_version != schema_version,
-            )
+            compatible = (schema.generation_summary_json or {}).get("compatible_extraction_versions") or []
+            if compatible:
+                # NULL/0 are legacy provenance. Consolidation alone never
+                # invalidates completed facts or silently retries failed work.
+                mismatch = and_(KnowledgeChunk.graph_schema_version.is_not(None),
+                                KnowledgeChunk.graph_schema_version.notin_([schema_version, *compatible]),
+                                KnowledgeChunk.graph_status == "completed")
+            else:
+                mismatch = or_(KnowledgeChunk.graph_schema_version.is_(None),
+                               KnowledgeChunk.graph_schema_version != schema_version)
+            status_filter = or_(status_filter, mismatch)
 
         return list(
             self.db.scalars(

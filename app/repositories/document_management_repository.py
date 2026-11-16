@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from app.models.document_management import (
@@ -13,6 +13,7 @@ from app.models.document_management import (
 )
 from app.models.knowledge_chunk import KnowledgeChunk
 from app.models.knowledge_document import KnowledgeDocument
+from app.services.knowledge_mutation import serialized_knowledge_mutation
 
 
 class DocumentManagementRepository:
@@ -39,6 +40,7 @@ class DocumentManagementRepository:
             )
         )
 
+    @serialized_knowledge_mutation
     def create_folder(
         self,
         *,
@@ -47,7 +49,7 @@ class DocumentManagementRepository:
         description: str | None = None,
     ) -> KnowledgeFolder:
         clean_name = name.strip().strip("/")
-        if not clean_name or "/" in clean_name or ".." in clean_name:
+        if not clean_name or any(part in clean_name for part in ("/", "\\", "..")):
             raise ValueError("Invalid folder name")
         parent = self.get_folder(parent_id) if parent_id else None
         if parent_id and parent is None:
@@ -72,6 +74,55 @@ class DocumentManagementRepository:
         self.db.refresh(folder)
         return folder
 
+    @serialized_knowledge_mutation
+    def update_folder(self, folder_id: str, changes: dict) -> KnowledgeFolder:
+        folder = self.get_folder(folder_id)
+        if folder is None:
+            raise ValueError("目录不存在")
+        name = (changes.get("name") if changes.get("name") is not None else folder.name).strip().strip("/")
+        if not name or any(part in name for part in ("/", "\\", "..")):
+            raise ValueError("目录名称无效")
+        parent_id = changes.get("parent_id", folder.parent_id)
+        parent = self.get_folder(parent_id) if parent_id else None
+        if parent_id and parent is None:
+            raise ValueError("上级目录不存在")
+        if parent and (parent.id == folder.id or parent.path.startswith(folder.path + "/")):
+            raise ValueError("不能将目录移到自身或子目录下")
+        new_path = f"{parent.path}/{name}" if parent else f"/{name}"
+        folders = self.list_folders()
+        subtree = [item for item in folders if item.id == folder.id or item.path.startswith(folder.path + "/")]
+        replacements = {item.id: new_path + item.path[len(folder.path):] for item in subtree}
+        if any(len(path) > 1024 for path in replacements.values()):
+            raise ValueError("目录路径不能超过 1024 个字符")
+        if any(item.id not in replacements and item.path in replacements.values() for item in folders):
+            raise ValueError("目标目录名称已经存在")
+        for item in subtree:
+            item.path = replacements[item.id]
+        folder.name = name
+        folder.parent_id = parent_id
+        if "description" in changes:
+            folder.description = changes["description"]
+        self.db.commit()
+        self.db.refresh(folder)
+        return folder
+
+    @serialized_knowledge_mutation
+    def delete_folder(self, folder_id: str) -> None:
+        folder = self.get_folder(folder_id)
+        if folder is None:
+            raise ValueError("目录不存在")
+        if self.db.scalar(select(KnowledgeFolder.id).where(
+            KnowledgeFolder.knowledge_base_id == self.knowledge_base_id,
+            KnowledgeFolder.parent_id == folder.id,
+        ).limit(1)):
+            raise ValueError("请先移动或删除子目录，再删除此目录")
+        self.db.execute(update(KnowledgeDocument).where(
+            KnowledgeDocument.knowledge_base_id == self.knowledge_base_id,
+            KnowledgeDocument.folder_id == folder.id,
+        ).values(folder_id=None))
+        self.db.delete(folder)
+        self.db.commit()
+
     def list_tags(self) -> list[DocumentTag]:
         return list(
             self.db.scalars(
@@ -89,6 +140,7 @@ class DocumentManagementRepository:
             )
         )
 
+    @serialized_knowledge_mutation
     def create_tag(self, *, name: str, color: str | None = None) -> DocumentTag:
         clean_name = name.strip()
         if not clean_name:
@@ -110,6 +162,40 @@ class DocumentManagementRepository:
         self.db.refresh(tag)
         return tag
 
+    @serialized_knowledge_mutation
+    def update_tag(self, tag_id: str, changes: dict) -> DocumentTag:
+        tag = self.get_tag(tag_id)
+        if tag is None:
+            raise ValueError("标签不存在")
+        if "name" in changes:
+            name = (changes["name"] or "").strip()
+            if not name:
+                raise ValueError("标签名称不能为空")
+            if self.db.scalar(select(DocumentTag.id).where(
+                DocumentTag.knowledge_base_id == self.knowledge_base_id,
+                DocumentTag.name == name, DocumentTag.id != tag.id,
+            )):
+                raise ValueError("标签名称已经存在")
+            tag.name = name
+        if "color" in changes:
+            tag.color = changes["color"]
+        self.db.commit()
+        self.db.refresh(tag)
+        return tag
+
+    @serialized_knowledge_mutation
+    def delete_tag(self, tag_id: str) -> None:
+        tag = self.get_tag(tag_id)
+        if tag is None:
+            raise ValueError("标签不存在")
+        self.db.execute(delete(DocumentTagLink).where(
+            DocumentTagLink.knowledge_base_id == self.knowledge_base_id,
+            DocumentTagLink.tag_id == tag.id,
+        ))
+        self.db.delete(tag)
+        self.db.commit()
+
+    @serialized_knowledge_mutation
     def set_document_tags(
         self,
         document_ids: list[str],
@@ -178,6 +264,7 @@ class DocumentManagementRepository:
             mapping.setdefault(document_id, []).append(tag_id)
         return mapping
 
+    @serialized_knowledge_mutation
     def move_documents(self, document_ids: list[str], folder_id: str | None) -> int:
         if folder_id and self.get_folder(folder_id) is None:
             raise ValueError("Folder not found")

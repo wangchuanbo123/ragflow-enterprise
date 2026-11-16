@@ -101,6 +101,7 @@ class CodeGraphRepository:
         query: str,
         limit: int = 20,
         snapshot_id: str | None = None,
+        allowed_document_ids: set[str] | None = None,
     ) -> list[dict]:
         if snapshot_id is None:
             active = self.active_snapshot()
@@ -111,7 +112,7 @@ class CodeGraphRepository:
         if not norm:
             return []
         code_file = aliased(CodeFile)
-        rows = self.db.execute(
+        statement = (
             select(CodeSymbol, code_file.path, code_file.language)
             .join(code_file, code_file.id == CodeSymbol.file_id)
             .where(
@@ -128,8 +129,14 @@ class CodeGraphRepository:
                 CodeSymbol.name,
                 code_file.path,
             )
-            .limit(limit)
-        ).all()
+        )
+        if allowed_document_ids is not None:
+            statement = statement.where(
+                CodeSymbol.metadata_json["document_source"]["document_id"].as_string().in_(
+                    sorted(allowed_document_ids)
+                )
+            )
+        rows = self.db.execute(statement.limit(limit)).all()
         return [self._symbol_dict(symbol, path, language) for symbol, path, language in rows]
 
     def list_symbols(

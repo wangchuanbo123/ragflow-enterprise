@@ -1,0 +1,46 @@
+# Server runtime: external inference, native bounded parsers and pgvector.
+langchain-core==1.8.0
+langchain-text-splitters==1.1.3
+pip>=26.2
+setuptools>=84.1.0
+
+numpy==1.26.4
+
+fastapi==0.162.5
+starlette==1.3.1
+uvicorn==0.29.0
+pydantic==2.14.3
+python-dotenv==1.2.2
+openai==1.109.1
+
+rank-bm25==0.2.2
+jieba==0.42.1
+
+# PDF text/image parsing and bounded Poppler/Tesseract OCR.
+pypdf==6.21.4
+Pillow>=13.0.0,<14
+python-multipart>=0.0.33
+tiktoken==0.7.0
+chardet==5.2.0
+docx2txt==0.9
+
+
+xxhash==3.5.0
+
+psutil
+
+SQLAlchemy==2.0.51
+psycopg[binary]==3.3.8
+pgvector==0.5.1
+redis==7.4.1
+alembic==1.18.5
+PyJWT==2.15.0
+bcrypt==5.0.0
+httpx==0.27.2
+boto3==1.43.124
+Markdown==3.10.2
+jsonschema>=4.20,<5
+
+# Optional multi-language code parsing. Python parsing still uses stdlib ast.
+tree-sitter>=0.23,<0.26
+tree-sitter-language-pack>=0.7,<1

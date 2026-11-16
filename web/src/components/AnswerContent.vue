@@ -199,8 +199,8 @@ function tokenizeCode(code: string): CodeToken[] {
     const rest = code.slice(i)
     let m: RegExpExecArray | null
     if ((m = /^((?:#|\/\/)[^\n]*)/.exec(rest))) { push('comment', m[1]); i += m[1].length; continue }
-    if ((m = /^\/\*[\s\S]*?\*\//.exec(rest))) { push('comment', m[1]); i += m[1].length; continue }
-    if ((m = /^(?:'''[\s\S]*?'''|"""[\s\S]*?""")/.exec(rest))) { push('string', m[1]); i += m[1].length; continue }
+    if ((m = /^\/\*[\s\S]*?\*\//.exec(rest))) { push('comment', m[0]); i += m[0].length; continue }
+    if ((m = /^(?:'''[\s\S]*?'''|"""[\s\S]*?""")/.exec(rest))) { push('string', m[0]); i += m[0].length; continue }
     if ((m = /^('(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`)/.exec(rest))) { push('string', m[1]); i += m[1].length; continue }
     if ((m = /^(0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/.exec(rest))) { push('number', m[1]); i += m[1].length; continue }
     if ((m = /^([A-Za-z_$][A-Za-z0-9_$]*)/.exec(rest))) {

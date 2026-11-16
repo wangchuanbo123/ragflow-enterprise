@@ -1,10 +1,20 @@
 import { reactive, ref } from 'vue'
 import * as api from '../api/client'
 import type { User } from '../types'
+import { resetConversations } from './useConversations'
+import { resetSessionRequests } from '../api/session'
 
 const user = ref<User | null>(null)
 const ready = ref(false)
 const state = reactive({ loading: false, error: '' })
+
+function clearSession(): void {
+  resetSessionRequests()
+  resetConversations()
+  user.value = null
+}
+
+window.addEventListener('rag:unauthorized', clearSession)
 
 async function restore(): Promise<void> {
   try {
@@ -17,6 +27,7 @@ async function restore(): Promise<void> {
 }
 
 async function login(username: string, password: string): Promise<void> {
+  clearSession()
   state.loading = true
   state.error = ''
   try {
@@ -31,9 +42,9 @@ async function login(username: string, password: string): Promise<void> {
 
 async function logout(): Promise<void> {
   await api.logout()
-  user.value = null
+  clearSession()
 }
 
 export function useAuth() {
-  return { user, ready, state, restore, login, logout }
+  return { user, ready, state, restore, login, logout, clearSession }
 }

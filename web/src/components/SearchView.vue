@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import * as api from '../api/client'
 import type { SearchHit } from '../types'
+import { navigate, navigationState } from '../composables/useNavigation'
+import { pageLabel } from '../documentPresentation'
 
 const props = defineProps<{ knowledgeBaseId: string }>()
 
-const query = ref('')
+const query = ref(navigationState.value.query)
 const hits = ref<SearchHit[]>([])
 const searching = ref(false)
 const searched = ref(false)
@@ -20,6 +22,7 @@ async function search(): Promise<void> {
   try {
     hits.value = await api.searchKnowledgeBase(props.knowledgeBaseId, text, 30)
     searched.value = true
+    navigate({ query: text }, true)
   } catch (e) {
     error.value = (e as Error).message
   } finally {
@@ -46,10 +49,11 @@ function imageUrl(image: { url: string }): string {
 }
 
 function locationLabel(hit: SearchHit): string {
-  return [hit.section, hit.page != null ? `第 ${hit.page} 页` : ''].filter(Boolean).join(' · ')
+  return [hit.section, pageLabel(hit.page)].filter(Boolean).join(' · ')
 }
 
 const previewImage = ref<{ url: string; alt: string } | null>(null)
+onMounted(() => { if (query.value.trim()) void search() })
 </script>
 
 <template>

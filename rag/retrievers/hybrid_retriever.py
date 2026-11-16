@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+from time import perf_counter
 from typing import Any
 
 from langchain_core.documents import Document
@@ -22,6 +23,7 @@ from app.core.config import (
 from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 from rag.retrievers.bm25_retriever import get_bm25_retriever
 from rag.retrieval_strategy import get_retrieval_policy
+from rag.retrievers.diagnostics import RetrievalDocuments, diagnostic
 
 logger = logging.getLogger(__name__)
 
@@ -131,157 +133,68 @@ class HybridRRFRetriever:
         return self.retrieve_single(query)
 
     def retrieve_single(
-        self,
-        query: str,
-        allowed_document_ids: set[str] | None = None,
-        query_embedding: list[float] | None = None,
-        strategy: str = "standard",
+        self, query: str, allowed_document_ids: set[str] | None = None,
+        query_embedding: list[float] | None = None, strategy: str = "standard",
     ) -> list[Document]:
-        """对单个 query 执行向量+BM25 双通道检索和 RRF 融合。"""
-        if allowed_document_ids is not None and not allowed_document_ids:
-            return []
-        vector_filter = (
-            {"document_id": {"$in": sorted(allowed_document_ids)}}
-            if allowed_document_ids is not None
-            else None
-        )
-        policy = get_retrieval_policy(strategy)
-        # Vector retrieval
-        vector_docs: list[Document] = []
-        try:
-            if query_embedding is not None:
-                vector_docs = self.vector_store.similarity_search_by_vector_with_relevance_scores(
-                    query_embedding,
-                    k=policy.vector_k,
-                    **({"filter": vector_filter} if vector_filter else {}),
-                )
-            else:
-                vector_docs = self.vector_store.similarity_search_with_relevance_scores(
-                    query,
-                    k=policy.vector_k,
-                    **({"filter": vector_filter} if vector_filter else {}),
-                )
-            vector_docs = [doc for doc, _ in vector_docs]
-        except Exception:
-            try:
-                if query_embedding is not None:
-                    vector_docs = self.vector_store.similarity_search_by_vector(
-                        query_embedding,
-                        k=policy.vector_k,
-                        **({"filter": vector_filter} if vector_filter else {}),
-                    )
-                else:
-                    vector_docs = self.vector_store.similarity_search(
-                        query,
-                        k=policy.vector_k,
-                        **({"filter": vector_filter} if vector_filter else {}),
-                    )
-            except Exception as exc:
-                logger.warning("Vector retrieval failed: %s", exc)
-
-        if allowed_document_ids is not None:
-            vector_docs = [
-                doc for doc in vector_docs
-                if doc.metadata.get("document_id") in allowed_document_ids
-            ]
-
-        for doc in vector_docs:
-            doc.metadata["_channel"] = "vector"
-
-        # BM25 retrieval
-        bm25_docs: list[Document] = []
-        try:
-            bm25_retriever = get_bm25_retriever(self.knowledge_base_id)
-            bm25_docs = bm25_retriever.get_relevant_documents(
-                query,
-                top_k=policy.bm25_k,
-                allowed_document_ids=allowed_document_ids,
-            )
-        except Exception as exc:
-            logger.warning("BM25 retrieval failed: %s", exc)
-
-        for doc in bm25_docs:
-            doc.metadata["_channel"] = "bm25"
-
-        # RRF fusion
-        return weighted_rrf_fusion(
-            [
-                (vector_docs, self.vector_weight),
-                (bm25_docs, self.bm25_weight),
-            ],
-            rrf_k=self.rrf_k,
-            candidate_k=policy.candidate_k,
-        )
+        return self.retrieve_multi_query([query], allowed_document_ids=allowed_document_ids,
+            query_embedding=query_embedding, strategy=strategy)
 
     def retrieve_multi_query(
-        self,
-        queries: list[str],
-        allowed_document_ids: set[str] | None = None,
-        query_embedding: list[float] | None = None,
-        strategy: str = "standard",
+        self, queries: list[str], allowed_document_ids: set[str] | None = None,
+        query_embedding: list[float] | None = None, strategy: str = "standard",
     ) -> list[Document]:
-        """对多个 query 分别执行双通道检索，然后按 chunk_id 累加 RRF。"""
-        if allowed_document_ids is not None and not allowed_document_ids:
-            return []
-        vector_filter = (
-            {"document_id": {"$in": sorted(allowed_document_ids)}}
-            if allowed_document_ids is not None
-            else None
-        )
+        if not queries or (allowed_document_ids is not None and not allowed_document_ids):
+            return RetrievalDocuments()
+        vector_filter = {"document_id": {"$in": sorted(allowed_document_ids)}} if allowed_document_ids is not None else None
+        kwargs = {"filter": vector_filter} if vector_filter else {}
         policy = get_retrieval_policy(strategy)
-        all_ranked: list[tuple[list[Document], float]] = []
-
-        # Semantic retrieval is intentionally executed once. The same vector is
-        # reused by every vector-backed channel; lexical retrieval can still use
-        # both the original and rewritten query.
-        semantic_query = queries[-1]
-        vector_docs: list[Document] = []
+        ranked, diagnostics = [], []
+        vector_docs = []
+        started = perf_counter()
+        vector_status, vector_code = "ok", "retrieved"
         try:
-            if query_embedding is not None:
-                vector_docs = self.vector_store.similarity_search_by_vector(
-                    query_embedding,
-                    k=policy.vector_k,
-                    **({"filter": vector_filter} if vector_filter else {}),
-                )
-            else:
-                vector_docs = self.vector_store.similarity_search(
-                    semantic_query,
-                    k=policy.vector_k,
-                    **({"filter": vector_filter} if vector_filter else {}),
-                )
+            if query_embedding is not None and not len(query_embedding):
+                raise ValueError("shared_embedding_unavailable")
+            method = ("similarity_search_by_vector_with_relevance_scores" if query_embedding is not None
+                      else "similarity_search_with_relevance_scores")
+            scored = getattr(self.vector_store, method)(query_embedding if query_embedding is not None else queries[-1],
+                                                       k=policy.vector_k, **kwargs)
+            for doc, score in scored:
+                doc.metadata["vector_score"] = float(score)
+                vector_docs.append(doc)
+        except (AttributeError, NotImplementedError):
+            try:
+                method = "similarity_search_by_vector" if query_embedding is not None else "similarity_search"
+                vector_docs = getattr(self.vector_store, method)(query_embedding if query_embedding is not None else queries[-1],
+                                                                k=policy.vector_k, **kwargs)
+                vector_status, vector_code = "degraded", "scores_unavailable"
+            except Exception as exc:
+                vector_status, vector_code = "error", type(exc).__name__
         except Exception as exc:
-            logger.warning("Vector retrieval failed for query '%s': %s", semantic_query[:50], exc)
-        if allowed_document_ids is not None:
-            vector_docs = [
-                doc for doc in vector_docs
-                if doc.metadata.get("document_id") in allowed_document_ids
-            ]
+            vector_status, vector_code = ("skipped", "shared_embedding_unavailable") if query_embedding is not None and not len(query_embedding) else ("error", type(exc).__name__)
+        vector_docs = [doc for doc in vector_docs if allowed_document_ids is None or doc.metadata.get("document_id") in allowed_document_ids]
         for doc in vector_docs:
             doc.metadata["_channel"] = "vector"
-        all_ranked.append((vector_docs, self.vector_weight))
-
-        for q in queries:
-            # BM25
-            bm25_docs: list[Document] = []
+        diagnostics.append(diagnostic("vector", vector_status, vector_code, len(vector_docs), (perf_counter()-started)*1000))
+        ranked.append((vector_docs, self.vector_weight))
+        # A single semantic vector is shared; lexical recall uses every distinct query.
+        for query in dict.fromkeys(queries):
+            started, bm25_docs = perf_counter(), []
+            status, code = "ok", "retrieved"
             try:
-                bm25_docs = get_bm25_retriever(
-                    self.knowledge_base_id
-                ).get_relevant_documents(
-                    q,
-                    top_k=policy.bm25_k,
-                    allowed_document_ids=allowed_document_ids,
-                )
+                bm25_docs = get_bm25_retriever(self.knowledge_base_id).get_relevant_documents(
+                    query, top_k=policy.bm25_k, allowed_document_ids=allowed_document_ids)
             except Exception as exc:
-                logger.warning("BM25 retrieval failed for query '%s': %s", q[:50], exc)
+                status = "error"
+                code = getattr(exc, "code", type(exc).__name__)
             for doc in bm25_docs:
                 doc.metadata["_channel"] = "bm25"
-            all_ranked.append((bm25_docs, self.bm25_weight))
-
-        return weighted_rrf_fusion(
-            all_ranked,
-            rrf_k=self.rrf_k,
-            candidate_k=policy.candidate_k,
-        )
+            diagnostics.append(diagnostic("bm25", status, code, len(bm25_docs), (perf_counter()-started)*1000))
+            ranked.append((bm25_docs, self.bm25_weight))
+        documents = weighted_rrf_fusion(ranked, rrf_k=self.rrf_k, candidate_k=policy.candidate_k)
+        for doc in documents:
+            doc.metadata["retrieval_diagnostics"] = diagnostics
+        return RetrievalDocuments(documents, diagnostics=diagnostics)
 
     def retrieve_with_options(
         self,

@@ -2,6 +2,8 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import * as api from '../api/client'
 import type { BackupSettings, KnowledgeBackup, KnowledgeDocument } from '../types'
+import { usePermissions } from '../composables/usePermissions'
+const { canEdit } = usePermissions()
 
 const props = defineProps<{ knowledgeBaseId: string }>()
 const backups = ref<KnowledgeBackup[]>([])
@@ -85,19 +87,19 @@ onMounted(load)
     </section>
     <p v-if="error" class="error">{{ error }}</p><p v-if="message" class="message">{{ message }}</p>
 
-    <div class="actions">
-      <section><header><b>整个知识库</b><small>完整灾备和整体回退</small></header><label>版本备注（可选）<input v-model="label" placeholder="例如：上线前稳定版本" /></label><button :disabled="loading" @click="create('knowledge_base')">立即备份整个知识库</button></section>
+    <div v-if="canEdit" class="actions">
+      <section><header><b>整个知识库</b><small>知识库版本回退；服务器灾备需另行执行完整备份</small></header><label>版本备注（可选）<input v-model="label" placeholder="例如：上线前稳定版本" /></label><button :disabled="loading" @click="create('knowledge_base')">立即备份整个知识库</button></section>
       <section><header><b>单文档知识图谱</b><small>只保护一个文档的实体、关系和证据</small></header><label>选择来源文档<select v-model="documentId"><option v-for="document in documents" :key="document.id" :value="document.id">{{ document.original_filename }}</option></select></label><button :disabled="loading || !documentId" @click="create('document_graph')">备份所选文档图谱</button></section>
     </div>
 
     <section class="versions">
-      <header><div><b>备份版本</b><small>自动备份最多保留 {{ settings?.retention_versions ?? 12 }} 个；手工备份仅由管理员删除</small></div><button @click="load">刷新</button></header>
+      <header><div><b>备份版本</b><small>自动备份最多保留 {{ settings?.retention_versions ?? 12 }} 个；有知识库编辑权限的用户可以删除手工备份</small></div><button @click="load">刷新</button></header>
       <div v-if="!backups.length" class="empty">还没有备份，建议先创建一份整个知识库备份。</div>
       <article v-for="item in backups" :key="item.id">
         <div :class="['type', item.backup_type]"><span>{{ item.backup_type === 'knowledge_base' ? 'KB' : '图' }}</span></div>
         <div class="main"><b>{{ item.backup_type === 'knowledge_base' ? '整个知识库' : (documentNames[item.document_id || ''] || '文档图谱') }} · v{{ item.version_no }}</b><p>{{ item.label || '未填写版本备注' }}</p><small>{{ triggerName(item.trigger) }} · {{ new Date(item.created_at).toLocaleString() }} · {{ size(item.file_size) }}<template v-if="item.restored_at"> · 已于 {{ new Date(item.restored_at).toLocaleString() }} 回退</template></small></div>
         <span class="ready">{{ item.status === 'ready' ? '可恢复' : item.status }}</span>
-        <button :disabled="loading" @click="restore(item)">回退到此版本</button><button class="danger" :disabled="loading" @click="remove(item)">删除</button>
+        <button v-if="canEdit" :disabled="loading || item.status!=='ready'" @click="restore(item)">回退到此版本</button><button v-if="canEdit" class="danger" :disabled="loading" @click="remove(item)">删除</button>
       </article>
     </section>
   </div>

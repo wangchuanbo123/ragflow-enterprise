@@ -1,8 +1,31 @@
 """文档管理 Pydantic 模型。"""
 
 from datetime import datetime
+from typing import Annotated
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictBool, StrictInt
+
+
+class DocumentReindexRequest(BaseModel):
+    force_ocr: StrictBool = False
+    ocr_pages: list[Annotated[StrictInt, Field(ge=0)]] | None = Field(default=None, max_length=40)
+
+    model_config = {"extra": "forbid"}
+
+
+class ProcessingStage(BaseModel):
+    name: str
+    status: str
+
+
+class DocumentProcessing(BaseModel):
+    job_id: str
+    stage: str | None = None
+    status: str
+    message: str | None = None
+    updated_at: datetime | None = None
+    stages: list[ProcessingStage] = Field(default_factory=list)
+    waiting_reason: str | None = None
 
 
 class DocumentOut(BaseModel):
@@ -24,6 +47,8 @@ class DocumentOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     indexed_at: datetime | None = None
+    processing: DocumentProcessing | None = None
+    tag_ids: list[str] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
 
@@ -47,8 +72,28 @@ class IndexJobOut(BaseModel):
     created_at: datetime
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    priority: int = 50
+    document_ids: list[str] = Field(default_factory=list)
+    document_names: list[str] = Field(default_factory=list)
+    current_stage: str | None = None
+    waiting_reason: str | None = None
+    stages: list[ProcessingStage] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}
+
+
+class DocumentPage(BaseModel):
+    items: list[DocumentOut]
+    total: int
+    offset: int
+    limit: int
+
+
+class IndexJobPage(BaseModel):
+    items: list[IndexJobOut]
+    total: int
+    offset: int
+    limit: int
 
 
 class IndexJobEventOut(BaseModel):

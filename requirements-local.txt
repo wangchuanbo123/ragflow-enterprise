@@ -1,0 +1,4 @@
+# Optional in-process BGE reranker. Use CPU torch wheels in the image.
+sentence-transformers==6.3.0
+transformers==5.22.2
+torch==2.15.0

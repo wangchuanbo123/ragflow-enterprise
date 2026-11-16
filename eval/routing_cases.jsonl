@@ -1,0 +1,12 @@
+{"id":"route-001","query":"员工入职需要哪些材料？","expected":["text"]}
+{"id":"route-002","query":"订单模块依赖哪些服务","graph_available":true,"expected":["graph","text"]}
+{"id":"route-003","query":"数据库宕机会影响哪些下游系统？","graph_available":true,"expected":["graph","text"]}
+{"id":"route-004","query":"解释 process_job 函数调用哪些函数？","code_available":true,"expected":["code","text"]}
+{"id":"route-005","query":"Where is the UserService class implemented?","code_available":true,"expected":["code","text"]}
+{"id":"route-006","query":"A 和 B 之间有什么关系？","graph_available":false,"expected":["text"],"expected_unavailable":["graph"]}
+{"id":"route-007","query":"这个接口的源码实现在哪里？","code_available":false,"expected":["text"],"expected_unavailable":["code"]}
+{"id":"route-008","query":"系统发布流程是什么？","expected":["text"]}
+{"id":"route-009","query":"Show the dependency path between billing and ledger","graph_available":true,"expected":["graph","text"]}
+{"id":"route-010","query":"Which module calls create_invoice?","code_available":true,"expected":["code","text"]}
+{"id":"route-011","query":"只查询图谱","explicit":["graph"],"graph_available":true,"expected":["graph"]}
+{"id":"route-012","query":"只查询尚未可用的代码图","explicit":["code"],"code_available":false,"expected":["text"],"expected_unavailable":["code"]}

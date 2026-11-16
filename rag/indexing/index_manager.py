@@ -14,7 +14,7 @@ import hashlib
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,7 @@ from app.core.knowledge_bases import (
 )
 from app.repositories.knowledge_repository import KnowledgeRepository
 from rag.indexing.chunker import split_documents
+from rag.indexing.profiles import embedding_fingerprint, pipeline_fingerprint, index_ref
 from rag.indexing.image_metadata import encode_images_for_vector
 from rag.loaders.document_loader import is_supported_document, load_document
 from rag.providers.interfaces import VectorIndexRef
@@ -53,6 +54,7 @@ class PreparedDocument:
     file_size: int
     vector_documents: list[Document]
     chunk_records: list[Any]
+    parse_summary: dict = field(default_factory=dict)
 
 
 def _corpus_fingerprint(doc_dir: Path, include_path=None) -> str:
@@ -67,8 +69,8 @@ def _corpus_fingerprint(doc_dir: Path, include_path=None) -> str:
     return hasher.hexdigest()[:16]
 
 
-def _embedding_fingerprint() -> str:
-    return f"{EMBEDDING_PROVIDER}:{EMBEDDING_MODEL}"
+def _embedding_fingerprint(embedding=None) -> str:
+    return embedding_fingerprint(embedding)
 
 
 class IndexManager:
@@ -120,10 +122,7 @@ class IndexManager:
         return self._image_sink
 
     def _index_ref(self, collection_name: str) -> VectorIndexRef:
-        return VectorIndexRef(
-            name=collection_name,
-            knowledge_base_id=self.knowledge_base_id,
-        )
+        return index_ref(collection_name, self.knowledge_base_id, self.embedding)
 
     def _open_vector_store(self, collection_name: str):
         return self.vector_provider.open(
@@ -145,7 +144,7 @@ class IndexManager:
         state = self.repo.get_index_state()
         state.active_collection_name = collection_name
         state.index_schema_version = INDEX_SCHEMA_VERSION
-        state.embedding_fingerprint = _embedding_fingerprint()
+        state.embedding_fingerprint = _embedding_fingerprint(self.embedding)
         state.corpus_fingerprint = ""
         state.updated_at = datetime.now(timezone.utc)
         self.db.commit()
@@ -186,7 +185,7 @@ class IndexManager:
                 continue
             files_on_disk[rel] = path
 
-        emb_fp = _embedding_fingerprint()
+        emb_fp = _embedding_fingerprint(self.embedding)
 
         for rel, path in files_on_disk.items():
             fh = file_hash(path)
@@ -201,6 +200,8 @@ class IndexManager:
                 or doc.index_schema_version != INDEX_SCHEMA_VERSION
                 or doc.embedding_provider != EMBEDDING_PROVIDER
                 or doc.embedding_model != EMBEDDING_MODEL
+                or (doc.metadata_json or {}).get("embedding_fingerprint") != emb_fp
+                or (doc.metadata_json or {}).get("pipeline_fingerprint") != pipeline_fingerprint()
             ):
                 result["modified"].append({
                     "source_path": rel, "path": path, "file_hash": fh, "document_id": doc.id
@@ -345,19 +346,27 @@ class IndexManager:
         """解析并切片，但不修改 SQLite 或活动 collection。"""
         from app.models.knowledge_chunk import KnowledgeChunk
 
-        docs = load_document(file_path)
-        if not docs:
-            raise ValueError(f"No readable content: {source_path}")
+        from app.services.task_execution import job_stage
+        with job_stage("parse", document_id=document_id):
+            existing = self.repo.get_by_id(document_id)
+            options = ((existing.metadata_json or {}).get("parse_options") or {}) if existing else {}
+            if options:
+                docs = load_document(file_path, force_ocr=bool(options.get("force_ocr")), ocr_pages=options.get("ocr_pages"))
+            else:
+                docs = load_document(file_path)
+            if not docs:
+                raise ValueError(f"No readable content: {source_path}")
 
-        self._attach_document_images(docs, file_path, document_id)
+            self._attach_document_images(docs, file_path, document_id)
 
-        chunk_result = split_documents(
-            docs,
-            document_id=document_id,
-            file_hash_val=file_hash_val,
-        )
-        if not chunk_result.chunks:
-            raise ValueError(f"No chunks generated: {source_path}")
+        with job_stage("chunk", document_id=document_id):
+            chunk_result = split_documents(
+                docs,
+                document_id=document_id,
+                file_hash_val=file_hash_val,
+            )
+            if not chunk_result.chunks:
+                raise ValueError(f"No chunks generated: {source_path}")
 
         chunk_records: list[KnowledgeChunk] = []
         for chunk_doc, token_count, chunk_hash in zip(
@@ -372,6 +381,8 @@ class IndexManager:
                 "file_hash": file_hash_val,
                 "source": source_path,
                 "filename": file_path.name,
+                "embedding_fingerprint": embedding_fingerprint(self.embedding),
+                "pipeline_fingerprint": pipeline_fingerprint(),
             })
             chunk_doc.metadata = metadata
             vector_metadata = dict(metadata)
@@ -405,6 +416,14 @@ class IndexManager:
             file_size=file_path.stat().st_size,
             vector_documents=chunk_result.chunks,
             chunk_records=chunk_records,
+            parse_summary={
+                "page_count": len(docs),
+                "native_text_characters": sum(int(doc.metadata.get("native_text_characters", 0)) for doc in docs),
+                "ocr_recommended_pages": [doc.metadata["page"] for doc in docs if doc.metadata.get("ocr_recommended") and isinstance(doc.metadata.get("page"), int)],
+                "ocr_pages": [doc.metadata["page"] for doc in docs if doc.metadata.get("extraction_method") == "local_ocr" and isinstance(doc.metadata.get("page"), int)],
+                "preview": "\n".join(doc.page_content[:200] for doc in docs[:3])[:600],
+                "table_pages": [doc.metadata.get("page", 0) for doc in docs if doc.metadata.get("table_structure")],
+            },
         )
 
     def _write_prepared_vectors(
@@ -418,11 +437,13 @@ class IndexManager:
         written_ids: set[str] = set()
         preserve_ids = preserve_ids or set()
         try:
-            for start in range(0, len(prepared.vector_documents), INGEST_BATCH_SIZE):
-                batch = prepared.vector_documents[start:start + INGEST_BATCH_SIZE]
-                ids = [chunk.metadata["chunk_id"] for chunk in batch]
-                vector_store.add_documents(batch, ids=ids)
-                written_ids.update(ids)
+            from app.services.task_execution import job_stage
+            with job_stage("vector", document_id=prepared.document_id):
+                for start in range(0, len(prepared.vector_documents), INGEST_BATCH_SIZE):
+                    batch = prepared.vector_documents[start:start + INGEST_BATCH_SIZE]
+                    ids = [chunk.metadata["chunk_id"] for chunk in batch]
+                    vector_store.add_documents(batch, ids=ids)
+                    written_ids.update(ids)
         except Exception as write_error:
             cleanup_ids = written_ids - preserve_ids
             if cleanup_ids:
@@ -478,8 +499,11 @@ class IndexManager:
         doc.index_schema_version = INDEX_SCHEMA_VERSION
         doc.embedding_provider = EMBEDDING_PROVIDER
         doc.embedding_model = EMBEDDING_MODEL
+        doc.metadata_json = {**(doc.metadata_json or {}), "embedding_fingerprint": embedding_fingerprint(self.embedding), "pipeline_fingerprint": pipeline_fingerprint(), "parse_summary": prepared.parse_summary}
         doc.error_message = None
         doc.indexed_at = datetime.now(timezone.utc)
+
+        self._remove_document_code(prepared.document_id)
 
         self.db.execute(
             delete(KnowledgeChunk).where(
@@ -575,12 +599,40 @@ class IndexManager:
 
         for chunk in self.repo.list_chunks_for_document(doc.id):
             self.db.delete(chunk)
+        self._remove_document_code(doc.id)
         doc.status = "deleted"
         doc.chunk_count = 0
         doc.error_message = None
         self.repo.touch_index_state(commit=False)
         self.db.commit()
         return True
+
+    def _remove_document_code(self, document_id: str) -> None:
+        """Immediately revoke derived code, including older snapshots without provenance."""
+        from sqlalchemy import delete, or_, select, update
+        from app.models.code_graph import CodeFile, CodeRelation, CodeSnapshot, CodeSymbol, CodeVectorIndexState
+
+        files = list(self.db.scalars(select(CodeFile).where(
+            CodeFile.knowledge_base_id == self.knowledge_base_id,
+            CodeFile.path.startswith(f"docs/{document_id}/", autoescape=True),
+        )))
+        if not files:
+            return
+        file_ids = [item.id for item in files]
+        symbol_ids = list(self.db.scalars(select(CodeSymbol.id).where(CodeSymbol.file_id.in_(file_ids))))
+        if symbol_ids:
+            self.db.execute(delete(CodeRelation).where(
+                CodeRelation.knowledge_base_id == self.knowledge_base_id,
+                or_(CodeRelation.subject_symbol_id.in_(symbol_ids), CodeRelation.target_symbol_id.in_(symbol_ids)),
+            ))
+            self.db.execute(delete(CodeSymbol).where(CodeSymbol.id.in_(symbol_ids)))
+        self.db.execute(delete(CodeFile).where(CodeFile.id.in_(file_ids)))
+        self.db.execute(update(CodeSnapshot).where(
+            CodeSnapshot.id.in_({item.snapshot_id for item in files}),
+        ).values(content_hash=""))
+        self.db.execute(update(CodeVectorIndexState).where(
+            CodeVectorIndexState.knowledge_base_id == self.knowledge_base_id,
+        ).values(status="stale"))
 
     def _delete_doc_from_collection(self, document_id: str, collection_name: str) -> None:
         self.vector_provider.delete_vectors(
@@ -595,6 +647,8 @@ class IndexManager:
         doc_dir: Path,
         dry_run: bool = False,
         job_id: str | None = None,
+        *,
+        cancelled=None,
     ) -> dict:
         """安全全量重建，任一文件失败都不切换活动索引。"""
         job_id = job_id or str(uuid.uuid4())[:8]
@@ -628,13 +682,36 @@ class IndexManager:
                 "chunk_count": 0,
             }
 
-        self._reset_build_collection(build_collection)
+        try:
+            self._check_rebuild_cancelled(cancelled)
+            self._reset_build_collection(build_collection)
+            return self._populate_rebuild(
+                doc_dir, classification, rebuild_items, build_collection, cancelled,
+            )
+        except Exception:
+            self.db.rollback()
+            self._discard_build_collection(build_collection)
+            raise
+
+    @staticmethod
+    def _check_rebuild_cancelled(cancelled) -> None:
+        if cancelled is not None and cancelled():
+            from app.agents.contracts import AgentCancelledError
+
+            raise AgentCancelledError("索引重建已取消，活动索引保持不变")
+
+    def _populate_rebuild(
+        self, doc_dir, classification, rebuild_items, build_collection, cancelled,
+    ) -> dict:
+        from app.agents.contracts import AgentCancelledError
+        from app.repositories.index_job_repository import JobLeaseLostError
 
         prepared_documents: list[PreparedDocument] = []
         expected_chunk_ids: set[str] = set()
         errors: list[str] = []
 
         for item in rebuild_items:
+            self._check_rebuild_cancelled(cancelled)
             try:
                 prepared = self._prepare_document(
                     source_path=item["source_path"],
@@ -642,12 +719,15 @@ class IndexManager:
                     file_hash_val=item["file_hash"],
                     document_id=item.get("document_id") or str(uuid.uuid4()),
                 )
+                self._check_rebuild_cancelled(cancelled)
                 self._write_prepared_vectors(prepared, build_collection)
                 prepared_documents.append(prepared)
                 expected_chunk_ids.update(
                     chunk.metadata["chunk_id"]
                     for chunk in prepared.vector_documents
                 )
+            except (AgentCancelledError, JobLeaseLostError):
+                raise
             except Exception as exc:
                 errors.append(f"{item['source_path']}: {exc}")
                 logger.error("Failed to rebuild %s: %s", item["source_path"], exc)
@@ -663,6 +743,7 @@ class IndexManager:
                 "errors": errors[:20],
             }
 
+        self._check_rebuild_cancelled(cancelled)
         build_ref = self._index_ref(build_collection)
         vector_count = self.vector_provider.count(build_ref)
         actual_chunk_ids = self.vector_provider.list_ids(build_ref)
@@ -694,6 +775,7 @@ class IndexManager:
                 "chunk_count": len(expected_chunk_ids),
             }
 
+        self._check_rebuild_cancelled(cancelled)
         try:
             old_collection = self._commit_rebuild(
                 prepared_documents=prepared_documents,
@@ -705,7 +787,10 @@ class IndexManager:
                     doc_dir,
                     self._belongs_to_knowledge_base,
                 ),
+                cancelled=cancelled,
             )
+        except (AgentCancelledError, JobLeaseLostError):
+            raise
         except Exception as exc:
             self.db.rollback()
             self._discard_build_collection(build_collection)
@@ -762,6 +847,7 @@ class IndexManager:
         deleted_source_paths: set[str],
         build_collection: str,
         corpus_fingerprint: str,
+        cancelled=None,
     ) -> str | None:
         """原子替换 SQLite Chunk 并切换活动 collection 指针。"""
         from sqlalchemy import delete, func, select
@@ -818,6 +904,7 @@ class IndexManager:
             doc.index_schema_version = INDEX_SCHEMA_VERSION
             doc.embedding_provider = EMBEDDING_PROVIDER
             doc.embedding_model = EMBEDDING_MODEL
+            doc.metadata_json = {**(doc.metadata_json or {}), "embedding_fingerprint": embedding_fingerprint(self.embedding), "pipeline_fingerprint": pipeline_fingerprint(), "parse_summary": prepared.parse_summary}
             doc.error_message = None
             doc.indexed_at = datetime.now(timezone.utc)
             self.db.add_all(prepared.chunk_records)
@@ -828,9 +915,10 @@ class IndexManager:
                 doc.status = "deleted"
                 doc.chunk_count = 0
 
+        self._check_rebuild_cancelled(cancelled)
         state.active_collection_name = build_collection
         state.index_schema_version = INDEX_SCHEMA_VERSION
-        state.embedding_fingerprint = _embedding_fingerprint()
+        state.embedding_fingerprint = _embedding_fingerprint(self.embedding)
         state.corpus_fingerprint = corpus_fingerprint
         state.updated_at = datetime.now(timezone.utc)
 
@@ -856,6 +944,7 @@ class IndexManager:
                 f"SQLite chunk count ({persisted_count}) != staged count ({staged_count})"
             )
 
+        self._check_rebuild_cancelled(cancelled)
         self.db.commit()
         return old_collection
 
@@ -923,6 +1012,8 @@ class IndexManager:
         active = self._active_collection()
         result = []
         for index in indexes:
+            if index.ref.knowledge_base_id and index.ref.knowledge_base_id != self.knowledge_base_id:
+                continue
             name = index.ref.name
             result.append({
                 "name": name,

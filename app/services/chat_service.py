@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from contextlib import nullcontext
+import logging
+import time
 
 from sqlalchemy.orm import Session
 
@@ -18,6 +21,8 @@ from app.repositories.conversation_repository import (
 )
 from app.repositories.knowledge_base_repository import KnowledgeBaseRepository
 
+logger = logging.getLogger(__name__)
+
 
 def _runtime_for_knowledge_base(knowledge_base_id: str):
     """Resolve through the module so runtime/test overrides stay observable."""
@@ -31,6 +36,11 @@ def _runtime_for_knowledge_base(knowledge_base_id: str):
 def _ensure_conversation(db: Session, conversation_id: str, user_id: str) -> Conversation:
     conversation = ConversationRepository(db).get_for_user(conversation_id, user_id)
     if not conversation:
+        raise not_found("会话不存在")
+    user = db.get(User, user_id)
+    if not user or not KnowledgeBaseRepository(db).can_read(
+        conversation.knowledge_base_id, user_id, is_admin=user.role == "admin"
+    ):
         raise not_found("会话不存在")
     return conversation
 
@@ -121,7 +131,7 @@ def answer_sync(
     content: str,
     retrieval_options=None,
 ) -> dict:
-    """Persist a synchronous answer produced by the compiled LangGraph."""
+    """Persist a synchronous answer produced by the retrieval workflow."""
     conversation = _ensure_conversation(db, conversation_id, user_id)
     content = (content or "").strip()
     if not content:
@@ -162,6 +172,7 @@ def answer_sync(
             )
             result = _annotate_single_base_result(result, knowledge_base)
     except Exception as exc:  # noqa: BLE001
+        logger.warning("Synchronous answer failed (%s)", type(exc).__name__)
         message_repo.add(
             Message(
                 conversation_id=conversation.id,
@@ -169,7 +180,7 @@ def answer_sync(
                 role="assistant",
                 content="",
                 status="failed",
-                error_message=str(exc)[:1000],
+                error_message=exc.message if getattr(exc, "code", "") == "INDEX_REBUILD_REQUIRED" else "回答生成失败，请稍后重试",
             )
         )
         conversation_repo.touch(conversation)
@@ -199,8 +210,10 @@ def answer_stream(
     user_id: str,
     content: str,
     retrieval_options=None,
+    *,
+    session_factory=None,
 ) -> Iterator[dict]:
-    """Persist and expose message, route, delta, sources, done/error SSE events."""
+    """Validate eagerly; the returned iterator owns persistence and cancellation."""
     conversation = _ensure_conversation(db, conversation_id, user_id)
     content = (content or "").strip()
     if not content:
@@ -209,52 +222,99 @@ def answer_stream(
         db, user_id, conversation.knowledge_base_id, retrieval_options
     )
 
+    history = _load_history(db, conversation.id, user_id)
+    # Only immutable values cross the request/stream session boundary.
+    knowledge_base_id = conversation.knowledge_base_id
+    conversation_id = conversation.id
+    db.commit()
+
+    def events():
+        scope = session_factory() if session_factory else nullcontext(db)
+        with scope as stream_db:
+            yield from _stream_answer(
+                stream_db, conversation_id, knowledge_base_id,
+                content, history, knowledge_bases, retrieval_options,
+            )
+
+    return events()
+
+
+def _stream_answer(db, conversation_id, knowledge_base_id, content, history, knowledge_bases, retrieval_options):
     conversation_repo = ConversationRepository(db)
     message_repo = MessageRepository(db)
-    history = _load_history(db, conversation.id, user_id)
     message_repo.add(
         Message(
-            conversation_id=conversation.id,
-            knowledge_base_id=conversation.knowledge_base_id,
+            conversation_id=conversation_id,
+            knowledge_base_id=knowledge_base_id,
             role="user",
             content=content,
             status="completed",
         )
     )
-    conversation_repo.touch(conversation)
     assistant = message_repo.add(
         Message(
-            conversation_id=conversation.id,
-            knowledge_base_id=conversation.knowledge_base_id,
+            conversation_id=conversation_id,
+            knowledge_base_id=knowledge_base_id,
             role="assistant",
             content="",
             status="streaming",
         )
     )
-    yield {"event": "message", "data": {"message_id": assistant.id}}
-
+    assistant_id = assistant.id
+    db.commit()
     collected: list[str] = []
     sources: list[dict] = []
     route: dict = {}
+    state = "interrupted"
+    error_message = None
+    upstream = None
+    lease = None
+    checkpoint_at = time.monotonic()
+
+    def persist(status):
+        # Reload after rollback/commit; do not hold a read transaction while
+        # waiting on the model. A deleted conversation need not be recreated.
+        row = db.get(Message, assistant_id)
+        if row is not None:
+            message_repo.update(
+                row, content="".join(collected), status=status,
+                sources_json=sources, routing_json=route,
+                error_message=error_message,
+            )
+            conversation = db.get(Conversation, conversation_id)
+            if conversation:
+                conversation_repo.touch(conversation)
+        db.commit()
+
     try:
+        from app.services.stream_lifecycle import stream_lease
+        lease = stream_lease(assistant_id)
+        yield {"event": "message", "data": {"message_id": assistant_id}}
         from app.services import rag_service
 
         if len(knowledge_bases) > 1:
-            events = rag_service.stream_multi(
+            upstream = rag_service.stream_multi(
                 content, history, knowledge_bases, retrieval_options
             )
         else:
             knowledge_base = knowledge_bases[0]
-            events = rag_service.stream(
+            upstream = rag_service.stream(
                 content,
                 history,
                 _runtime_for_knowledge_base(knowledge_base["id"]),
                 knowledge_base["id"],
                 retrieval_options,
             )
-        for event in events:
+        for event in upstream:
+            if lease is not None:
+                lease.assert_held()
             if event["event"] == "delta":
                 collected.append(event["data"]["content"])
+                if time.monotonic() - checkpoint_at >= 1:
+                    persist("streaming")
+                    checkpoint_at = time.monotonic()
+            elif event["event"] == "answer":
+                collected[:] = [event["data"]["content"]]
             elif event["event"] == "sources":
                 sources = event["data"]["sources"]
                 if len(knowledge_bases) == 1:
@@ -274,30 +334,37 @@ def answer_stream(
                     ]
             yield event
 
-        message_repo.update(
-            assistant,
-            content="".join(collected),
-            status="completed",
-            sources_json=sources,
-            routing_json=route,
-            error_message=None,
-        )
-        conversation_repo.touch(conversation)
+        if lease is not None:
+            lease.assert_held()
+        state = "completed"
+        persist(state)
         yield {
             "event": "done",
-            "data": {"message_id": assistant.id, "status": "completed"},
+            "data": {"message_id": assistant_id, "status": "completed"},
         }
     except Exception as exc:  # noqa: BLE001
-        message_repo.update(
-            assistant,
-            status="failed",
-            routing_json=route,
-            error_message=str(exc)[:1000],
-        )
+        db.rollback()
+        state = "failed"
+        # Provider exceptions can contain endpoint URLs or credentials. Keep
+        # public and persisted errors generic; record only the exception type.
+        logger.warning("Answer stream failed (%s)", type(exc).__name__)
+        incompatible_index = getattr(exc, "code", "") == "INDEX_REBUILD_REQUIRED"
+        error_message = exc.message if incompatible_index else "回答生成失败，请稍后重试"
+        persist(state)
         yield {
             "event": "error",
             "data": {
-                "code": "RAG_GENERATION_FAILED",
-                "message": "回答生成失败，请稍后重试",
+                "code": "INDEX_REBUILD_REQUIRED" if incompatible_index else "RAG_GENERATION_FAILED",
+                "message": error_message,
             },
         }
+    finally:
+        try:
+            if upstream is not None and hasattr(upstream, "close"):
+                upstream.close()
+        finally:
+            try:
+                persist(state)
+            finally:
+                if lease is not None:
+                    lease.close()

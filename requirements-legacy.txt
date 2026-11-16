@@ -1,0 +1,4 @@
+# Optional dependency group; runtime requirements are installed separately.
+chromadb==0.4.24
+posthog==5.4.0
+langchain-community==0.4.2

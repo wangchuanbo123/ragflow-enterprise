@@ -29,6 +29,7 @@ eval/results/*
 .mypy_cache/
 .ruff_cache/
 .cache/
+.workbuddy/
 
 # OS and editor files
 .DS_Store
@@ -42,4 +43,7 @@ web/dist/
 
 # Local shell scripts
 *.sh
-!deploy/enterprise/deploy.sh
+
+# Official OpenCode checkout is reproducible via its pinned source manifest.
+vendor/opencode/
+integrations/opencode/runtime/

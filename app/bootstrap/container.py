@@ -14,23 +14,12 @@ from app.adapters.interfaces import (
 from app.core.config import (
     APP_PROFILE,
     CACHE_PROVIDER,
-    CELERY_BROKER_URL,
-    CELERY_INDEX_QUEUE,
-    CELERY_INDEX_TASK_NAME,
-    CELERY_RESULT_BACKEND,
-    LOCAL_OBJECT_STORE_DIR,
+    REDIS_URL,
+    REDIS_KEY_PREFIX,
     GRAPH_STORE_PROVIDER,
+    LOCAL_OBJECT_STORE_DIR,
     METADATA_STORE_PROVIDER,
     OBJECT_STORE_PROVIDER,
-    REDIS_CACHE_PREFIX,
-    REDIS_URL,
-    S3_ACCESS_KEY,
-    S3_ADDRESSING_STYLE,
-    S3_BUCKET,
-    S3_ENDPOINT_URL,
-    S3_PREFIX,
-    S3_REGION,
-    S3_SECRET_KEY,
     TASK_QUEUE_PROVIDER,
     VECTOR_STORE_PROVIDER,
 )
@@ -52,35 +41,31 @@ def validate_provider_configuration(
     cache: str,
     graph_store: str = "sqlalchemy",
 ) -> None:
-    """Fail fast when an enterprise profile points at local-only adapters."""
-
-    if profile not in {"local", "test", "enterprise"}:
+    if profile not in {"local", "test", "server"}:
         raise ValueError(f"Unsupported application profile: {profile}")
 
-    if profile != "enterprise":
-        return
-
-    local_only = {
-        "METADATA_STORE_PROVIDER": (metadata_store, {"sqlite"}),
-        "VECTOR_STORE_PROVIDER": (
-            vector_store,
-            {"chroma", "chroma_embedded"},
-        ),
+    allowed = {
+        "METADATA_STORE_PROVIDER": (metadata_store, {"sqlite", "postgresql"}),
+        "VECTOR_STORE_PROVIDER": (vector_store, {"chroma", "chroma_embedded", "pgvector"}),
         "OBJECT_STORE_PROVIDER": (object_store, {"local"}),
-        "TASK_QUEUE_PROVIDER": (task_queue, {"inline", "in_process"}),
-        "CACHE_PROVIDER": (cache, {"memory"}),
-        "GRAPH_STORE_PROVIDER": (graph_store, {"sqlite"}),
+        "TASK_QUEUE_PROVIDER": (task_queue, {"inline", "in_process", "redis"}),
+        "CACHE_PROVIDER": (cache, {"memory", "redis"}),
+        "GRAPH_STORE_PROVIDER": (graph_store, {"sqlite", "sqlalchemy"}),
     }
     invalid = [
         f"{name}={value}"
-        for name, (value, forbidden) in local_only.items()
-        if value in forbidden
+        for name, (value, supported) in allowed.items()
+        if value not in supported
     ]
     if invalid:
         raise ValueError(
-            "Enterprise profile cannot use local-only providers: "
-            + ", ".join(invalid)
+            "Unsupported provider configuration: " + ", ".join(invalid)
         )
+    if profile == "server" and (
+        metadata_store != "postgresql" or vector_store != "pgvector"
+        or task_queue != "redis" or cache != "redis" or graph_store != "sqlalchemy"
+    ):
+        raise ValueError("Server profile requires PostgreSQL, pgvector, Redis and SQLAlchemy graph storage")
 
 
 @dataclass(frozen=True)
@@ -131,61 +116,18 @@ def get_provider_container() -> ProviderContainer:
         get_reranker,
         get_vector_store_provider,
     )
-
-    if OBJECT_STORE_PROVIDER == "local":
-        object_store = LocalObjectStore(LOCAL_OBJECT_STORE_DIR)
-    elif OBJECT_STORE_PROVIDER in {"s3", "minio"}:
-        from app.adapters.remote import S3ObjectStore
-
-        object_store = S3ObjectStore(
-            bucket=S3_BUCKET,
-            endpoint_url=S3_ENDPOINT_URL,
-            access_key=S3_ACCESS_KEY,
-            secret_key=S3_SECRET_KEY,
-            region=S3_REGION,
-            prefix=S3_PREFIX,
-            addressing_style=S3_ADDRESSING_STYLE,
-        )
-    else:
-        raise ValueError(
-            f"Unsupported object store adapter: {OBJECT_STORE_PROVIDER}"
-        )
-
-    if TASK_QUEUE_PROVIDER in {"inline", "in_process"}:
-        task_queue = InlineTaskQueue()
-    elif TASK_QUEUE_PROVIDER == "celery":
-        from app.adapters.remote import CeleryTaskQueue
-
-        task_queue = CeleryTaskQueue(
-            broker_url=CELERY_BROKER_URL,
-            result_backend=CELERY_RESULT_BACKEND,
-            queue_name=CELERY_INDEX_QUEUE,
-            task_name=CELERY_INDEX_TASK_NAME,
-        )
-    else:
-        raise ValueError(
-            f"Unsupported task queue adapter: {TASK_QUEUE_PROVIDER}"
-        )
-
-    if CACHE_PROVIDER == "memory":
-        cache = MemoryCache()
-    elif CACHE_PROVIDER == "redis":
-        from app.adapters.remote import RedisCache
-
-        cache = RedisCache(REDIS_URL, prefix=REDIS_CACHE_PREFIX)
-    else:
-        raise ValueError(f"Unsupported cache adapter: {CACHE_PROVIDER}")
-    if METADATA_STORE_PROVIDER not in {"sqlite", "postgres", "postgresql"}:
-        raise ValueError(
-            f"Unsupported metadata store adapter: {METADATA_STORE_PROVIDER}"
-        )
+    if TASK_QUEUE_PROVIDER == "redis" or CACHE_PROVIDER == "redis":
+        from app.adapters.redis import RedisTaskQueue, RedisCache
 
     return ProviderContainer(
         profile=APP_PROFILE,
         llm=get_llm_provider("answer"),
         rewrite_llm=get_llm_provider("rewrite"),
         router_llm=get_llm_provider("router"),
-        extraction_llm=get_llm_provider("extraction"),
+        # Compatibility for explicitly injected legacy consumers. Production
+        # knowledge reasoning resolves AgentBackend independently and must not
+        # fail because an unused historical extraction-model setting changed.
+        extraction_llm=get_llm_provider("answer"),
         embedding=get_embedding_provider(),
         reranker=get_reranker(),
         vector_store=get_vector_store_provider(),
@@ -193,9 +135,9 @@ def get_provider_container() -> ProviderContainer:
             lambda: database.SessionLocal(),
             provider_name=METADATA_STORE_PROVIDER,
         ),
-        object_store=object_store,
-        task_queue=task_queue,
-        cache=cache,
+        object_store=LocalObjectStore(LOCAL_OBJECT_STORE_DIR),
+        task_queue=RedisTaskQueue(REDIS_URL, prefix=REDIS_KEY_PREFIX) if TASK_QUEUE_PROVIDER == "redis" else InlineTaskQueue(),
+        cache=RedisCache(REDIS_URL, prefix=REDIS_KEY_PREFIX) if CACHE_PROVIDER == "redis" else MemoryCache(),
     )
 
 

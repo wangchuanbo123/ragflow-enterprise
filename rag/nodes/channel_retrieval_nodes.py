@@ -16,6 +16,15 @@ from rag.retrievers.hybrid_retriever import weighted_rrf_fusion
 from rag.retrieval_strategy import get_retrieval_policy
 
 
+def _attach_diagnostics(documents, diagnostics):
+    for doc in documents:
+        combined = list(doc.metadata.get("retrieval_diagnostics") or [])
+        for item in diagnostics:
+            if item not in combined:
+                combined.append(item)
+        doc.metadata["retrieval_diagnostics"] = combined
+
+
 def create_text_retrieve_node(retriever):
     retrieve = create_retrieve_node(retriever)
 
@@ -23,22 +32,27 @@ def create_text_retrieve_node(retriever):
         started = perf_counter()
         route = state.get("route") or {}
         error = None
+        diagnostics = []
         try:
             if "text" not in route.get("selected_channels", ["text"]):
                 documents = []
                 status = "skipped"
             else:
-                documents = retrieve(state).get("docs", [])
+                retrieved = retrieve(state)
+                documents = retrieved.get("docs", [])
+                diagnostics = retrieved.get("retrieval_diagnostics", [])
                 documents = filter_documents_by_scope(
                     documents,
                     state.get("allowed_document_ids"),
                 )
-                status = "ok"
+                _attach_diagnostics(documents, diagnostics)
+                status = "degraded" if any(item.get("status") in {"degraded", "error"} or item.get("code") == "shared_embedding_unavailable" for item in diagnostics) else "ok"
         except Exception as exc:
             documents = []
             status = "error"
-            error = f"{type(exc).__name__}: {exc}"
+            error = type(exc).__name__
         channel_result = {
+            "diagnostics": diagnostics,
             "status": status,
             "count": len(documents),
             "elapsed_ms": round((perf_counter() - started) * 1000, 2),
@@ -61,22 +75,27 @@ def create_graph_retrieve_node(retriever):
         started = perf_counter()
         route = state.get("route") or {}
         error = None
+        diagnostics = []
         try:
             if retriever is None or "graph" not in route.get("selected_channels", []):
                 documents = []
                 status = "skipped"
             else:
-                documents = retrieve(state).get("docs", [])
+                retrieved = retrieve(state)
+                documents = retrieved.get("docs", [])
+                diagnostics = retrieved.get("retrieval_diagnostics", [])
                 documents = filter_documents_by_scope(
                     documents,
                     state.get("allowed_document_ids"),
                 )
-                status = "ok"
+                _attach_diagnostics(documents, diagnostics)
+                status = "degraded" if any(item.get("status") in {"degraded", "error"} or item.get("code") == "shared_embedding_unavailable" for item in diagnostics) else "ok"
         except Exception as exc:
             documents = []
             status = "error"
-            error = f"{type(exc).__name__}: {exc}"
+            error = type(exc).__name__
         channel_result = {
+            "diagnostics": diagnostics,
             "status": status,
             "count": len(documents),
             "elapsed_ms": round((perf_counter() - started) * 1000, 2),
@@ -99,22 +118,27 @@ def create_code_retrieve_node(retriever):
         started = perf_counter()
         route = state.get("route") or {}
         error = None
+        diagnostics = []
         try:
             if retriever is None or "code" not in route.get("selected_channels", []):
                 documents = []
                 status = "skipped"
             else:
-                documents = retrieve(state).get("docs", [])
+                retrieved = retrieve(state)
+                documents = retrieved.get("docs", [])
+                diagnostics = retrieved.get("retrieval_diagnostics", [])
                 documents = filter_documents_by_scope(
                     documents,
                     state.get("allowed_document_ids"),
                 )
-                status = "ok"
+                _attach_diagnostics(documents, diagnostics)
+                status = "degraded" if any(item.get("status") in {"degraded", "error"} or item.get("code") == "shared_embedding_unavailable" for item in diagnostics) else "ok"
         except Exception as exc:
             documents = []
             status = "error"
-            error = f"{type(exc).__name__}: {exc}"
+            error = type(exc).__name__
         channel_result = {
+            "diagnostics": diagnostics,
             "status": status,
             "count": len(documents),
             "elapsed_ms": round((perf_counter() - started) * 1000, 2),
@@ -153,6 +177,14 @@ def fusion_node(state):
         "graph": state.get("graph_channel_result") or {"status": "skipped", "count": 0, "elapsed_ms": 0},
         "code": state.get("code_channel_result") or {"status": "skipped", "count": 0, "elapsed_ms": 0},
     }
+    diagnostics = list(route.get("retrieval_diagnostics") or [])
+    for channel, result in route["channel_results"].items():
+        nested = result.get("diagnostics") or []
+        if nested:
+            diagnostics.extend(nested)
+        elif channel != "text":
+            diagnostics.append({"channel": channel, "status": result.get("status", "skipped"), "code": result.get("error") or result.get("status", "skipped"), "count": result.get("count", 0), "elapsed_ms": result.get("elapsed_ms", 0)})
+    route["retrieval_diagnostics"] = diagnostics
     route["fused_count"] = len(documents)
     return {
         "docs": documents,

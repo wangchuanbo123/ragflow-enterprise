@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
+import uuid
 
 import bcrypt
 import jwt
@@ -37,6 +38,7 @@ def create_access_token(subject: str, extra: dict[str, Any] | None = None) -> st
         "sub": subject,
         "iat": int(now.timestamp()),
         "exp": int(expire.timestamp()),
+        "jti": str(uuid.uuid4()),
     }
     if extra:
         payload.update(extra)

@@ -107,13 +107,17 @@ class KnowledgeBaseRepository:
         )
 
     def can_read(self, knowledge_base_id: str, user_id: str, *, is_admin: bool = False) -> bool:
+        if self.get(knowledge_base_id) is None:
+            return False
         if is_admin:
-            return self.get(knowledge_base_id) is not None
+            return True
         return self.member_role(knowledge_base_id, user_id) is not None
 
     def can_edit(self, knowledge_base_id: str, user_id: str, *, is_admin: bool = False) -> bool:
+        if self.get(knowledge_base_id) is None:
+            return False
         if is_admin:
-            return self.get(knowledge_base_id) is not None
+            return True
         return self.member_role(knowledge_base_id, user_id) in {"owner", "editor"}
 
     def _available_slug(self, name: str, requested_slug: str | None = None) -> str:
@@ -327,7 +331,9 @@ class KnowledgeBaseRepository:
     def list_due_data_sources(self, now: datetime, limit: int = 100) -> list[KnowledgeDataSource]:
         return list(self.db.scalars(
             select(KnowledgeDataSource)
+            .join(KnowledgeBase, KnowledgeBase.id == KnowledgeDataSource.knowledge_base_id)
             .where(
+                KnowledgeBase.is_active.is_(True),
                 KnowledgeDataSource.status == "active",
                 KnowledgeDataSource.sync_interval_minutes.is_not(None),
                 or_(

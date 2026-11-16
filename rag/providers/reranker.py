@@ -2,7 +2,6 @@ from functools import cached_property
 from typing import List, Sequence
 
 from langchain_core.documents import Document
-from sentence_transformers import CrossEncoder
 
 from rag.providers.interfaces import ProviderHealth, ProviderIdentity
 
@@ -14,6 +13,7 @@ class BgeReranker:
 
     @cached_property
     def _model(self):
+        from sentence_transformers import CrossEncoder
         return CrossEncoder(self.model)
 
     def rerank(

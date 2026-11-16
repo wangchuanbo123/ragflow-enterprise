@@ -164,6 +164,25 @@ def test_stream_marks_failed_on_error(client, monkeypatch):
         assert msgs and msgs[0].status == "failed"
 
 
+def test_incompatible_index_stream_reports_rebuild_action(client, monkeypatch):
+    from rag.errors import IndexCompatibilityError
+    def incompatible(*args, **kwargs):
+        raise IndexCompatibilityError("请在文档管理中执行重建全库索引")
+    monkeypatch.setattr("app.services.rag_service.active_runtime", incompatible)
+    _login(client)
+    cid = _create_conversation(client)
+    with client.stream("POST", f"/api/v1/conversations/{cid}/messages/stream", json={"content": "test"}) as response:
+        payload = response.read().decode("utf-8")
+    assert "INDEX_REBUILD_REQUIRED" in payload
+    assert "重建全库索引" in payload
+    from app.core.database import SessionLocal
+    from app.models.message import Message
+    with SessionLocal() as db:
+        message = db.query(Message).filter_by(conversation_id=cid, role="assistant").one()
+        assert message.status == "failed"
+        assert "重建全库索引" in message.error_message
+
+
 def test_image_and_code_artifacts_survive_message_history(client, monkeypatch):
     from langchain_core.documents import Document
 

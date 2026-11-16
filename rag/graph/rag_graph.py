@@ -1,12 +1,17 @@
-"""Compiled, route-aware LangGraph used by every question-answering entry point."""
+"""Application-owned deterministic RAG workflow, independent of agent frameworks.
 
-from langgraph.graph import END, StateGraph
+Knowledge work uses a pluggable agent backend. Online question answering keeps
+bounded routing/retrieval stages and exposes the existing ``invoke`` API.
+"""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 
 from rag.nodes.channel_retrieval_nodes import (
-    create_code_retrieve_node,
-    create_graph_retrieve_node,
-    create_text_retrieve_node,
-    fusion_node,
+    create_code_retrieve_node, create_graph_retrieve_node,
+    create_text_retrieve_node, fusion_node,
 )
 from rag.nodes.context_node import context_node
 from rag.nodes.embed_query_node import create_embed_query_node
@@ -18,66 +23,58 @@ from rag.runtime.runtime import RAGRuntime, get_current_runtime
 from rag.state.rag_state import RAGState
 
 
-def _after_context(state: RAGState) -> str:
-    return "end" if state.get("generation_mode") == "context" else "generate"
+class RAGWorkflow:
+    """A reusable, stateless pipeline; each invocation owns its mutable state."""
+
+    def __init__(self, runtime: RAGRuntime):
+        self.before_retrieval = (
+            create_route_node(runtime),
+            create_rewrite_node(runtime.rewrite_llm or runtime.llm),
+            create_post_rewrite_route_node(runtime),
+            create_embed_query_node(runtime.embedding_model),
+        )
+        self.retrieval_channels = (
+            create_text_retrieve_node(runtime.retriever),
+            create_graph_retrieve_node(runtime.graph_retriever),
+            create_code_retrieve_node(runtime.code_retriever),
+        )
+        self.after_retrieval = (
+            fusion_node, create_rerank_node(runtime.reranker), context_node,
+        )
+        self.generate = create_generate_node(runtime.llm)
+
+    @staticmethod
+    def _merge(state: dict, updates: dict) -> None:
+        for key, value in updates.items():
+            if key == "parallel_markers":
+                state[key] = list(state.get(key) or []) + list(value or [])
+            else:
+                state[key] = value
+
+    def invoke(self, initial_state: RAGState, config=None, **kwargs) -> RAGState:
+        del config, kwargs
+        state = deepcopy(dict(initial_state))
+        for node in self.before_retrieval:
+            self._merge(state, node(state))
+        # Branches read independent snapshots. Fixed merge order makes fusion
+        # and citation numbering independent of thread scheduling.
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="rag-retrieval") as executor:
+            futures = [executor.submit(node, deepcopy(state)) for node in self.retrieval_channels]
+            updates = [future.result() for future in futures]
+        seen_keys = set()
+        for update in updates:
+            overlapping = (set(update) - {"parallel_markers"}) & seen_keys
+            if overlapping:
+                raise ValueError(f"Retrieval channels wrote overlapping state keys: {sorted(overlapping)}")
+            seen_keys.update(set(update) - {"parallel_markers"})
+            self._merge(state, update)
+        for node in self.after_retrieval:
+            self._merge(state, node(state))
+        if state.get("generation_mode") != "context":
+            self._merge(state, self.generate(state))
+        return state
 
 
-def build_graph(runtime: RAGRuntime | None = None):
-    """Build one workflow for sync answers and streaming context preparation.
-
-    Streaming requests stop after context construction and stream the model using
-    the same prepared state. Synchronous requests continue to the generate node.
-    """
-    runtime = runtime or get_current_runtime()
-    workflow = StateGraph(RAGState)
-
-    workflow.add_node(
-        "rewrite",
-        create_rewrite_node(runtime.rewrite_llm or runtime.llm),
-    )
-    workflow.add_node("route_request", create_route_node(runtime))
-    workflow.add_node(
-        "route_after_rewrite",
-        create_post_rewrite_route_node(runtime),
-    )
-    workflow.add_node(
-        "embed_query",
-        create_embed_query_node(runtime.embedding_model),
-    )
-    workflow.add_node("text_retrieve", create_text_retrieve_node(runtime.retriever))
-    workflow.add_node(
-        "graph_retrieve",
-        create_graph_retrieve_node(runtime.graph_retriever),
-    )
-    workflow.add_node(
-        "code_retrieve",
-        create_code_retrieve_node(runtime.code_retriever),
-    )
-    workflow.add_node("fuse", fusion_node)
-    workflow.add_node("rerank", create_rerank_node(runtime.reranker))
-    workflow.add_node("build_context", context_node)
-    workflow.add_node("generate", create_generate_node(runtime.llm))
-
-    workflow.set_entry_point("route_request")
-    workflow.add_edge("route_request", "rewrite")
-    workflow.add_edge("rewrite", "route_after_rewrite")
-    workflow.add_edge("route_after_rewrite", "embed_query")
-    # Independent channels fan out concurrently. Each writes distinct state
-    # keys, and the list edge acts as the fan-in barrier before fusion.
-    workflow.add_edge("embed_query", "text_retrieve")
-    workflow.add_edge("embed_query", "graph_retrieve")
-    workflow.add_edge("embed_query", "code_retrieve")
-    workflow.add_edge(
-        ["text_retrieve", "graph_retrieve", "code_retrieve"],
-        "fuse",
-    )
-    workflow.add_edge("fuse", "rerank")
-    workflow.add_edge("rerank", "build_context")
-    workflow.add_conditional_edges(
-        "build_context",
-        _after_context,
-        {"generate": "generate", "end": END},
-    )
-    workflow.add_edge("generate", END)
-
-    return workflow.compile()
+def build_graph(runtime: RAGRuntime | None = None) -> RAGWorkflow:
+    """Compatibility entry point for the framework-independent RAG runner."""
+    return RAGWorkflow(runtime or get_current_runtime())

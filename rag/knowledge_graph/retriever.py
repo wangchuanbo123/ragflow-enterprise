@@ -5,6 +5,9 @@
 
 from __future__ import annotations
 
+from time import perf_counter
+from rag.retrievers.diagnostics import RetrievalDocuments, diagnostic
+
 import logging
 import math
 from typing import Any
@@ -40,15 +43,7 @@ class KnowledgeGraphRetriever:
         knowledge_base_id: str = DEFAULT_KNOWLEDGE_BASE_ID,
     ):
         self._db = db
-        self._owns_db = False
         self.knowledge_base_id = knowledge_base_id
-
-    @property
-    def db(self):
-        if self._db is None:
-            self._db = SessionLocal()
-            self._owns_db = True
-        return self._db
 
     def get_relevant_documents(self, query: str, top_k: int = 8) -> list[Document]:
         if not KNOWLEDGE_GRAPH_ENABLED:
@@ -75,13 +70,12 @@ class KnowledgeGraphRetriever:
             policy.graph_top_k,
             query_embedding=query_embedding,
             strategy=strategy,
+            allowed_document_ids=allowed_document_ids,
         )
         if allowed_document_ids is None:
             return docs
-        return [
-            doc for doc in docs
-            if doc.metadata.get("document_id") in allowed_document_ids
-        ]
+        return RetrievalDocuments([doc for doc in docs if doc.metadata.get("document_id") in allowed_document_ids],
+                                  diagnostics=getattr(docs, "diagnostics", []))
 
     def _retrieve(
         self,
@@ -90,13 +84,40 @@ class KnowledgeGraphRetriever:
         *,
         query_embedding: list[float] | None = None,
         strategy: str = "standard",
+        allowed_document_ids: set[str] | None = None,
+    ) -> list[Document]:
+        # Cached retrievers contain no owned Session. Each request releases its
+        # connection, and concurrent requests never share a transaction.
+        if self._db is not None:
+            return self._retrieve_with_db(
+                self._db, query, top_k,
+                query_embedding=query_embedding, strategy=strategy,
+                allowed_document_ids=allowed_document_ids,
+            )
+        with SessionLocal() as db:
+            return self._retrieve_with_db(
+                db, query, top_k,
+                query_embedding=query_embedding, strategy=strategy,
+                allowed_document_ids=allowed_document_ids,
+            )
+
+    def _retrieve_with_db(
+        self, db, query: str, top_k: int, *,
+        query_embedding: list[float] | None = None,
+        strategy: str = "standard",
+        allowed_document_ids: set[str] | None = None,
     ) -> list[Document]:
         from app.bootstrap.container import get_provider_container
 
         policy = get_retrieval_policy(strategy)
+        started = perf_counter()
+        diagnostics = []
+        skip_semantic = query_embedding is not None and not len(query_embedding)
+        if skip_semantic:
+            diagnostics.append(diagnostic("graph", "degraded", "shared_embedding_unavailable"))
 
         store = get_provider_container().graph_store(
-            self.db,
+            db,
             self.knowledge_base_id,
         )
 
@@ -107,14 +128,20 @@ class KnowledgeGraphRetriever:
             from app.services.entity_vector_service import EntityVectorService
 
             semantic = (
-                EntityVectorService(self.db, self.knowledge_base_id).semantic_search(
+                EntityVectorService(db, self.knowledge_base_id).semantic_search(
                     query,
                     policy.graph_entity_k,
                     query_embedding=query_embedding,
                 )
-                if GRAPH_ENTITY_VECTOR_ENABLED else []
+                if GRAPH_ENTITY_VECTOR_ENABLED and not skip_semantic else []
             )
             by_id = {entity["id"]: entity for entity in entities}
+            effective_entities = (
+                {identifier: candidate for candidate in store.get_effective_entities(
+                    [item["entity_id"] for item in semantic if item.get("entity_id") not in by_id])
+                    for identifier in [candidate["id"], *candidate.get("matched_entity_ids", [])]}
+                if any(item.get("entity_id") not in by_id for item in semantic) else {}
+            )
             for item in semantic:
                 entity_id = item.get("entity_id")
                 if not entity_id:
@@ -125,12 +152,9 @@ class KnowledgeGraphRetriever:
                         float(item.get("match_score", 0)),
                     )
                 else:
-                    model = next((
-                        candidate for candidate in store.list_effective_entities()
-                        if candidate["id"] == entity_id
-                    ), None)
+                    model = effective_entities.get(entity_id)
                     if model:
-                        by_id[entity_id] = {
+                        by_id[model["id"]] = {
                             **model,
                             "match_score": float(item.get("match_score", 0)),
                         }
@@ -138,7 +162,7 @@ class KnowledgeGraphRetriever:
                 by_id.values(), key=lambda item: float(item.get("match_score", 0)), reverse=True
             )[:policy.graph_entity_k]
         except Exception as exc:
-            logger.debug("Semantic entity retrieval unavailable: %s", exc)
+            diagnostics.append(diagnostic("graph", "degraded", "entity_vector_" + type(exc).__name__))
 
         # Step 2: relation seeds from predicate lexical and semantic matching.
         relation_seeds = store.search_relations(
@@ -154,13 +178,13 @@ class KnowledgeGraphRetriever:
 
             semantic_relations = (
                 RelationVectorService(
-                    self.db, self.knowledge_base_id
+                    db, self.knowledge_base_id
                 ).semantic_search(
                     query,
                     policy.graph_relation_k,
                     query_embedding=query_embedding,
                 )
-                if GRAPH_RELATION_VECTOR_ENABLED else []
+                if GRAPH_RELATION_VECTOR_ENABLED and not skip_semantic else []
             )
             semantic_scores = {
                 item["relation_id"]: float(item.get("match_score", 0))
@@ -191,10 +215,10 @@ class KnowledgeGraphRetriever:
                 reverse=True,
             )[:policy.graph_relation_k]
         except Exception as exc:
-            logger.debug("Semantic relation retrieval unavailable: %s", exc)
+            diagnostics.append(diagnostic("graph", "degraded", "relation_vector_" + type(exc).__name__))
 
         if not entities and not relation_seeds:
-            return []
+            return RetrievalDocuments(diagnostics=diagnostics)
 
         seed_scores: dict[str, float] = {}
         for i, ent in enumerate(entities):
@@ -279,24 +303,31 @@ class KnowledgeGraphRetriever:
             chunk_scores[cid] = max(chunk_scores.get(cid, 0), entity_score)
 
         if not chunk_facts:
-            return []
+            return RetrievalDocuments(diagnostics=diagnostics)
 
         # Step 5: load chunks from SQLite.
         from app.models.knowledge_chunk import KnowledgeChunk
+        from app.models.knowledge_document import KnowledgeDocument
         from sqlalchemy import select
 
-        chunks = list(self.db.scalars(
-            select(KnowledgeChunk).where(
+        statement = select(KnowledgeChunk, KnowledgeDocument.source_path).join(
+            KnowledgeDocument, KnowledgeDocument.id == KnowledgeChunk.document_id,
+        ).where(
                 KnowledgeChunk.knowledge_base_id == self.knowledge_base_id,
+                KnowledgeDocument.knowledge_base_id == self.knowledge_base_id,
+                KnowledgeDocument.status == "ready",
                 KnowledgeChunk.id.in_(list(chunk_facts.keys())),
-            )
-        ))
+        )
+        if allowed_document_ids is not None:
+            statement = statement.where(KnowledgeChunk.document_id.in_(allowed_document_ids))
+        rows = list(db.execute(statement))
 
         # Build documents
-        doc_map: dict[str, KnowledgeChunk] = {c.id: c for c in chunks}
+        doc_map = {chunk.id: chunk for chunk, source in rows}
+        source_paths = {chunk.id: source for chunk, source in rows}
         results: list[Document] = []
 
-        sorted_cids = sorted(chunk_scores.keys(), key=lambda c: chunk_scores[c], reverse=True)
+        sorted_cids = sorted(doc_map, key=lambda c: chunk_scores[c], reverse=True)
         for cid in sorted_cids[:top_k]:
             chunk = doc_map.get(cid)
             if not chunk:
@@ -305,14 +336,11 @@ class KnowledgeGraphRetriever:
             doc = Document(
                 page_content=chunk.content,
                 metadata={
+                    **(chunk.metadata_json or {}),
                     "chunk_id": chunk.id,
                     "knowledge_base_id": self.knowledge_base_id,
                     "document_id": chunk.document_id,
-                    "source": _get_source_path(
-                        self.db,
-                        chunk.document_id,
-                        self.knowledge_base_id,
-                    ),
+                    "source": source_paths[cid],
                     "file_hash": chunk.file_hash,
                     "chunk_index": chunk.chunk_index,
                     "page": chunk.page,
@@ -326,7 +354,8 @@ class KnowledgeGraphRetriever:
             )
             results.append(doc)
 
-        return results
+        diagnostics.append(diagnostic("graph", "degraded" if diagnostics else "ok", "retrieved", len(results), (perf_counter()-started)*1000))
+        return RetrievalDocuments(results, diagnostics=diagnostics)
 
 
 def _get_source_path(db, document_id: str, knowledge_base_id: str) -> str:
@@ -362,10 +391,4 @@ def invalidate_graph_retrievers(knowledge_base_id: str | None = None) -> None:
         else [knowledge_base_id]
     )
     for target in targets:
-        retriever = _retrievers_by_knowledge_base.pop(target, None)
-        if (
-            retriever is not None
-            and retriever._db is not None
-            and retriever._owns_db
-        ):
-            retriever._db.close()
+        _retrievers_by_knowledge_base.pop(target, None)

@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
+from sqlalchemy import CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import JSON
 
@@ -21,13 +21,13 @@ class GraphSchemaDefinition(Base):
             "knowledge_base_id", "version", name="uq_graph_schema_kb_version"
         ),
         Index(
-            "uq_graph_schema_one_active_per_kind",
+            "uq_graph_schema_one_active_per_kb",
             "knowledge_base_id",
-            "graph_kind",
             unique=True,
             sqlite_where=text("status = 'active'"),
             postgresql_where=text("status = 'active'"),
         ),
+        CheckConstraint("status <> 'active' OR graph_kind = 'general'", name="ck_graph_schema_active_general"),
     )
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
     knowledge_base_id: Mapped[str] = mapped_column(String(36), ForeignKey("knowledge_bases.id", ondelete="CASCADE"), nullable=False)

@@ -1,7 +1,11 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref, watch } from 'vue'
 import * as api from '../api/client'
-import type { DataSource, KnowledgeBaseMember } from '../types'
+import type { ConnectorCredential, DataSource, KnowledgeBaseMember } from '../types'
+
+import { usePermissions } from '../composables/usePermissions'
+const { canEdit, canManageMembers } = usePermissions()
+const credentials = ref<ConnectorCredential[]>([])
 
 const props = defineProps<{ knowledgeBaseId: string }>()
 const tab = ref<'sources' | 'members'>('sources')
@@ -18,6 +22,7 @@ async function load(): Promise<void> {
       api.listDataSources(props.knowledgeBaseId),
       api.listKnowledgeBaseMembers(props.knowledgeBaseId),
     ])
+    credentials.value = canEdit.value ? await api.listConnectorCredentials(props.knowledgeBaseId) : []
     error.value = ''
   } catch (e) { error.value = (e as Error).message }
 }
@@ -59,6 +64,7 @@ async function removeMember(member: KnowledgeBaseMember): Promise<void> {
   try { await api.removeKnowledgeBaseMember(props.knowledgeBaseId, member.user_id); await load() } catch (e) { error.value = (e as Error).message }
 }
 
+watch(() => sourceForm.source_type, () => { sourceForm.connection_ref='' })
 watch(() => props.knowledgeBaseId, load)
 onMounted(load)
 </script>
@@ -70,17 +76,17 @@ onMounted(load)
 
     <template v-if="tab === 'sources'">
       <section class="intro"><div><h2>数据源连接器</h2><p>保存数据位置和凭据引用。密码、Token 和访问密钥不会直接保存在知识库配置中。</p></div></section>
-      <div class="two-column">
-        <form class="form-card" @submit.prevent="addSource"><h3>添加数据源</h3><label>来源类型<select v-model="sourceForm.source_type"><option value="git">Git 仓库</option><option value="s3">S3 / MinIO</option><option value="local_directory">本地目录</option><option value="upload">手工上传</option></select></label><label>显示名称<input v-model="sourceForm.name" required placeholder="例如：产品文档仓库" /></label><label>数据位置<input v-model="sourceForm.location" :placeholder="sourceForm.source_type === 'git' ? 'https://git.example/repo.git' : sourceForm.source_type === 's3' ? 's3://bucket/prefix' : '目录位置'" /></label><label>凭据引用<input v-model="sourceForm.connection_ref" placeholder="env://RAG_DOCS_CREDENTIAL 或 file://绝对路径" /></label><label>自动同步间隔（分钟，0 为关闭）<input v-model.number="sourceForm.sync_interval_minutes" type="number" min="0" /></label><label>源端删除策略<select v-model="sourceForm.deletion_policy"><option value="ignore">保留知识库文档</option><option value="delete">同步删除知识库文档</option></select></label><label v-if="sourceForm.source_type==='git'||sourceForm.source_type==='local_directory'" class="check"><input v-model="sourceForm.index_code" type="checkbox" /> 同时构建代码符号与调用图</label><button class="primary">保存连接器</button></form>
-        <section class="list-card"><header><strong>已配置 {{ sources.length }} 个数据源</strong><span>本地目录、Git、S3/MinIO 均由持久化 Worker 同步</span></header><div v-if="!sources.length" class="empty">暂无数据源配置</div><article v-for="source in sources" :key="source.id"><div class="source-icon">{{ source.source_type === 'git' ? 'G' : source.source_type === 's3' ? 'S3' : 'D' }}</div><div><strong>{{ source.name }}</strong><p>{{ source.config?.location || '未填写数据位置' }}</p><small>{{ source.source_type }} · {{ source.connection_ref || '无需凭据' }} · {{ source.sync_interval_minutes ? `每 ${source.sync_interval_minutes} 分钟` : '手工同步' }} · 删除策略 {{ source.deletion_policy }}<template v-if="source.health_detail"> · {{ source.health_detail }}</template><template v-if="source.last_sync_detail"> · 最近同步：{{ source.last_sync_detail }}</template></small></div><span :class="['state', source.last_sync_status || source.health_status || source.status]">{{ source.last_sync_status || source.health_status || source.status }}</span><button v-if="source.source_type !== 'upload'" :disabled="syncing === source.id || source.status !== 'active'" @click="syncSource(source)">{{ syncing === source.id ? '提交中…' : '同步' }}</button><button @click="checkSource(source)">检查配置</button><button @click="toggleSource(source)">{{ source.status === 'active' ? '停用' : '启用' }}</button><button class="danger" @click="removeSource(source)">删除</button></article></section>
+      <div class="two-column" :class="{readonly:!canEdit}">
+        <form v-if="canEdit" class="form-card" @submit.prevent="addSource"><h3>添加数据源</h3><label>来源类型<select v-model="sourceForm.source_type"><option value="git">Git 仓库</option><option value="s3">S3</option><option value="local_directory">本地目录</option><option value="upload">手工上传</option></select></label><label>显示名称<input v-model="sourceForm.name" required placeholder="例如：产品文档仓库" /></label><label>数据位置<input v-model="sourceForm.location" :placeholder="sourceForm.source_type === 'git' ? 'https://git.example/repo.git' : sourceForm.source_type === 's3' ? 's3://bucket/prefix' : '目录位置'" /></label><label>授权凭据<select v-model="sourceForm.connection_ref"><option value="">公开数据源，无需凭据</option><option v-for="credential in credentials.filter(item=>item.source_type===sourceForm.source_type)" :key="credential.id" :value="credential.connection_ref">{{credential.id}}</option></select><small>凭据由管理员在服务器登记并授权给本知识库；本地目录也需管理员登记。</small></label><label>自动同步间隔（分钟，0 为关闭）<input v-model.number="sourceForm.sync_interval_minutes" type="number" min="0" /></label><label>源端删除策略<select v-model="sourceForm.deletion_policy"><option value="ignore">保留知识库文档</option><option value="delete">同步删除知识库文档</option></select></label><label v-if="sourceForm.source_type==='git'||sourceForm.source_type==='local_directory'" class="check"><input v-model="sourceForm.index_code" type="checkbox" /> 同时构建代码符号与调用图</label><button class="primary">保存连接器</button></form>
+        <section class="list-card"><header><strong>已配置 {{ sources.length }} 个数据源</strong><span>本地目录、Git、S3 均由持久化 Worker 同步</span></header><div v-if="!sources.length" class="empty">暂无数据源配置</div><article v-for="source in sources" :key="source.id"><div class="source-icon">{{ source.source_type === 'git' ? 'G' : source.source_type === 's3' ? 'S3' : 'D' }}</div><div><strong>{{ source.name }}</strong><p>{{ source.config?.location || '未填写数据位置' }}</p><small>{{ source.source_type }} · {{ source.connection_ref || '无需凭据' }} · {{ source.sync_interval_minutes ? `每 ${source.sync_interval_minutes} 分钟` : '手工同步' }} · 删除策略 {{ source.deletion_policy }}<template v-if="source.health_detail"> · {{ source.health_detail }}</template><template v-if="source.last_sync_detail"> · 最近同步：{{ source.last_sync_detail }}</template></small></div><span :class="['state', source.last_sync_status || source.health_status || source.status]">{{ source.last_sync_status || source.health_status || source.status }}</span><button v-if="canEdit && source.source_type !== 'upload'" :disabled="syncing === source.id || source.status !== 'active'" @click="syncSource(source)">{{ syncing === source.id ? '提交中…' : '同步' }}</button><button v-if="canEdit" @click="checkSource(source)">检查配置</button><button v-if="canEdit" @click="toggleSource(source)">{{ source.status === 'active' ? '停用' : '启用' }}</button><button class="danger" v-if="canEdit" @click="removeSource(source)">删除</button></article></section>
       </div>
     </template>
 
     <template v-else>
       <section class="intro"><div><h2>成员与权限</h2><p>Viewer 可以查看和问答，Editor 可以管理文档与图谱；所有者权限不能在这里转移。</p></div></section>
-      <div class="two-column">
-        <form class="form-card" @submit.prevent="addMember"><h3>添加或更新成员</h3><label>用户名<input v-model="memberForm.username" required placeholder="输入系统中已存在的用户名" /></label><label>角色<select v-model="memberForm.role"><option value="viewer">Viewer · 查看</option><option value="editor">Editor · 编辑</option></select></label><button class="primary">保存成员</button></form>
-        <section class="list-card"><header><strong>{{ members.length }} 位成员</strong></header><article v-for="member in members" :key="member.id"><div class="member-avatar">{{ (member.display_name || member.username).slice(0, 1) }}</div><div><strong>{{ member.display_name || member.username }}</strong><p>@{{ member.username }}</p></div><span class="role">{{ member.role }}</span><button v-if="member.role !== 'owner'" class="danger" @click="removeMember(member)">移除</button></article></section>
+      <div class="two-column" :class="{readonly:!canManageMembers}">
+        <form v-if="canManageMembers" class="form-card" @submit.prevent="addMember"><h3>添加或更新成员</h3><label>用户名<input v-model="memberForm.username" required placeholder="输入系统中已存在的用户名" /></label><label>角色<select v-model="memberForm.role"><option value="viewer">Viewer · 查看</option><option value="editor">Editor · 编辑</option></select></label><button class="primary">保存成员</button></form>
+        <section class="list-card"><header><strong>{{ members.length }} 位成员</strong></header><article v-for="member in members" :key="member.id"><div class="member-avatar">{{ (member.display_name || member.username).slice(0, 1) }}</div><div><strong>{{ member.display_name || member.username }}</strong><p>@{{ member.username }}</p></div><span class="role">{{ member.role }}</span><button v-if="canManageMembers && member.role !== 'owner'" class="danger" @click="removeMember(member)">移除</button></article></section>
       </div>
     </template>
   </div>
@@ -91,4 +97,5 @@ onMounted(load)
 .state.accepted,.state.unchanged { color: #18794e; background: #e9f8ef; }.state.partial { color: #986800; background: #fff6d8; }.state.failed { color: #b42318; background: #fff0ee; }
 .form-card label.check { display: flex; align-items: center; gap: 7px; }.form-card label.check input { width: 14px; }
 @media(max-width: 900px) { .two-column { grid-template-columns: 1fr; } }
+.two-column.readonly{grid-template-columns:1fr}
 </style>

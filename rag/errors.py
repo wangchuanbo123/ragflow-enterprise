@@ -39,6 +39,11 @@ class VectorStoreError(RAGError):
     status_code = 503
 
 
+class IndexCompatibilityError(RAGError):
+    code = "INDEX_REBUILD_REQUIRED"
+    status_code = 409
+
+
 class RetrievalError(RAGError):
     code = "RETRIEVAL_FAILED"
     status_code = 500

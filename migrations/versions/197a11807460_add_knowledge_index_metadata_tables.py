@@ -52,7 +52,7 @@ def upgrade() -> None:
     sa.Column('updated_at', sa.DateTime(), server_default=sa.text('(CURRENT_TIMESTAMP)'), nullable=False),
     sa.Column('indexed_at', sa.DateTime(), nullable=True),
     sa.PrimaryKeyConstraint('id'),
-    sa.UniqueConstraint('source_path')
+    sa.UniqueConstraint('source_path', name='uq_knowledge_documents_source_path')
     )
     op.create_table('knowledge_index_state',
     sa.Column('id', sa.Integer(), nullable=False),

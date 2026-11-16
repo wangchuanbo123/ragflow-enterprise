@@ -48,8 +48,17 @@ from app.models.graph_governance import (
 )
 from app.models.message import Message, MessageFeedback
 from app.models.user import User
+from app.models.auth_session import AuthSession
+from app.models.agent_run import AgentRun, AgentRunEvent
+
+from app.models.server_deployment import ServerDeploymentState
+from app.models.graph_filter import GraphFilterView
+from app.models.graph_revision import KnowledgeGraphRevision
 
 __all__ = [
+    "KnowledgeGraphRevision",
+    "ServerDeploymentState",
+    "GraphFilterView",
     "Base",
     "KnowledgeBackup",
     "CodeSnapshot",
@@ -60,6 +69,9 @@ __all__ = [
     "EntityVectorIndexState",
     "RelationVectorIndexState",
     "User",
+    "AuthSession",
+    "AgentRun",
+    "AgentRunEvent",
     "Conversation",
     "Message",
     "MessageFeedback",

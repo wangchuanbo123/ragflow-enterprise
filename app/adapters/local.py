@@ -27,7 +27,7 @@ class LocalObjectStore:
         return ProviderIdentity(
             kind="object_store",
             provider="local",
-            capabilities=("atomic_put", "materialize"),
+            capabilities=("atomic_put", "streaming_put", "materialize"),
         )
 
     def _resolve(self, key: str) -> Path:
@@ -66,6 +66,24 @@ class LocalObjectStore:
 
     def exists(self, key: str) -> bool:
         return self._resolve(key).is_file()
+
+    def put_file(self, key: str, path: Path) -> ObjectRef:
+        target = self._resolve(key)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
+        digest, size = hashlib.sha256(), 0
+        try:
+            with Path(path).open("rb") as source, temporary.open("xb") as destination:
+                while block := source.read(1024 * 1024):
+                    destination.write(block)
+                    digest.update(block)
+                    size += len(block)
+                destination.flush()
+                os.fsync(destination.fileno())
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return ObjectRef(key=key, size=size, content_hash=digest.hexdigest())
 
     @contextmanager
     def materialize(self, key: str):
@@ -162,7 +180,7 @@ class MemoryCache:
 
 
 class SQLAlchemyMetadataSessionProvider:
-    """SQLAlchemy session adapter shared by SQLite and PostgreSQL profiles."""
+    """SQLAlchemy sessions shared by PostgreSQL and SQLite implementations."""
 
     def __init__(self, session_factory, provider_name: str):
         self.session_factory = session_factory

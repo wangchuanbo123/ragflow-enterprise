@@ -15,7 +15,7 @@ from app.core.database import get_db
 from app.models.user import User
 from app.repositories.knowledge_base_repository import KnowledgeBaseRepository
 from app.repositories.index_job_repository import IndexJobRepository
-from app.schemas.document import DocumentOut, IndexJobEventOut, IndexJobOut
+from app.schemas.document import DocumentOut, DocumentPage, DocumentReindexRequest, IndexJobEventOut, IndexJobOut, IndexJobPage
 from app.schemas.document_management import (
     BatchDocumentRequest,
     ChunkDetailOut,
@@ -25,15 +25,19 @@ from app.schemas.document_management import (
     DocumentVersionOut,
     FolderCreate,
     FolderOut,
+    FolderUpdate,
     SearchHitOut,
     TagCreate,
     TagOut,
+    TagUpdate,
 )
 from app.schemas.knowledge_base import (
     DataSourceCreate,
     DataSourceOut,
     DataSourceSyncOut,
     DataSourceUpdate,
+    ConnectorCredentialOut,
+    KnowledgeBaseCapabilities,
     KnowledgeBaseCreate,
     KnowledgeBaseMemberOut,
     KnowledgeBaseMemberUpsert,
@@ -51,6 +55,7 @@ from app.schemas.knowledge_graph import (
 )
 from app.schemas.rag import AskRequest, AskResponse, RetrievalDebugResponse
 from app.services.document_index_service import DocumentIndexService
+from app.services.upload_staging import stage_uploads, upload_db_operation
 
 router = APIRouter(prefix="/knowledge-bases", tags=["knowledge-bases"])
 _UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
@@ -58,6 +63,21 @@ _UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 
 def _is_admin(user: User) -> bool:
     return user.role == "admin"
+
+
+def _knowledge_base_out(db: Session, knowledge_base, user: User) -> KnowledgeBaseOut:
+    role = "admin" if _is_admin(user) else KnowledgeBaseRepository(db).member_role(knowledge_base.id, user.id)
+    can_read = bool(knowledge_base.is_active and role)
+    can_manage = can_read and role in {"admin", "owner"}
+    return KnowledgeBaseOut.model_validate(knowledge_base).model_copy(update={
+        "current_user_role": role,
+        "capabilities": KnowledgeBaseCapabilities(
+            can_read=can_read,
+            can_edit=can_read and role in {"admin", "owner", "editor"},
+            can_manage_members=can_manage,
+            can_archive=can_manage and not knowledge_base.is_default,
+        ),
+    })
 
 
 def _require_read(db: Session, knowledge_base_id: str, user: User) -> None:
@@ -78,6 +98,11 @@ def _require_edit(db: Session, knowledge_base_id: str, user: User) -> None:
         raise forbidden("没有该知识库的编辑权限")
 
 
+def _require_upload_edit(db: Session, knowledge_base_id: str, user_id: str, is_admin: bool) -> None:
+    if not KnowledgeBaseRepository(db).can_edit(knowledge_base_id, user_id, is_admin=is_admin):
+        raise forbidden("没有该知识库的编辑权限")
+
+
 def _require_owner(db: Session, knowledge_base_id: str, user: User) -> None:
     repository = KnowledgeBaseRepository(db)
     knowledge_base = repository.get(knowledge_base_id)
@@ -94,10 +119,11 @@ def list_knowledge_bases(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    return KnowledgeBaseRepository(db).list_for_user(
+    knowledge_bases = KnowledgeBaseRepository(db).list_for_user(
         current_user.id,
         is_admin=_is_admin(current_user),
     )
+    return [_knowledge_base_out(db, kb, current_user) for kb in knowledge_bases]
 
 
 @router.post("", response_model=KnowledgeBaseOut, status_code=201)
@@ -117,7 +143,7 @@ def create_knowledge_base(
         knowledge_base.description = payload.description
         db.commit()
         db.refresh(knowledge_base)
-        return knowledge_base
+        return _knowledge_base_out(db, knowledge_base, current_user)
     except ValueError as exc:
         raise bad_request(str(exc)) from exc
 
@@ -132,7 +158,7 @@ def get_knowledge_base(
     knowledge_base = KnowledgeBaseRepository(db).get(knowledge_base_id)
     if knowledge_base is None:
         raise not_found("知识库不存在")
-    return knowledge_base
+    return _knowledge_base_out(db, knowledge_base, current_user)
 
 
 @router.patch("/{knowledge_base_id}", response_model=KnowledgeBaseOut)
@@ -149,13 +175,14 @@ def update_knowledge_base(
         raise not_found("知识库不存在")
     supplied = payload.model_fields_set
     try:
-        return repository.update(
+        updated = repository.update(
             knowledge_base,
             name=payload.name,
             slug=payload.slug,
             description=payload.description,
             description_supplied="description" in supplied,
         )
+        return _knowledge_base_out(db, updated, current_user)
     except ValueError as exc:
         raise bad_request(str(exc)) from exc
 
@@ -260,6 +287,11 @@ def create_data_source(
 ):
     _require_edit(db, knowledge_base_id, current_user)
     try:
+        from app.services.data_source_service import DataSourceService
+
+        DataSourceService(db, knowledge_base_id, task_queue=object()).validate_configuration(
+            payload.source_type, payload.config, payload.connection_ref,
+        )
         return KnowledgeBaseRepository(db).create_data_source(
             knowledge_base_id,
             source_type=payload.source_type,
@@ -285,14 +317,38 @@ def update_data_source(
     db: Session = Depends(get_db),
 ):
     _require_edit(db, knowledge_base_id, current_user)
-    source = KnowledgeBaseRepository(db).update_data_source(
-        knowledge_base_id,
-        source_id,
-        **payload.model_dump(exclude_unset=True),
-    )
+    repository = KnowledgeBaseRepository(db)
+    source = repository.get_data_source(knowledge_base_id, source_id)
     if source is None:
         raise not_found("数据源不存在")
-    return source
+    changes = payload.model_dump(exclude_unset=True)
+    try:
+        if {"config", "connection_ref"}.intersection(changes) or changes.get("status") == "active":
+            from app.services.data_source_service import DataSourceService
+
+            DataSourceService(db, knowledge_base_id, task_queue=object()).validate_configuration(
+                source.source_type,
+                changes.get("config", source.config_json) or {},
+                changes.get("connection_ref", source.connection_ref),
+            )
+        return repository.update_data_source(knowledge_base_id, source_id, **changes)
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
+
+
+@router.get("/{knowledge_base_id}/connector-credentials", response_model=list[ConnectorCredentialOut])
+def list_connector_credentials(
+    knowledge_base_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_edit(db, knowledge_base_id, current_user)
+    from app.services.credential_service import CredentialResolver
+
+    try:
+        return CredentialResolver.list_for_knowledge_base(knowledge_base_id)
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
 
 
 @router.delete(
@@ -387,6 +443,22 @@ def list_documents(
     )
 
 
+@router.get("/{knowledge_base_id}/documents/page", response_model=DocumentPage)
+def paged_documents(
+    knowledge_base_id: str,
+    offset: int = Query(default=0, ge=0), limit: int = Query(default=30, ge=1, le=200),
+    query: str | None = Query(default=None, max_length=255),
+    status_filter: str | None = Query(default=None, alias="status", max_length=32),
+    folder_id: str | None = Query(default=None, max_length=36),
+    tag_id: str | None = Query(default=None, max_length=36),
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    _require_read(db, knowledge_base_id, current_user)
+    from app.services.workspace_queries import documents_page
+    return documents_page(db, knowledge_base_id, offset=offset, limit=limit, query=query,
+                          status=status_filter, folder_id=folder_id, tag_id=tag_id)
+
+
 @router.get("/{knowledge_base_id}/documents/tag-map", response_model=dict[str, list[str]])
 def document_tag_map(
     knowledge_base_id: str,
@@ -413,7 +485,8 @@ def get_document(
     document = DocumentIndexService(db, knowledge_base_id).get_document(document_id)
     if document is None:
         raise not_found("文档不存在")
-    return document
+    from app.services.workspace_queries import serialize_documents
+    return serialize_documents(db, knowledge_base_id, [document])[0]
 
 
 @router.post(
@@ -426,32 +499,26 @@ async def upload_document(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _require_edit(db, knowledge_base_id, current_user)
-    max_bytes = MAX_DOCUMENT_SIZE_MB * 1024 * 1024
-    parts: list[bytes] = []
-    total = 0
-    while chunk := await file.read(_UPLOAD_READ_CHUNK_BYTES):
-        total += len(chunk)
-        if total > max_bytes:
-            raise bad_request(f"File too large: more than {MAX_DOCUMENT_SIZE_MB}MB")
-        parts.append(chunk)
+    user_id, is_admin = current_user.id, _is_admin(current_user)
+    await upload_db_operation(db, _require_upload_edit, knowledge_base_id, user_id, is_admin)
 
     try:
-        job, document_id = DocumentIndexService(
-            db,
-            knowledge_base_id,
-        ).create_upload_job(
-            file.filename or "upload.txt",
-            b"".join(parts),
-            current_user.id,
-        )
+        async with stage_uploads([file]) as (uploads, _):
+            _, filename, path = uploads[0]
+            def register(owned_db):
+                _require_upload_edit(owned_db, knowledge_base_id, user_id, is_admin)
+                job, document_id = DocumentIndexService(owned_db, knowledge_base_id).create_upload_job(
+                    filename, path, user_id,
+                )
+                return job.id, document_id
+            job_id, document_id = await upload_db_operation(db, register)
     except Exception as exc:
         from rag.errors import DocumentTooLargeError, DocumentValidationError
 
         if isinstance(exc, (DocumentValidationError, DocumentTooLargeError)):
             raise bad_request(str(exc)) from exc
         raise
-    return {"job_id": job.id, "document_id": document_id, "status": "accepted"}
+    return {"job_id": job_id, "document_id": document_id, "status": "accepted"}
 
 
 @router.post(
@@ -464,7 +531,8 @@ async def batch_upload_documents(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _require_edit(db, knowledge_base_id, current_user)
+    user_id, is_admin = current_user.id, _is_admin(current_user)
+    await upload_db_operation(db, _require_upload_edit, knowledge_base_id, user_id, is_admin)
     if not files:
         raise bad_request("At least one file is required")
     if len(files) > MAX_BATCH_UPLOAD_FILES:
@@ -472,30 +540,21 @@ async def batch_upload_documents(
             f"A batch can contain at most {MAX_BATCH_UPLOAD_FILES} files"
         )
 
-    max_file_bytes = MAX_DOCUMENT_SIZE_MB * 1024 * 1024
-    max_total_bytes = MAX_BATCH_UPLOAD_TOTAL_MB * 1024 * 1024
-    total_bytes = 0
-    uploads: list[tuple[str, bytes]] = []
-    for file in files:
-        parts: list[bytes] = []
-        file_bytes = 0
-        while chunk := await file.read(_UPLOAD_READ_CHUNK_BYTES):
-            file_bytes += len(chunk)
-            total_bytes += len(chunk)
-            if total_bytes > max_total_bytes:
-                raise bad_request(
-                    f"Batch is larger than {MAX_BATCH_UPLOAD_TOTAL_MB}MB"
-                )
-            parts.append(chunk)
-            if file_bytes > max_file_bytes:
-                break
-        uploads.append((file.filename or "upload.txt", b"".join(parts)))
-
     try:
-        job, document_ids, rejected = DocumentIndexService(
-            db,
-            knowledge_base_id,
-        ).create_batch_upload_job(uploads, current_user.id)
+        async with stage_uploads(files, partial=True) as (uploads, rejected):
+            if uploads:
+                def register(owned_db):
+                    _require_upload_edit(owned_db, knowledge_base_id, user_id, is_admin)
+                    job, document_ids, invalid = DocumentIndexService(owned_db, knowledge_base_id).create_batch_upload_job(
+                        [(name, path) for _, name, path in uploads], user_id,
+                    )
+                    return job.id, document_ids, invalid
+                job_id, document_ids, invalid = await upload_db_operation(db, register)
+                for item in invalid:
+                    item["index"] = uploads[item["index"]][0]
+                rejected.extend(invalid)
+            else:
+                job_id, document_ids = None, []
     except Exception as exc:
         from rag.errors import DocumentTooLargeError, DocumentValidationError
 
@@ -503,7 +562,7 @@ async def batch_upload_documents(
             raise bad_request(str(exc)) from exc
         raise
     return {
-        "job_id": job.id,
+        "job_id": job_id,
         "document_ids": document_ids,
         "accepted": len(document_ids),
         "rejected": rejected,
@@ -545,12 +604,14 @@ def reindex_document(
     document_id: str,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    payload: DocumentReindexRequest | None = None,
 ):
     _require_edit(db, knowledge_base_id, current_user)
     try:
         job = DocumentIndexService(db, knowledge_base_id).request_reindex(
             document_id,
             current_user.id,
+            parse_options=payload.model_dump() if payload is not None else None,
         )
     except Exception as exc:
         from rag.errors import DocumentValidationError
@@ -575,6 +636,25 @@ def request_sync(
     return {"job_id": job.id, "status": "accepted"}
 
 
+@router.post(
+    "/{knowledge_base_id}/index-jobs/rebuild",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def request_rebuild(
+    knowledge_base_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    _require_edit(db, knowledge_base_id, current_user)
+    from rag.errors import DocumentValidationError
+
+    try:
+        job = DocumentIndexService(db, knowledge_base_id).request_rebuild_job(current_user.id)
+    except DocumentValidationError as exc:
+        raise bad_request(str(exc)) from exc
+    return {"job_id": job.id, "status": "accepted"}
+
+
 @router.get(
     "/{knowledge_base_id}/index-jobs",
     response_model=list[IndexJobOut],
@@ -585,7 +665,21 @@ def list_index_jobs(
     db: Session = Depends(get_db),
 ):
     _require_read(db, knowledge_base_id, current_user)
-    return IndexJobRepository(db, knowledge_base_id).list_jobs()
+    from app.services.workspace_queries import serialize_jobs
+    return serialize_jobs(db, knowledge_base_id, IndexJobRepository(db, knowledge_base_id).list_jobs())
+
+
+@router.get("/{knowledge_base_id}/index-jobs/page", response_model=IndexJobPage)
+def paged_index_jobs(
+    knowledge_base_id: str,
+    offset: int = Query(default=0, ge=0), limit: int = Query(default=30, ge=1, le=200),
+    status_filter: str | None = Query(default=None, alias="status", max_length=32),
+    query: str | None = Query(default=None, max_length=255),
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db),
+):
+    _require_read(db, knowledge_base_id, current_user)
+    from app.services.workspace_queries import jobs_page
+    return jobs_page(db, knowledge_base_id, offset=offset, limit=limit, status=status_filter, query=query)
 
 
 @router.get(
@@ -602,7 +696,8 @@ def get_index_job(
     job = IndexJobRepository(db, knowledge_base_id).get(job_id)
     if job is None:
         raise not_found("任务不存在")
-    return job
+    from app.services.workspace_queries import serialize_jobs
+    return serialize_jobs(db, knowledge_base_id, [job])[0]
 
 
 @router.get(
@@ -728,7 +823,7 @@ def search_graph_entities(
     limit: int = Query(default=20, ge=1, le=100),
     graph_kind: str | None = Query(
         default=None,
-        pattern="^(general|concept|functional|configuration|standard)$",
+        pattern="^general$",
     ),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -736,19 +831,10 @@ def search_graph_entities(
     _require_read(db, knowledge_base_id, current_user)
     from app.bootstrap.container import get_provider_container
 
-    fetch_limit = 100 if graph_kind else limit
     entities = get_provider_container().graph_store(
         db,
         knowledge_base_id,
-    ).search_entities(query, fetch_limit)
-    if graph_kind and graph_kind != "general":
-        from rag.knowledge_graph.profiles import profile_type_names
-
-        allowed_entities, _ = profile_type_names(graph_kind)
-        entities = [
-            entity for entity in entities
-            if str(entity.get("entity_type") or "").upper() in allowed_entities
-        ][:limit]
+    ).search_entities(query, limit)
     return [EntityOut(**entity) for entity in entities]
 
 
@@ -786,7 +872,7 @@ def entity_subgraph(
     limit: int = Query(default=100, ge=1, le=500),
     graph_kind: str | None = Query(
         default=None,
-        pattern="^(general|concept|functional|configuration|standard)$",
+        pattern="^general$",
     ),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -871,16 +957,12 @@ def entity_subgraph(
         })
     payload = {
         "seed_entity_ids": entity_ids,
-        "graph_kind": graph_kind,
+        "graph_kind": "general",
         "nodes": list(nodes.values()),
         "edges": edges,
         "offset": offset,
         "next_offset": offset + limit if len(relations) > limit else None,
     }
-    if graph_kind and graph_kind != "general":
-        from rag.knowledge_graph.profiles import project_subgraph
-
-        return project_subgraph(payload, graph_kind)
     return payload
 
 
@@ -894,7 +976,7 @@ def document_subgraph(
     limit: int = Query(default=200, ge=1, le=1000),
     graph_kind: str | None = Query(
         default=None,
-        pattern="^(general|concept|functional|configuration|standard)$",
+        pattern="^general$",
     ),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -909,10 +991,7 @@ def document_subgraph(
         db,
         knowledge_base_id,
     ).get_document_subgraph(document_id, limit)
-    if graph_kind and graph_kind != "general":
-        from rag.knowledge_graph.profiles import project_subgraph
-
-        return project_subgraph(payload, graph_kind)
+    payload["graph_kind"] = "general"
     return payload
 
 
@@ -1038,6 +1117,36 @@ def create_folder(
         raise bad_request(str(exc)) from exc
 
 
+@router.patch("/{knowledge_base_id}/folders/{folder_id}", response_model=FolderOut)
+def update_folder(knowledge_base_id: str, folder_id: str, payload: FolderUpdate,
+                  current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require_edit(db, knowledge_base_id, current_user)
+    from app.repositories.document_management_repository import DocumentManagementRepository
+
+    repository = DocumentManagementRepository(db, knowledge_base_id)
+    if repository.get_folder(folder_id) is None:
+        raise not_found("目录不存在")
+    try:
+        return repository.update_folder(folder_id, payload.model_dump(exclude_unset=True))
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
+
+
+@router.delete("/{knowledge_base_id}/folders/{folder_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_folder(knowledge_base_id: str, folder_id: str,
+                  current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require_edit(db, knowledge_base_id, current_user)
+    from app.repositories.document_management_repository import DocumentManagementRepository
+
+    repository = DocumentManagementRepository(db, knowledge_base_id)
+    if repository.get_folder(folder_id) is None:
+        raise not_found("目录不存在")
+    try:
+        repository.delete_folder(folder_id)
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
+
+
 @router.get(
     "/{knowledge_base_id}/tags",
     response_model=list[TagOut],
@@ -1078,6 +1187,33 @@ def create_tag(
         )
     except ValueError as exc:
         raise bad_request(str(exc)) from exc
+
+
+@router.patch("/{knowledge_base_id}/tags/{tag_id}", response_model=TagOut)
+def update_tag(knowledge_base_id: str, tag_id: str, payload: TagUpdate,
+               current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require_edit(db, knowledge_base_id, current_user)
+    from app.repositories.document_management_repository import DocumentManagementRepository
+
+    repository = DocumentManagementRepository(db, knowledge_base_id)
+    if repository.get_tag(tag_id) is None:
+        raise not_found("标签不存在")
+    try:
+        return repository.update_tag(tag_id, payload.model_dump(exclude_unset=True))
+    except ValueError as exc:
+        raise bad_request(str(exc)) from exc
+
+
+@router.delete("/{knowledge_base_id}/tags/{tag_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_tag(knowledge_base_id: str, tag_id: str,
+               current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    _require_edit(db, knowledge_base_id, current_user)
+    from app.repositories.document_management_repository import DocumentManagementRepository
+
+    repository = DocumentManagementRepository(db, knowledge_base_id)
+    if repository.get_tag(tag_id) is None:
+        raise not_found("标签不存在")
+    repository.delete_tag(tag_id)
 
 
 @router.get(
@@ -1316,25 +1452,18 @@ async def upload_document_version(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    _require_edit(db, knowledge_base_id, current_user)
-    max_bytes = MAX_DOCUMENT_SIZE_MB * 1024 * 1024
-    parts: list[bytes] = []
-    total = 0
-    while chunk := await file.read(_UPLOAD_READ_CHUNK_BYTES):
-        total += len(chunk)
-        if total > max_bytes:
-            raise bad_request(f"File too large: more than {MAX_DOCUMENT_SIZE_MB}MB")
-        parts.append(chunk)
+    user_id, is_admin = current_user.id, _is_admin(current_user)
+    await upload_db_operation(db, _require_upload_edit, knowledge_base_id, user_id, is_admin)
     try:
-        job, version = DocumentIndexService(
-            db,
-            knowledge_base_id,
-        ).create_document_version(
-            document_id,
-            file.filename or "upload.txt",
-            b"".join(parts),
-            current_user.id,
-        )
+        async with stage_uploads([file]) as (uploads, _):
+            _, filename, path = uploads[0]
+            def register(owned_db):
+                _require_upload_edit(owned_db, knowledge_base_id, user_id, is_admin)
+                job, version = DocumentIndexService(owned_db, knowledge_base_id).create_document_version(
+                    document_id, filename, path, user_id,
+                )
+                return job.id, version.id, version.version_no
+            job_id, version_id, version_no = await upload_db_operation(db, register)
     except Exception as exc:
         from rag.errors import DocumentTooLargeError, DocumentValidationError
 
@@ -1342,9 +1471,9 @@ async def upload_document_version(
             raise bad_request(str(exc)) from exc
         raise
     return {
-        "job_id": job.id,
-        "version_id": version.id,
-        "version_no": version.version_no,
+        "job_id": job_id,
+        "version_id": version_id,
+        "version_no": version_no,
         "status": "accepted",
     }
 

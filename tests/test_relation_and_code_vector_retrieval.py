@@ -273,7 +273,7 @@ def test_code_symbols_are_vectorized_and_vector_only_hits_are_hydrated(
         ).index_directory(source, revision="vector-test")
         container = _container()
         service = CodeVectorService(
-            db, DEFAULT_KNOWLEDGE_BASE_ID, container=container
+            db, DEFAULT_KNOWLEDGE_BASE_ID, container=container, summary_agent_enabled=False
         )
 
         result = service.rebuild()
@@ -324,7 +324,7 @@ def test_code_vectors_incrementally_update_changed_symbols(db_engine, tmp_path):
         )
         container = _container()
         vector_service = CodeVectorService(
-            db, DEFAULT_KNOWLEDGE_BASE_ID, container=container
+            db, DEFAULT_KNOWLEDGE_BASE_ID, container=container, summary_agent_enabled=False
         )
         index_service.index_directory(source, revision="r1")
         first = vector_service.rebuild()
@@ -384,7 +384,7 @@ def test_code_function_summaries_are_persisted_and_vectorized_incrementally(
         summary_llm = _FakeSummaryLLM()
         container = _container(summary_llm)
         vector_service = CodeVectorService(
-            db, DEFAULT_KNOWLEDGE_BASE_ID, container=container
+            db, DEFAULT_KNOWLEDGE_BASE_ID, container=container, summary_llm=summary_llm
         )
 
         index_service.index_directory(source, revision="summary-r1")

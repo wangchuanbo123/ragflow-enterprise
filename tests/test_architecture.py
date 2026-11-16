@@ -96,7 +96,18 @@ class ArchitectureTests(unittest.TestCase):
         )
         self.assertEqual(get_runtime.cache_info().currsize, 0)
 
-    def testEnterpriseProfileDisablesImplicitOllamaFallback(self):
+    def testProfileValidationRejectsUnsupportedProviders(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported provider configuration"):
+            validate_provider_configuration(
+                profile="local",
+                metadata_store="mysql",
+                vector_store="chroma_embedded",
+                object_store="local",
+                task_queue="inline",
+                cache="memory",
+            )
+
+    def testRemoteProviderWithoutFallbackRaises(self):
         with self.assertRaisesRegex(ValueError, "implicit Ollama fallback"):
             create_llm_provider(
                 provider="zhipu",
@@ -108,25 +119,14 @@ class ArchitectureTests(unittest.TestCase):
                 allow_ollama_fallback=False,
             )
 
-    def testEnterpriseProfileRejectsLocalOnlyAdapters(self):
-        with self.assertRaisesRegex(ValueError, "local-only providers"):
-            validate_provider_configuration(
-                profile="enterprise",
-                metadata_store="sqlite",
-                vector_store="chroma_embedded",
-                object_store="local",
-                task_queue="inline",
-                cache="memory",
-            )
-
-    def testEnterpriseProfileAcceptsImplementedRemoteAdapters(self):
+    def testProfileValidationAcceptsLocalProviders(self):
         validate_provider_configuration(
-            profile="enterprise",
-            metadata_store="postgresql",
-            vector_store="chroma_http",
-            object_store="s3",
-            task_queue="celery",
-            cache="redis",
+            profile="local",
+            metadata_store="sqlite",
+            vector_store="chroma_embedded",
+            object_store="local",
+            task_queue="inline",
+            cache="memory",
         )
 
     def testGraphUsesInjectedRuntimeEndToEnd(self):

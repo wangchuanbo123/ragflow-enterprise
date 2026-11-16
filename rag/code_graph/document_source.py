@@ -17,7 +17,7 @@ from rag.code_graph.parser import LANGUAGE_BY_SUFFIX, CodeParser
 from rag.code_graph.schemas import ParsedFile
 from rag.indexing.code_segments import iter_code_segments
 
-_DOCUMENT_PARSER_VERSION = "doc-code-v1"
+_DOCUMENT_PARSER_VERSION = "doc-code-v2"
 
 # 语言名 → 能被 LANGUAGE_BY_SUFFIX 识别的标准文件后缀。
 _LANGUAGE_SUFFIX = {}
@@ -49,11 +49,11 @@ def extract_document_code(
     """
     parser = parser or CodeParser()
     parsed_files: list[ParsedFile] = []
-    processed_blocks = 0
+    processed_blocks: dict[str, int] = {}
 
     for document_id, chunk_index, content in chunk_contents:
-        if not content or processed_blocks >= max_blocks:
-            break
+        if not content or processed_blocks.get(document_id, 0) >= max_blocks:
+            continue
         for ordinal, segment in enumerate(
             iter_code_segments(
                 content,
@@ -62,7 +62,7 @@ def extract_document_code(
             ),
             start=1,
         ):
-            if processed_blocks >= max_blocks:
+            if processed_blocks.get(document_id, 0) >= max_blocks:
                 break
             if not segment.text.strip():
                 continue
@@ -86,7 +86,7 @@ def extract_document_code(
                     },
                 )
             parsed_files.append(parsed)
-            processed_blocks += 1
+            processed_blocks[document_id] = processed_blocks.get(document_id, 0) + 1
 
     return parsed_files
 

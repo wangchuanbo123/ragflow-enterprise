@@ -50,7 +50,7 @@ async function archive(item: KnowledgeBase): Promise<void> {
       <header><div><strong>知识库管理</strong><small>创建独立知识空间，分别管理文档、图谱、代码与成员</small></div><button @click="emit('close')">×</button></header>
       <p v-if="error" class="error">{{error}}</p>
       <template v-if="mode==='list'">
-        <div class="list"><article v-for="item in items" :key="item.id"><div><b>{{item.name}}</b><small>{{item.description||'暂无描述'}} · 独立知识空间</small></div><span v-if="item.is_default">初始库</span><button @click="startEdit(item)">编辑</button><button v-if="!item.is_default" class="danger" @click="archive(item)">归档</button></article></div>
+        <div class="list"><article v-for="item in items" :key="item.id"><div><b>{{item.name}}</b><small>{{item.description||'暂无描述'}} · {{item.current_user_role||'viewer'}}</small></div><span v-if="item.is_default">初始库</span><button v-if="item.capabilities?.can_manage_members" @click="startEdit(item)">编辑</button><button v-if="!item.is_default&&item.capabilities?.can_archive" class="danger" @click="archive(item)">归档</button></article></div>
         <footer v-if="canCreate"><button class="primary" @click="startCreate">＋ 创建知识库</button></footer>
       </template>
       <form v-else @submit.prevent="save">

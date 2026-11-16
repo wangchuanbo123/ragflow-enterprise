@@ -104,5 +104,9 @@ def read_object(
     return Response(
         content=data,
         media_type=_guess_media_type(key),
-        headers={"Cache-Control": "private, max-age=3600"},
+        headers={
+            "Cache-Control": "private, max-age=3600",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'",
+        },
     )

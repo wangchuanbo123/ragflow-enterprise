@@ -13,7 +13,7 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
 from app.core.config import (
@@ -25,7 +25,7 @@ from app.core.config import (
     MIN_CHUNK_SIZE,
 )
 from rag.indexing.code_aware_splitter import split_documents_code_aware
-from rag.indexing.tokens import count_tokens
+from rag.indexing.tokens import TOKEN_ENCODING_NAME, count_tokens
 from rag.loaders.image_extractor import IMAGE_PLACEHOLDER_PATTERN
 
 __all__ = [
@@ -164,23 +164,24 @@ def _split_recursive(
     min_chunk_size: int,
 ) -> list[Document]:
     splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        encoding_name=TOKEN_ENCODING_NAME,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
         separators=_SEPARATORS,
     )
-    chunks = splitter.split_documents(list(docs))
-
-    # Merge tiny tail chunks into the previous chunk
-    if min_chunk_size > 0 and len(chunks) > 1:
+    chunks: list[Document] = []
+    # A PDF page is an evidence anchor. Never merge its tail into another page.
+    for doc in docs:
         merged: list[Document] = []
-        for chunk in chunks:
-            if merged and count_tokens(chunk.page_content) < min_chunk_size:
-                prev = merged[-1]
-                prev.page_content = prev.page_content + "\n" + chunk.page_content
+        for chunk in splitter.split_documents([doc]):
+            combined = merged[-1].page_content + "\n" + chunk.page_content if merged else ""
+            if (merged and min_chunk_size > 0
+                    and count_tokens(chunk.page_content) < min_chunk_size
+                    and count_tokens(combined) <= chunk_size):
+                merged[-1].page_content = combined
             else:
                 merged.append(chunk)
-        chunks = merged
-
+        chunks.extend(merged)
     return chunks
 
 
@@ -190,21 +191,45 @@ def _split_semantic(
     chunk_overlap: int,
 ) -> list[Document]:
     try:
-        from langchain_experimental.text_splitter import SemanticChunker
+        import re
+        import numpy as np
         from rag.providers.factory import get_embedding_provider
 
         embedding = get_embedding_provider().get_model()
         coarse_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+            encoding_name=TOKEN_ENCODING_NAME,
             chunk_size=chunk_size * 2,
             chunk_overlap=chunk_overlap,
         )
         coarse_docs = coarse_splitter.split_documents(list(docs))
-        semantic = SemanticChunker(embedding)
-        result = semantic.split_documents(coarse_docs)
+        result = []
+        for doc in coarse_docs:
+            sentences = [value.strip() for value in re.split(r"(?<=[。！？])|(?<=[.!?])\s+|\n{2,}", doc.page_content) if value.strip()]
+            if len(sentences) < 2:
+                result.append(doc)
+                continue
+            vectors = np.asarray(embedding.embed_documents(sentences), dtype=float)
+            if len(vectors) != len(sentences) or not np.isfinite(vectors).all():
+                raise ValueError("Invalid semantic embeddings")
+            norms = np.linalg.norm(vectors, axis=1)
+            if np.any(norms == 0):
+                raise ValueError("Empty semantic embeddings")
+            normalized = vectors / norms[:, None]
+            distances = 1 - np.sum(normalized[:-1] * normalized[1:], axis=1)
+            threshold = float(np.percentile(distances, 85))
+            current = []
+            for index, sentence in enumerate(sentences):
+                current.append(sentence)
+                if index == len(sentences) - 1 or distances[index] > threshold:
+                    result.append(Document(page_content="\n".join(current), metadata={**doc.metadata, "semantic_split": True}))
+                    current = []
     except Exception:
         result = _split_recursive(docs, chunk_size, chunk_overlap, 0)
+        for doc in result:
+            doc.metadata["semantic_split_fallback"] = "recursive"
 
     final_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+        encoding_name=TOKEN_ENCODING_NAME,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )

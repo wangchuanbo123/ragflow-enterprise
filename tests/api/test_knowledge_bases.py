@@ -210,7 +210,7 @@ def test_batch_upload_job_events_and_cancel(client):
     assert retried.json()["cancel_requested"] is False
 
 
-def test_member_and_data_source_management(client):
+def test_member_and_data_source_management(client, monkeypatch):
     import app.core.database as db_module
 
     _login(client, INITIAL_ADMIN_USERNAME, INITIAL_ADMIN_PASSWORD)
@@ -219,6 +219,12 @@ def test_member_and_data_source_management(client):
         json={"name": "Connectors", "slug": "connectors-kb"},
     ).json()
     kb_id = knowledge_base["id"]
+    import json
+    monkeypatch.setenv("CONNECTOR_CREDENTIALS_JSON", json.dumps({"docs": {
+        "knowledge_base_ids": [kb_id], "source_type": "git",
+        "allowed_locations": ["https://example.invalid/docs.git"],
+        "secret_ref": "env://TEST_DOCS_TOKEN",
+    }}))
 
     with db_module.SessionLocal() as db:
         db.add(User(
@@ -246,7 +252,7 @@ def test_member_and_data_source_management(client):
         json={
             "source_type": "git",
             "name": "Engineering docs",
-            "connection_ref": "vault://rag/git",
+            "connection_ref": "credential://docs",
             "config": {"location": "https://example.invalid/docs.git"},
         },
     )
@@ -269,12 +275,7 @@ def test_member_and_data_source_management(client):
             "config": {"location": "../outside"},
         },
     )
-    assert unsafe_local.status_code == 201
-    unsafe_check = client.post(
-        f"/api/v1/knowledge-bases/{kb_id}/sources/{unsafe_local.json()['id']}/check"
-    )
-    assert unsafe_check.status_code == 200
-    assert unsafe_check.json()["health_status"] == "fail"
+    assert unsafe_local.status_code == 400
 
     rejected = client.post(
         f"/api/v1/knowledge-bases/{kb_id}/sources",
@@ -352,6 +353,8 @@ def test_local_directory_sync_is_incremental_and_versions_can_be_restored(
         "app.services.data_source_service.LOCAL_SOURCE_ALLOWED_ROOTS",
         (tmp_path.resolve(),),
     )
+    import json
+    monkeypatch.setenv("LOCAL_SOURCE_ROOTS_JSON", json.dumps({kb_id: [str(source_root.resolve())]}))
 
     source = client.post(
         f"/api/v1/knowledge-bases/{kb_id}/sources",

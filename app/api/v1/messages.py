@@ -1,9 +1,11 @@
 """消息接口：同步问答与 SSE 流式问答。"""
 
 import json
+import anyio
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -50,18 +52,35 @@ def stream_message(
     current_user: User = Depends(get_current_user),
 ):
     """SSE 流式问答接口，Web 默认调用。"""
+    from app.bootstrap.container import get_provider_container
+
     events = chat_service.answer_stream(
         db,
         conversation_id,
         current_user.id,
         payload.content,
         payload.retrieval,
+        session_factory=get_provider_container().metadata.session,
     )
 
-    def event_stream():
-        for evt in events:
-            yield f"event: {evt['event']}\n"
-            yield f"data: {json.dumps(evt['data'], ensure_ascii=False)}\n\n"
+    def next_event():
+        try:
+            return next(events)
+        except StopIteration:
+            return None
+
+    async def event_stream():
+        try:
+            while True:
+                evt = await run_in_threadpool(next_event)
+                if evt is None:
+                    break
+                yield f"event: {evt['event']}\ndata: {json.dumps(evt['data'], ensure_ascii=False)}\n\n"
+        finally:
+            # Starlette cancels the response iterator on disconnect. Shield
+            # persistence so partial output and upstream resources are closed.
+            with anyio.CancelScope(shield=True):
+                await run_in_threadpool(events.close)
 
     return StreamingResponse(
         event_stream(),

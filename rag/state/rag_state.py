@@ -1,10 +1,9 @@
 """
-LangGraph 状态对象
+项目内确定性 RAG workflow 状态对象
 定义整个 RAG workflow 共享的数据
 """
 
-import operator
-from typing import Annotated, Any, List, TypedDict
+from typing import Any, List, TypedDict
 
 from langchain_core.documents import Document
 
@@ -15,6 +14,7 @@ class RAGState(TypedDict, total=False):
     retrieval_queries: List[str]
     query_embedding: List[float] | None
     retrieval_candidates: List[Document]
+    retrieval_diagnostics: List[dict]
     query: str
     history: List[dict]
     docs: List[Document]
@@ -34,5 +34,5 @@ class RAGState(TypedDict, total=False):
     graph_channel_result: dict
     code_channel_result: dict
     channel_results: dict[str, dict]
-    parallel_markers: Annotated[List[str], operator.add]
+    parallel_markers: List[str]
     generation_mode: str

@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user
+from app.api.legacy_scope import require_default_knowledge_base
 from app.bootstrap.container import get_provider_container
 from app.core.config import KNOWLEDGE_GRAPH_ENABLED
 from app.core.database import get_db
@@ -28,6 +29,7 @@ def graph_stats(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    require_default_knowledge_base(db, current_user)
     _check_enabled()
     store = get_provider_container().graph_store(db)
     return GraphStatsOut(**store.stats())
@@ -40,6 +42,7 @@ def search_entities(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    require_default_knowledge_base(db, current_user)
     _check_enabled()
     store = get_provider_container().graph_store(db)
     entities = store.search_entities(query, limit)
@@ -52,6 +55,7 @@ def get_entity(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    require_default_knowledge_base(db, current_user)
     _check_enabled()
     from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
     repo = KnowledgeGraphRepository(db)
@@ -78,6 +82,7 @@ def get_neighbors(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    require_default_knowledge_base(db, current_user)
     _check_enabled()
     store = get_provider_container().graph_store(db)
     relations = store.get_neighbors([entity_id], hops, limit)

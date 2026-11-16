@@ -13,6 +13,7 @@ from app.core.config import (
     GRAPH_RELATION_SEARCH_K,
     MAX_CONTEXT_CHUNKS,
     MAX_CONTEXT_TOKENS,
+    MAX_CHUNKS_PER_SOURCE,
     RERANK_TOP_K,
     RETRIEVAL_CANDIDATE_K,
     VECTOR_SEARCH_K,
@@ -34,6 +35,7 @@ class RetrievalPolicy:
     rerank_k: int
     context_chunks: int
     context_tokens: int
+    source_chunks: int = MAX_CHUNKS_PER_SOURCE
 
 
 def _at_least(value: int, minimum: int = 1) -> int:
@@ -73,6 +75,7 @@ def get_retrieval_policy(name: str | None) -> RetrievalPolicy:
             rerank_k=_at_least(RERANK_TOP_K * 2),
             context_chunks=_at_least(MAX_CONTEXT_CHUNKS + 3),
             context_tokens=_at_least(int(MAX_CONTEXT_TOKENS * 1.67)),
+            source_chunks=max(4, MAX_CHUNKS_PER_SOURCE),
         )
     return RetrievalPolicy(
         name="standard",

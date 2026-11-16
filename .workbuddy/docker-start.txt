@@ -1,8 +1,0 @@
-Start-Process: OK
-processes after 20s: 6
-  com.docker.backend pid=29400
-  com.docker.backend pid=36020
-  com.docker.build pid=17456
-  docker pid=33056
-  Docker Desktop pid=18724
-  docker-desktop pid=11000

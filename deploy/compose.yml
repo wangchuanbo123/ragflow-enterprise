@@ -1,0 +1,155 @@
+name: rag-enterprise
+x-app: &app
+  image: ${APP_IMAGE:-rag-enterprise:team}
+  build:
+    context: ..
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  stop_grace_period: 90s
+  init: true
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  env_file:
+    - ../.env.server
+  environment: &environment
+    APP_PROFILE: server
+    APP_ENV: production
+    DATABASE_URL: postgresql+psycopg://rag:${POSTGRES_PASSWORD:?Run scripts.configure_server first}@postgres:5432/rag
+    METADATA_STORE_PROVIDER: postgresql
+    VECTOR_STORE_PROVIDER: pgvector
+    GRAPH_STORE_PROVIDER: sqlalchemy
+    TASK_QUEUE_PROVIDER: redis
+    CACHE_PROVIDER: redis
+    REDIS_URL: redis://:${REDIS_PASSWORD:?Run scripts.configure_server first}@redis:6379/0
+    DATA_DIR: /app/data
+    LOCAL_OBJECT_STORE_DIR: /app/data/docs
+    LOCAL_SOURCE_ALLOWED_ROOTS: /app/data/docs
+    INDEX_WORKER_ENABLED: "false"
+    AGENT_TOOL_URL: http://api:8080/api/v1/agent-tools
+    AGENT_TRUSTED_HTTP_HOSTS: api
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-pgvector/pgvector:pg17@sha256:7d0a41464797aeb9862dfdc0bbf1526b82cfd324cdd8036df19e3545f4a9ccb8}
+    restart: unless-stopped
+    cpus: "${POSTGRES_CPUS:-2}"
+    mem_limit: "${POSTGRES_MEMORY:-3g}"
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_DB: rag
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run scripts.configure_server first}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag -d rag"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4-alpine@sha256:8da19c7399dca900c6822a1cf30f9d2285585e2c4b457ff4095b0f4500054d3f}
+    restart: unless-stopped
+    cpus: "${REDIS_CPUS:-0.5}"
+    mem_limit: "${REDIS_MEMORY:-512m}"
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Run scripts.configure_server first}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=$$REDIS_PASSWORD redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  api:
+    <<: *app
+    cpus: "${API_CPUS:-2}"
+    mem_limit: "${API_MEMORY:-3g}"
+    environment:
+      <<: *environment
+      APP_ROLE: api
+      SERVER_BACKUP_STATUS_PATH: /app/operations/backup-status.json
+      AGENT_TOOL_URL: http://127.0.0.1:8080/api/v1/agent-tools
+    ports:
+      - "${APP_BIND_ADDRESS:-127.0.0.1}:${APP_PORT:-8080}:8080"
+    volumes:
+      - documents:/app/data/docs
+      - api-agents:/app/data/agents
+      - search-cache:/app/data/search-cache
+      - ../data/operations:/app/operations:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/v1/health',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+  worker:
+    <<: *app
+    cpus: "${WORKER_CPUS:-4}"
+    mem_limit: "${WORKER_MEMORY:-6g}"
+    healthcheck:
+      test: ["CMD", "python", "-m", "scripts.check_service_health"]
+      interval: 15s
+      timeout: 8s
+      retries: 4
+      start_period: 90s
+    command: ["python", "-m", "scripts.run_worker"]
+    environment:
+      <<: *environment
+      APP_ROLE: worker
+    volumes:
+      - documents:/app/data/docs
+      - worker-agents:/app/data/agents
+      - search-cache:/app/data/search-cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+  scheduler:
+    <<: *app
+    cpus: "${SCHEDULER_CPUS:-0.5}"
+    mem_limit: "${SCHEDULER_MEMORY:-1536m}"
+    healthcheck:
+      test: ["CMD", "python", "-m", "scripts.check_service_health"]
+      interval: 15s
+      timeout: 8s
+      retries: 4
+      start_period: 90s
+    command: ["python", "-m", "scripts.run_scheduler"]
+    environment:
+      <<: *environment
+      APP_ROLE: scheduler
+      SERVER_BACKUP_STATUS_PATH: /app/operations/backup-status.json
+      OPENCODE_AUTO_START: "false"
+    volumes:
+      - documents:/app/data/docs
+      - ../data/operations:/app/operations:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+
+volumes:
+  documents:
+  postgres:
+  redis:
+  api-agents:
+  worker-agents:
+  search-cache:

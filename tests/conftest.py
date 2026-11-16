@@ -2,6 +2,21 @@
 
 from pathlib import Path
 from sys import path
+import os
+
+# Tests must never generate credentials in the developer's .env or start real
+# background jobs. Individual integration tests can explicitly override these.
+for key, value in {
+    "APP_PROFILE": "test",
+    "JWT_SECRET_KEY": "test-suite-secret-at-least-thirty-two-bytes",
+    "INITIAL_ADMIN_PASSWORD": "test-admin-password-123",
+    "DATABASE_URL": "sqlite://",
+    "INDEX_WORKER_ENABLED": "false",
+    "CONNECTOR_SCHEDULER_ENABLED": "false",
+    "BACKUP_MONTHLY_ENABLED": "false",
+    "GRAPH_COMMUNITY_MAINTENANCE_ENABLED": "false",
+}.items():
+    os.environ.setdefault(key, value)
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in path:
@@ -11,6 +26,15 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+
+
+@pytest.fixture(autouse=True)
+def isolated_login_throttle():
+    from app.services.login_throttle import reset_login_limits
+
+    reset_login_limits()
+    yield
+    reset_login_limits()
 
 
 @pytest.fixture

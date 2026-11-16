@@ -23,7 +23,7 @@ def create_embed_query_node(embedding_model):
                 status = "ok"
             except Exception as exc:
                 status = "error"
-                error = f"{type(exc).__name__}: {exc}"[:500]
+                error = type(exc).__name__
         embedding_info = {
             "status": status,
             "shared": vector is not None,
@@ -33,6 +33,10 @@ def create_embed_query_node(embedding_model):
         if error:
             embedding_info["error"] = error
         route["query_embedding"] = embedding_info
+        route["retrieval_diagnostics"] = [*(route.get("retrieval_diagnostics") or []), {
+            "channel": "embedding", "status": status, "code": error or status,
+            "count": int(vector is not None), "elapsed_ms": embedding_info["elapsed_ms"],
+        }]
         return {"query_embedding": vector, "route": route}
 
     return embed_query_node

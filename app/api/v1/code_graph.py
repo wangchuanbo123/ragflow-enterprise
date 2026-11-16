@@ -1,7 +1,5 @@
 """Code symbol, call, and dependency graph APIs."""
 
-import uuid
-import zipfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Query, UploadFile, status
@@ -11,12 +9,12 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.api.errors import bad_request, forbidden, not_found
 from app.core.database import get_db
-from app.core.config import DOC_DIR, INDEX_JOB_MAX_ATTEMPTS, MAX_BATCH_UPLOAD_TOTAL_MB
+from app.core.config import INDEX_JOB_MAX_ATTEMPTS, MAX_BATCH_UPLOAD_TOTAL_MB
 from app.models.code_graph import CodeFile
 from app.models.index_job import IndexJob
 from app.models.user import User
 from app.repositories.code_graph_repository import CodeGraphRepository
-from app.repositories.index_job_repository import IndexJobRepository
+from app.repositories.index_job_repository import IndexJobRepository, signal_persisted_job
 from app.repositories.knowledge_base_repository import KnowledgeBaseRepository
 from app.schemas.code_graph import (
     CodeGraphStatsOut,
@@ -33,6 +31,7 @@ from app.schemas.document import IndexJobOut
 from app.schemas.knowledge_base import DataSourceOut
 from app.services.code_index_service import CodeIndexService
 from app.services.code_vector_service import CodeVectorService
+from app.services.upload_staging import stage_uploads, upload_db_operation
 
 router = APIRouter(prefix="/knowledge-bases", tags=["code-graph"])
 
@@ -82,58 +81,27 @@ async def upload_code_archive(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Safely unpack a ZIP into the persistent allowed source root."""
-    _require(db, knowledge_base_id, current_user, edit=True)
+    """Accept bounded ZIP upload; the worker validates, extracts and indexes."""
+    user_id, is_admin = current_user.id, current_user.role == "admin"
+    def authorize(owned_db):
+        repository = KnowledgeBaseRepository(owned_db)
+        if not repository.can_edit(knowledge_base_id, user_id, is_admin=is_admin):
+            if repository.get(knowledge_base_id) is None:
+                raise not_found("知识库不存在")
+            raise forbidden("没有该知识库的访问权限")
+    await upload_db_operation(db, authorize)
     filename = Path(file.filename or "code.zip").name
     if Path(filename).suffix.lower() != ".zip":
+        await file.close()
         raise bad_request("代码压缩包必须是 ZIP 格式")
-    max_bytes = MAX_BATCH_UPLOAD_TOTAL_MB * 1024 * 1024
-    body = await file.read(max_bytes + 1)
-    if len(body) > max_bytes:
-        raise bad_request(f"代码压缩包不能超过 {MAX_BATCH_UPLOAD_TOTAL_MB} MB")
-    archive_id = str(uuid.uuid4())
-    archive_root = (DOC_DIR / "code_uploads" / knowledge_base_id / archive_id).resolve()
-    archive_root.mkdir(parents=True, exist_ok=False)
-    archive_path = archive_root / "source.zip"
-    archive_path.write_bytes(body)
-    try:
-        with zipfile.ZipFile(archive_path) as package:
-            members = [item for item in package.infolist() if not item.is_dir()]
-            if not members:
-                raise ValueError("代码压缩包中没有文件")
-            if len(members) > 10000:
-                raise ValueError("压缩包文件数量超过 10000 个")
-            expanded = sum(item.file_size for item in members)
-            if expanded > max_bytes * 4:
-                raise ValueError("压缩后的代码体积异常，已停止解压")
-            for item in members:
-                unix_mode = (item.external_attr >> 16) & 0o170000
-                if unix_mode == 0o120000:
-                    raise ValueError("代码压缩包不能包含符号链接")
-                target = (archive_root / item.filename).resolve()
-                if archive_root not in target.parents:
-                    raise ValueError("压缩包包含不安全的文件路径")
-            package.extractall(archive_root)
-    except (zipfile.BadZipFile, ValueError) as exc:
-        import shutil
-        shutil.rmtree(archive_root, ignore_errors=True)
-        raise bad_request(str(exc) or "ZIP 文件损坏") from exc
-    archive_path.unlink(missing_ok=True)
-    children = [item for item in archive_root.iterdir()]
-    code_root = children[0] if len(children) == 1 and children[0].is_dir() else archive_root
-    repository = KnowledgeBaseRepository(db)
-    display_name = Path(filename).stem[:100] or "上传代码"
-    display_name = f"{display_name}-{archive_id[:6]}"
-    try:
-        return repository.create_data_source(
-            knowledge_base_id,
-            source_type="local_directory",
-            name=display_name,
-            connection_ref=None,
-            config={"location": str(code_root), "index_code": True, "uploaded_archive": True},
-        )
-    except ValueError as exc:
-        raise bad_request(str(exc)) from exc
+    async with stage_uploads([file], max_file_mb=MAX_BATCH_UPLOAD_TOTAL_MB) as (uploads, _):
+        path = uploads[0][2]
+        def register(owned_db):
+            from app.services.code_archive_service import CodeArchiveService
+            authorize(owned_db)
+            source = CodeArchiveService(owned_db, knowledge_base_id).stage(filename, path, user_id)
+            return DataSourceOut.model_validate(source)
+        return await upload_db_operation(db, register)
 
 
 @router.get(
@@ -249,7 +217,7 @@ def request_document_code_index(
     ))
     from app.bootstrap.container import get_provider_container
 
-    get_provider_container().task_queue.enqueue(job.id)
+    signal_persisted_job(get_provider_container().task_queue, job.id)
     return job
 
 

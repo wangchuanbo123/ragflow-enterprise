@@ -26,6 +26,7 @@ import type {
   GraphReviewItem,
   GraphSchema,
   IndexJob,
+  PageResult,
   KnowledgeBase,
   KnowledgeBaseMember,
   KnowledgeBackup,
@@ -41,34 +42,50 @@ import type {
   Tag,
   User,
 } from '../types'
+import { notifyUnauthorized, sessionRequest } from './session'
+import type { AgentRun, AgentRunCreate, AgentTaskCatalog } from '../agents'
 
 const BASE = '/api/v1'
 
-async function parseError(res: Response): Promise<string> {
+export class ApiRequestError extends Error {
+  constructor(message:string,readonly status:number,readonly code?:string,readonly details?:unknown){super(message);this.name='ApiRequestError'}
+}
+
+async function parseError(res: Response): Promise<ApiRequestError> {
   try {
     const body = (await res.json()) as ApiError | { detail?: string }
-    if ('error' in body) return body.error.message
-    if ('detail' in body) return String(body.detail)
+    if ('error' in body) return new ApiRequestError(body.error.message,res.status,body.error.code,body.error.details)
+    if ('detail' in body) return new ApiRequestError(String(body.detail),res.status)
   } catch {
     // Non-JSON error response.
   }
-  return `请求失败（${res.status}）`
+  return new ApiRequestError(`请求失败（${res.status}）`,res.status)
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function request<T>(path: string, init: RequestInit = {}, acceptedStatuses: number[] = []): Promise<T> {
   const headers = new Headers(init.headers)
   if (init.body && !(init.body instanceof FormData) && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json')
   }
-  let res: Response
+  const pending = sessionRequest(init.signal ?? undefined)
   try {
-    res = await fetch(`${BASE}${path}`, { ...init, headers, credentials: 'include' })
-  } catch {
-    throw new Error('无法连接到服务，请检查服务是否已启动或稍后重试')
+    let res: Response
+    try {
+      res = await fetch(`${BASE}${path}`, { ...init, headers, credentials: 'include', signal: pending.signal })
+    } catch (error) {
+      if ((error as Error).name === 'AbortError') throw error
+      throw new Error('无法连接到服务，请检查服务是否已启动或稍后重试')
+    }
+    pending.assertCurrent()
+    if (res.status === 401 && path !== '/auth/login') notifyUnauthorized()
+    if (!res.ok && !acceptedStatuses.includes(res.status)) throw await parseError(res)
+    if (res.status === 204) return undefined as T
+    const body = await res.json() as T
+    pending.assertCurrent()
+    return body
+  } finally {
+    pending.release()
   }
-  if (!res.ok) throw new Error(await parseError(res))
-  if (res.status === 204) return undefined as T
-  return (await res.json()) as T
 }
 
 export async function login(username: string, password: string): Promise<User> {
@@ -84,10 +101,8 @@ export function logout(): Promise<void> {
 }
 
 export async function fetchMe(): Promise<User | null> {
-  const res = await fetch(`${BASE}/auth/me`, { credentials: 'include' })
-  if (res.status === 401) return null
-  if (!res.ok) throw new Error(await parseError(res))
-  return (await res.json()) as User
+  try { return await request<User>('/auth/me') }
+  catch (error) { if ((error as Error).name === 'AbortError') return null; throw error }
 }
 
 export function listKnowledgeBases(): Promise<KnowledgeBase[]> {
@@ -154,6 +169,35 @@ export function listDataSources(knowledgeBaseId: string): Promise<DataSource[]> 
   return request(`/knowledge-bases/${knowledgeBaseId}/sources`)
 }
 
+export function listConnectorCredentials(knowledgeBaseId: string): Promise<import('../types').ConnectorCredential[]> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/connector-credentials`)
+}
+
+export function listAgentTaskCatalog(kb: string): Promise<AgentTaskCatalog[]> { return request(`/knowledge-bases/${kb}/agent-task-catalog`) }
+export function listAgentRuns(kb: string, offset = 0, limit = 50): Promise<AgentRun[]> { return request(`/knowledge-bases/${kb}/agent-runs?offset=${offset}&limit=${limit}`) }
+export function listAgentRunPage(kb: string, options: { offset?: number; limit?: number; task?: string; status?: string } = {}): Promise<import('../types').PageResult<AgentRun>> {
+  const params = new URLSearchParams({ offset: String(options.offset ?? 0), limit: String(options.limit ?? 50) })
+  if (options.task) params.set('task', options.task)
+  if (options.status) params.set('status', options.status)
+  return request(`/knowledge-bases/${kb}/agent-runs/page?${params}`)
+}
+export function createAgentRun(kb: string, payload: AgentRunCreate): Promise<AgentRun> { return request(`/knowledge-bases/${kb}/agent-runs`, { method:'POST',body:JSON.stringify(payload) }) }
+export function getAgentRun(kb: string, id: string, signal?: AbortSignal): Promise<AgentRun> { return request(`/knowledge-bases/${kb}/agent-runs/${id}`, {signal}) }
+export function getAgentRunArtifact(kb: string, id: string): Promise<AgentRun> { return request(`/knowledge-bases/${kb}/agent-runs/${id}/artifact`) }
+export function cancelAgentRun(kb: string, id: string): Promise<AgentRun> { return request(`/knowledge-bases/${kb}/agent-runs/${id}/cancel`, {method:'POST'}) }
+export function retryAgentRun(kb: string, id: string): Promise<AgentRun> { return request(`/knowledge-bases/${kb}/agent-runs/${id}/retry`, {method:'POST'}) }
+
+export function listUsers(): Promise<User[]> { return request('/users') }
+export function createUser(payload: { username: string; password: string; display_name?: string; role: 'admin' | 'user'; is_active: boolean }): Promise<User> {
+  return request('/users', { method: 'POST', body: JSON.stringify(payload) })
+}
+export function updateUser(id: string, payload: Partial<Pick<User, 'display_name' | 'role' | 'is_active'>> & { password?: string }): Promise<User> {
+  return request(`/users/${id}`, { method: 'PATCH', body: JSON.stringify(payload) })
+}
+export function changePassword(current_password: string, new_password: string): Promise<void> {
+  return request('/auth/password', { method: 'POST', body: JSON.stringify({ current_password, new_password }) })
+}
+
 export function createDataSource(
   knowledgeBaseId: string,
   payload: {
@@ -208,8 +252,8 @@ export function createConversation(
   })
 }
 
-export function getConversation(id: string): Promise<ConversationDetail> {
-  return request(`/conversations/${id}`)
+export function getConversation(id: string, signal?: AbortSignal): Promise<ConversationDetail> {
+  return request(`/conversations/${id}`, { signal })
 }
 
 export function saveMessageFeedback(
@@ -249,21 +293,31 @@ export function listDocuments(knowledgeBaseId: string): Promise<KnowledgeDocumen
   return request(`/knowledge-bases/${knowledgeBaseId}/documents`)
 }
 
+export function listDocumentPage(kb: string, filters: {offset?:number;limit?:number;query?:string;status?:string;folder_id?:string;tag_id?:string} = {}): Promise<PageResult<KnowledgeDocument>> {
+  const params = new URLSearchParams()
+  Object.entries(filters).forEach(([key,value])=>{if(value!==undefined&&value!=='')params.set(key,String(value))})
+  return request(`/knowledge-bases/${kb}/documents/page?${params}`)
+}
+
 export function getDocumentTagMap(knowledgeBaseId: string): Promise<Record<string, string[]>> {
   return request(`/knowledge-bases/${knowledgeBaseId}/documents/tag-map`)
 }
+export function getDocument(kb:string,id:string):Promise<KnowledgeDocument>{return request(`/knowledge-bases/${kb}/documents/${id}`)}
+export function getDocumentTags(kb:string,id:string):Promise<string[]>{return request(`/knowledge-bases/${kb}/documents/${id}/tags`)}
 
-export async function uploadDocuments(knowledgeBaseId: string, files: File[]): Promise<void> {
+export interface DocumentUploadResult { job_id: string | null; document_ids: string[]; accepted: number; rejected: Array<{ filename: string; error: string; index?: number }>; status: string }
+
+export async function uploadDocuments(knowledgeBaseId: string, files: File[]): Promise<DocumentUploadResult> {
   const form = new FormData()
   files.forEach((file) => form.append('files', file))
-  await request(`/knowledge-bases/${knowledgeBaseId}/documents/batch-upload`, {
+  return request(`/knowledge-bases/${knowledgeBaseId}/documents/batch-upload`, {
     method: 'POST',
     body: form,
   })
 }
 
-export async function reindexDocument(knowledgeBaseId: string, documentId: string): Promise<void> {
-  await request(`/knowledge-bases/${knowledgeBaseId}/documents/${documentId}/reindex`, { method: 'POST' })
+export async function reindexDocument(knowledgeBaseId: string, documentId: string, options?: { force_ocr?: boolean; ocr_pages?: number[] | null }): Promise<void> {
+  await request(`/knowledge-bases/${knowledgeBaseId}/documents/${documentId}/reindex`, { method: 'POST', ...(options?{body:JSON.stringify(options)}:{}) })
 }
 
 export async function deleteDocument(knowledgeBaseId: string, documentId: string): Promise<void> {
@@ -282,8 +336,9 @@ export async function batchDocuments(
   })
 }
 
-export function listDocumentChunks(knowledgeBaseId: string, documentId: string): Promise<DocumentChunk[]> {
-  return request(`/knowledge-bases/${knowledgeBaseId}/documents/${documentId}/chunks?limit=200`)
+export function listDocumentChunks(knowledgeBaseId: string, documentId: string, options: { offset?: number; limit?: number } = {}): Promise<DocumentChunk[]> {
+  const params = new URLSearchParams({ limit: String(options.limit ?? 200), offset: String(options.offset ?? 0) })
+  return request(`/knowledge-bases/${knowledgeBaseId}/documents/${documentId}/chunks?${params}`)
 }
 
 export function searchKnowledgeBase(knowledgeBaseId: string, query: string, limit = 20): Promise<SearchHit[]> {
@@ -301,11 +356,18 @@ export function uploadDocumentsWithProgress(
   knowledgeBaseId: string,
   files: File[],
   onProgress?: (info: UploadProgress) => void,
-): Promise<{ job_id: string; document_ids: string[]; accepted: number; rejected: Array<{ filename: string; error: string }>; status: string }> {
+  signal?: AbortSignal,
+): Promise<DocumentUploadResult> {
   return new Promise((resolve, reject) => {
+    if(signal?.aborted){reject(new DOMException('上传已取消','AbortError'));return}
     const form = new FormData()
     files.forEach((file) => form.append('files', file))
     const xhr = new XMLHttpRequest()
+    const pending = sessionRequest()
+    const abort = () => xhr.abort()
+    pending.signal.addEventListener('abort', abort, { once: true })
+    signal?.addEventListener('abort',abort,{once:true})
+    const cleanup = () => { pending.signal.removeEventListener('abort', abort);signal?.removeEventListener('abort',abort); pending.release() }
     xhr.open('POST', `${BASE}/knowledge-bases/${knowledgeBaseId}/documents/batch-upload`)
     xhr.withCredentials = true
     xhr.responseType = 'json'
@@ -313,14 +375,20 @@ export function uploadDocumentsWithProgress(
       if (onProgress && event.lengthComputable) onProgress({ loaded: event.loaded, total: event.total })
     }
     xhr.onload = () => {
+      try { pending.assertCurrent() } catch (error) { cleanup(); reject(error); return }
       const body = xhr.response ?? {}
+      cleanup()
       if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(body as { job_id: string; document_ids: string[]; accepted: number; rejected: Array<{ filename: string; error: string }>; status: string })
+        resolve(body as DocumentUploadResult)
       } else {
-        reject(new Error((body as { detail?: string }).detail || `请求失败（${xhr.status}）`))
+        if (xhr.status === 401) notifyUnauthorized()
+        reject(new Error((body as ApiError).error?.message || (body as { detail?: string }).detail || `请求失败（${xhr.status}）`))
       }
     }
-    xhr.onerror = () => reject(new Error('无法连接到服务，请检查服务是否已启动或稍后重试'))
+    xhr.onerror = () => { cleanup(); reject(new Error('无法连接到服务，请检查服务是否已启动或稍后重试')) }
+    xhr.onabort = () => { cleanup(); reject(new DOMException('上传已取消', 'AbortError')) }
+    xhr.timeout = 300000
+    xhr.ontimeout = () => { cleanup(); reject(new Error('上传超时，请重试')) }
     xhr.send(form)
   })
 }
@@ -366,12 +434,40 @@ export function listTags(knowledgeBaseId: string): Promise<Tag[]> {
   return request(`/knowledge-bases/${knowledgeBaseId}/tags`)
 }
 
+export function createFolder(kb: string, payload: { name: string; parent_id?: string | null; description?: string }): Promise<Folder> {
+  return request(`/knowledge-bases/${kb}/folders`, { method: 'POST', body: JSON.stringify(payload) })
+}
+export function updateFolder(kb: string, id: string, payload: { name: string; parent_id?: string | null; description?: string }): Promise<Folder> {
+  return request(`/knowledge-bases/${kb}/folders/${id}`, { method: 'PATCH', body: JSON.stringify(payload) })
+}
+export function deleteFolder(kb: string, id: string): Promise<void> { return request(`/knowledge-bases/${kb}/folders/${id}`, { method: 'DELETE' }) }
+export function createTag(kb: string, payload: { name: string; color?: string }): Promise<Tag> {
+  return request(`/knowledge-bases/${kb}/tags`, { method: 'POST', body: JSON.stringify(payload) })
+}
+export function updateTag(kb: string, id: string, payload: { name: string; color?: string }): Promise<Tag> {
+  return request(`/knowledge-bases/${kb}/tags/${id}`, { method: 'PATCH', body: JSON.stringify(payload) })
+}
+export function deleteTag(kb: string, id: string): Promise<void> { return request(`/knowledge-bases/${kb}/tags/${id}`, { method: 'DELETE' }) }
+export function setDocumentTags(kb: string, id: string, tag_ids: string[]): Promise<string[]> {
+  return request(`/knowledge-bases/${kb}/documents/${id}/tags`, { method: 'PUT', body: JSON.stringify({ tag_ids }) })
+}
+
 export function listIndexJobs(knowledgeBaseId: string): Promise<IndexJob[]> {
   return request(`/knowledge-bases/${knowledgeBaseId}/index-jobs`)
 }
 
+export function listIndexJobPage(kb:string,filters:{offset?:number;limit?:number;status?:string;query?:string}={}):Promise<PageResult<IndexJob>>{
+  const params=new URLSearchParams()
+  Object.entries(filters).forEach(([key,value])=>{if(value!==undefined&&value!=='')params.set(key,String(value))})
+  return request(`/knowledge-bases/${kb}/index-jobs/page?${params}`)
+}
+
 export async function startIndexSync(knowledgeBaseId: string): Promise<void> {
   await request(`/knowledge-bases/${knowledgeBaseId}/index-jobs/sync`, { method: 'POST' })
+}
+
+export function rebuildKnowledgeBaseIndex(knowledgeBaseId: string): Promise<{ job_id: string; status: 'accepted' }> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/index-jobs/rebuild`, { method: 'POST' })
 }
 
 export function cancelIndexJob(knowledgeBaseId: string, jobId: string): Promise<IndexJob> {
@@ -442,7 +538,10 @@ export function searchGraphEntities(knowledgeBaseId: string, query: string, grap
 }
 
 export function getReadiness(): Promise<Readiness> {
-  return request('/ready')
+  return request('/ready', {}, [503])
+}
+export function probeModels(): Promise<import('../types').ModelProbe> {
+  return request('/model-probe', { method: 'POST' }, [503])
 }
 
 export function getCodeGraphStats(knowledgeBaseId: string): Promise<CodeGraphStats> {
@@ -491,14 +590,11 @@ export function listGraphProfiles(knowledgeBaseId: string): Promise<import('../t
   return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/profiles`)
 }
 
-export function createGraphProfileSchema(
-  knowledgeBaseId: string,
-  graphKind: Exclude<import('../types').GraphKind, 'general'>,
-): Promise<GraphSchema> {
-  return request(`/knowledge-bases/${knowledgeBaseId}/knowledge-graph/schemas/profile-template`, {
-    method: 'POST', body: JSON.stringify({ graph_kind: graphKind }),
-  })
-}
+export function previewGraphFilter(kb:string,payload:{principles:string[];max_nodes:number;max_edges:number},signal?:AbortSignal):Promise<import('../types').GraphFilterPreview>{return request(`/knowledge-bases/${kb}/knowledge-graph/filter-preview`,{method:'POST',body:JSON.stringify(payload),signal})}
+export function listGraphFilters(kb:string):Promise<import('../types').SavedGraphFilter[]>{return request(`/knowledge-bases/${kb}/knowledge-graph/filters`)}
+export function saveGraphFilter(kb:string,payload:{name:string;principles:string[]}):Promise<import('../types').SavedGraphFilter>{return request(`/knowledge-bases/${kb}/knowledge-graph/filters`,{method:'POST',body:JSON.stringify(payload)})}
+export function deleteGraphFilter(kb:string,id:string):Promise<void>{return request(`/knowledge-bases/${kb}/knowledge-graph/filters/${id}`,{method:'DELETE'})}
+export function previewSavedGraphFilter(kb:string,id:string,payload:{max_nodes:number;max_edges:number},signal?:AbortSignal):Promise<import('../types').GraphFilterPreview>{return request(`/knowledge-bases/${kb}/knowledge-graph/filters/${id}/preview`,{method:'POST',body:JSON.stringify(payload),signal})}
 
 export function createGraphSchema(
   knowledgeBaseId: string,
@@ -652,6 +748,7 @@ export interface StreamHandlers {
   onMessageId?: (id: string) => void
   onRoute?: (route: RouteDecision) => void
   onDelta: (chunk: string) => void
+  onAnswer?: (content: string) => void
   onSources?: (sources: SourceItem[], images: SourceImage[], codeSnippets: CodeSnippet[]) => void
   onDone?: (status: string) => void
   onError?: (code: string, message: string) => void
@@ -667,29 +764,47 @@ export async function streamMessage(
   } = { strategy: 'standard' },
   signal?: AbortSignal,
 ): Promise<void> {
+  const pending = sessionRequest(signal)
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+  let finished = false
+  const guardedHandlers: StreamHandlers = {
+    ...handlers,
+    onDone: status => { finished = true; handlers.onDone?.(status) },
+    onError: (code, message) => { finished = true; handlers.onError?.(code, message) },
+  }
+  try {
   const res = await fetch(`${BASE}/conversations/${conversationId}/messages/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     credentials: 'include',
     body: JSON.stringify({ content, retrieval }),
-    signal,
+    signal: pending.signal,
   })
-  if (!res.ok || !res.body) throw new Error(await parseError(res))
+  pending.assertCurrent()
+  if (res.status === 401) notifyUnauthorized()
+  if (!res.ok || !res.body) throw await parseError(res)
 
-  const reader = res.body.getReader()
+  reader = res.body.getReader()
   const decoder = new TextDecoder('utf-8')
   let buffer = ''
   while (true) {
     const { value, done } = await reader.read()
+    pending.assertCurrent()
     if (done) break
     buffer += decoder.decode(value, { stream: true })
     let separator: number
     while ((separator = buffer.indexOf('\n\n')) !== -1) {
-      parseEvent(buffer.slice(0, separator), handlers)
+      parseEvent(buffer.slice(0, separator), guardedHandlers)
       buffer = buffer.slice(separator + 2)
     }
   }
-  if (buffer.trim()) parseEvent(buffer, handlers)
+  buffer += decoder.decode()
+  if (buffer.trim()) parseEvent(buffer, guardedHandlers)
+  if (!finished) throw new Error('回答连接提前中断，请重试')
+  } finally {
+    if (reader) { try { await reader.cancel() } catch { /* Network already closed. */ } reader.releaseLock() }
+    pending.release()
+  }
 }
 
 function parseEvent(block: string, handlers: StreamHandlers): void {
@@ -709,6 +824,7 @@ function parseEvent(block: string, handlers: StreamHandlers): void {
   if (event === 'message') handlers.onMessageId?.(payload.message_id)
   else if (event === 'route') handlers.onRoute?.(payload.route)
   else if (event === 'delta') handlers.onDelta(payload.content ?? '')
+  else if (event === 'answer' && typeof payload.content === 'string') handlers.onAnswer?.(payload.content)
   else if (event === 'sources') handlers.onSources?.(
     payload.sources ?? [], payload.images ?? [], payload.code_snippets ?? [],
   )

@@ -35,11 +35,15 @@ def _env_bool(name: str, default: bool = False) -> bool:
     raise ValueError(f"{name} must be a boolean value, got {raw!r}")
 
 APP_PROFILE = os.getenv("APP_PROFILE", "local").strip().lower()
-if APP_PROFILE not in {"local", "test", "enterprise"}:
+if APP_PROFILE not in {"local", "test", "server"}:
     raise ValueError(
-        "APP_PROFILE must be one of local, test, enterprise; "
-        f"got {APP_PROFILE!r}"
+        f"Unsupported application profile: {APP_PROFILE!r}"
     )
+APP_ROLE = os.getenv("APP_ROLE", "api" if APP_PROFILE == "server" else "all").strip().lower()
+if APP_ROLE not in {"api", "worker", "scheduler", "all"}:
+    raise ValueError("APP_ROLE must be api, worker, scheduler or all")
+if APP_PROFILE == "server" and APP_ROLE == "all":
+    raise ValueError("Server processes must select api, worker or scheduler")
 
 # Chroma telemetry is not needed by this local/offline-first application.
 # Set this before any Chroma client is created.
@@ -54,12 +58,8 @@ def _ensure_local_secret(key: str, env_path: Path = ENV_PATH) -> str:
     current = os.getenv(key, "").strip()
     if current:
         return current
-
-    if APP_PROFILE == "enterprise":
-        raise ValueError(
-            f"{key} must be supplied by the enterprise secret provider; "
-            "automatic .env writes are disabled"
-        )
+    if APP_PROFILE == "server":
+        raise ValueError(f"Server configuration requires explicit {key}")
 
     generated = secrets.token_urlsafe(48)
     lines = []
@@ -85,7 +85,8 @@ def _ensure_local_secret(key: str, env_path: Path = ENV_PATH) -> str:
     os.environ[key] = generated
     return generated
 
-DATA_DIR = BASE_DIR / "data"  # 等价rag_langgraph_enterprise/data
+_data_dir = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data")))
+DATA_DIR = (_data_dir if _data_dir.is_absolute() else BASE_DIR / _data_dir).resolve()
 
 DOC_DIR = DATA_DIR / "docs"
 
@@ -128,50 +129,26 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text-v2-moe")
 EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY") or LLM_API_KEY
 EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL") or LLM_BASE_URL
 
-RERANKER_PROVIDER = os.getenv("RERANKER_PROVIDER", "bge").lower()
+RERANKER_PROVIDER = os.getenv("RERANKER_PROVIDER", "none").lower()
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-base")
 RERANKER_API_KEY = os.getenv("RERANKER_API_KEY", "")
 RERANKER_BASE_URL = os.getenv("RERANKER_BASE_URL", "")
 RERANK_TOP_K = int(os.getenv("RERANK_TOP_K", "5"))
 
-VECTOR_STORE_PROVIDER = os.getenv("VECTOR_STORE_PROVIDER", "chroma_embedded").lower()
-METADATA_STORE_PROVIDER = os.getenv("METADATA_STORE_PROVIDER", "sqlite").lower()
+VECTOR_STORE_PROVIDER = os.getenv("VECTOR_STORE_PROVIDER", "pgvector" if APP_PROFILE == "server" else "chroma_embedded").lower()
+METADATA_STORE_PROVIDER = os.getenv("METADATA_STORE_PROVIDER", "postgresql" if APP_PROFILE == "server" else "sqlite").lower()
 OBJECT_STORE_PROVIDER = os.getenv("OBJECT_STORE_PROVIDER", "local").lower()
-TASK_QUEUE_PROVIDER = os.getenv("TASK_QUEUE_PROVIDER", "inline").lower()
-CACHE_PROVIDER = os.getenv("CACHE_PROVIDER", "memory").lower()
+TASK_QUEUE_PROVIDER = os.getenv("TASK_QUEUE_PROVIDER", "redis" if APP_PROFILE == "server" else "inline").lower()
+CACHE_PROVIDER = os.getenv("CACHE_PROVIDER", "redis" if APP_PROFILE == "server" else "memory").lower()
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+REDIS_KEY_PREFIX = os.getenv("REDIS_KEY_PREFIX", "rag-enterprise").strip()
+WORKER_HEARTBEAT_SECONDS = int(os.getenv("WORKER_HEARTBEAT_SECONDS", "5"))
+WORKER_HEARTBEAT_TTL_SECONDS = int(os.getenv("WORKER_HEARTBEAT_TTL_SECONDS", "20"))
+RAG_LEASE_SECONDS = int(os.getenv("RAG_LEASE_SECONDS", "60"))
+KNOWLEDGE_LOCK_TIMEOUT_SECONDS = int(os.getenv("KNOWLEDGE_LOCK_TIMEOUT_SECONDS", "120"))
+BM25_MAX_CACHE_KNOWLEDGE_BASES = int(os.getenv("BM25_MAX_CACHE_KNOWLEDGE_BASES", "8"))
+BM25_MAX_CHUNKS_PER_KNOWLEDGE_BASE = int(os.getenv("BM25_MAX_CHUNKS_PER_KNOWLEDGE_BASE", "100000"))
 
-CHROMA_HTTP_HOST = os.getenv("CHROMA_HTTP_HOST", "localhost")
-CHROMA_HTTP_PORT = int(os.getenv("CHROMA_HTTP_PORT", "8000"))
-CHROMA_HTTP_SSL = os.getenv("CHROMA_HTTP_SSL", "false").lower() == "true"
-CHROMA_HTTP_TENANT = os.getenv("CHROMA_HTTP_TENANT", "default_tenant")
-CHROMA_HTTP_DATABASE = os.getenv("CHROMA_HTTP_DATABASE", "default_database")
-CHROMA_HTTP_AUTH_TOKEN = os.getenv("CHROMA_HTTP_AUTH_TOKEN", "")
-
-S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "")
-S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "")
-S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "")
-S3_BUCKET = os.getenv("S3_BUCKET", "")
-S3_REGION = os.getenv("S3_REGION", "us-east-1")
-S3_PREFIX = os.getenv("S3_PREFIX", "").strip("/")
-S3_ADDRESSING_STYLE = os.getenv("S3_ADDRESSING_STYLE", "path").lower()
-
-CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
-CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/1")
-CELERY_INDEX_QUEUE = os.getenv("CELERY_INDEX_QUEUE", "rag.index")
-CELERY_INDEX_TASK_NAME = os.getenv(
-    "CELERY_INDEX_TASK_NAME",
-    "ragflow.index.process_job",
-)
-CELERY_RECONCILE_TASK_NAME = os.getenv(
-    "CELERY_RECONCILE_TASK_NAME",
-    "ragflow.index.reconcile",
-)
-CELERY_CONNECTOR_SCHEDULE_TASK_NAME = os.getenv(
-    "CELERY_CONNECTOR_SCHEDULE_TASK_NAME",
-    "ragflow.connectors.schedule_due",
-)
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/2")
-REDIS_CACHE_PREFIX = os.getenv("REDIS_CACHE_PREFIX", "ragflow")
 _local_object_store_dir = Path(
     os.getenv("LOCAL_OBJECT_STORE_DIR", str(DOC_DIR))
 )
@@ -223,7 +200,7 @@ _index_worker_default = "true" if TASK_QUEUE_PROVIDER == "inline" else "false"
 INDEX_WORKER_ENABLED = (
     os.getenv("INDEX_WORKER_ENABLED", _index_worker_default).lower() == "true"
 )
-INDEX_MAX_CONCURRENCY = int(os.getenv("INDEX_MAX_CONCURRENCY", "1"))
+INDEX_MAX_CONCURRENCY = int(os.getenv("INDEX_MAX_CONCURRENCY", "2" if APP_PROFILE == "server" else "1"))
 INDEX_JOB_LEASE_SECONDS = int(os.getenv("INDEX_JOB_LEASE_SECONDS", "300"))
 INDEX_JOB_HEARTBEAT_SECONDS = int(os.getenv("INDEX_JOB_HEARTBEAT_SECONDS", "30"))
 INDEX_JOB_MAX_ATTEMPTS = int(os.getenv("INDEX_JOB_MAX_ATTEMPTS", "3"))
@@ -255,15 +232,17 @@ CONTEXT_JSON_EXPORT_DIR = (
 )
 
 # --- Runtime reliability ---
-RAG_MAX_CONCURRENCY = int(os.getenv("RAG_MAX_CONCURRENCY", "2"))
-RAG_QUEUE_TIMEOUT_SECONDS = int(os.getenv("RAG_QUEUE_TIMEOUT_SECONDS", "3"))
+RAG_MAX_CONCURRENCY = int(os.getenv("RAG_MAX_CONCURRENCY", "8" if APP_PROFILE == "server" else "2"))
+RAG_QUEUE_TIMEOUT_SECONDS = int(os.getenv("RAG_QUEUE_TIMEOUT_SECONDS", "30" if APP_PROFILE == "server" else "3"))
 PROVIDER_TIMEOUT_SECONDS = int(os.getenv("PROVIDER_TIMEOUT_SECONDS", "120"))
 READINESS_TIMEOUT_SECONDS = int(os.getenv("READINESS_TIMEOUT_SECONDS", "2"))
 READINESS_CACHE_SECONDS = int(os.getenv("READINESS_CACHE_SECONDS", "10"))
+GRAPH_FILTER_MAX_CONCURRENCY = int(os.getenv("GRAPH_FILTER_MAX_CONCURRENCY", "4"))
+GRAPH_FILTER_MAX_RECORDS = int(os.getenv("GRAPH_FILTER_MAX_RECORDS", "200000"))
 
 # --- Knowledge graph ---
 KNOWLEDGE_GRAPH_ENABLED = os.getenv("KNOWLEDGE_GRAPH_ENABLED", "true").lower() == "true"
-GRAPH_STORE_PROVIDER = os.getenv("GRAPH_STORE_PROVIDER", "sqlite").lower()
+GRAPH_STORE_PROVIDER = os.getenv("GRAPH_STORE_PROVIDER", "sqlalchemy" if APP_PROFILE == "server" else "sqlite").lower()
 GRAPH_EXTRACTION_PROVIDER = os.getenv("GRAPH_EXTRACTION_PROVIDER", "current").lower()
 GRAPH_EXTRACTION_MODEL = os.getenv("GRAPH_EXTRACTION_MODEL", LLM_MODEL)
 GRAPH_EXTRACTION_API_KEY = os.getenv("GRAPH_EXTRACTION_API_KEY") or LLM_API_KEY
@@ -337,10 +316,6 @@ GRAPH_COMMUNITY_MAINTENANCE_INTERVAL_SECONDS = int(
 GRAPH_COMMUNITY_MAINTENANCE_WINDOW = os.getenv(
     "GRAPH_COMMUNITY_MAINTENANCE_WINDOW", ""
 ).strip()
-CELERY_GRAPH_MAINTENANCE_TASK_NAME = os.getenv(
-    "CELERY_GRAPH_MAINTENANCE_TASK_NAME",
-    "ragflow.graph.schedule_maintenance",
-)
 
 # --- Code graph ---
 CODE_GRAPH_ENABLED = _env_bool("CODE_GRAPH_ENABLED", True)
@@ -466,6 +441,8 @@ if not (0.0 < CONTEXT_TOKEN_SAFETY_RATIO <= 1.0):
     raise ValueError(f"CONTEXT_TOKEN_SAFETY_RATIO must be in (0, 1], got {CONTEXT_TOKEN_SAFETY_RATIO}")
 if RAG_MAX_CONCURRENCY < 1:
     raise ValueError("RAG_MAX_CONCURRENCY must be at least 1")
+if GRAPH_FILTER_MAX_CONCURRENCY < 1 or GRAPH_FILTER_MAX_RECORDS < 1:
+    raise ValueError("Graph filter resource limits must be positive")
 if RAG_QUEUE_TIMEOUT_SECONDS < 0:
     raise ValueError("RAG_QUEUE_TIMEOUT_SECONDS cannot be negative")
 if PROVIDER_TIMEOUT_SECONDS <= 0:
@@ -480,10 +457,26 @@ if INDEX_JOB_MAX_ATTEMPTS < 1:
     raise ValueError("INDEX_JOB_MAX_ATTEMPTS must be at least 1")
 if INDEX_JOB_RECONCILE_SECONDS < 5:
     raise ValueError("INDEX_JOB_RECONCILE_SECONDS must be at least 5")
+if INDEX_MAX_CONCURRENCY < 1:
+    raise ValueError("INDEX_MAX_CONCURRENCY must be at least 1")
+if WORKER_HEARTBEAT_SECONDS < 1 or WORKER_HEARTBEAT_TTL_SECONDS <= WORKER_HEARTBEAT_SECONDS * 2:
+    raise ValueError("Worker heartbeat TTL must exceed twice its interval")
+if RAG_LEASE_SECONDS < 10 or KNOWLEDGE_LOCK_TIMEOUT_SECONDS < 1:
+    raise ValueError("Invalid distributed coordination timeouts")
+if BM25_MAX_CACHE_KNOWLEDGE_BASES < 1 or BM25_MAX_CHUNKS_PER_KNOWLEDGE_BASE < 1:
+    raise ValueError("BM25 cache limits must be positive")
+if (TASK_QUEUE_PROVIDER == "redis" or CACHE_PROVIDER == "redis") and not REDIS_URL:
+    raise ValueError("Redis providers require REDIS_URL")
+if not REDIS_KEY_PREFIX or any(c.isspace() for c in REDIS_KEY_PREFIX):
+    raise ValueError("REDIS_KEY_PREFIX must be a non-empty namespace without whitespace")
 
 APP_ENV = os.getenv("APP_ENV", "development").lower()
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{DATA_DIR / 'app.db'}")
+if APP_PROFILE == "server" and not DATABASE_URL.startswith(("postgresql://", "postgresql+psycopg://")):
+    raise ValueError("Server profile requires a PostgreSQL DATABASE_URL")
 JWT_SECRET_KEY = _ensure_local_secret("JWT_SECRET_KEY")
+if APP_PROFILE == "server" and len(JWT_SECRET_KEY) < 32:
+    raise ValueError("Server JWT_SECRET_KEY must contain at least 32 characters")
 JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 CORS_ORIGINS = [
@@ -495,4 +488,44 @@ MAX_HISTORY_MESSAGES = int(os.getenv("MAX_HISTORY_MESSAGES", "10"))
 MAX_MESSAGE_LENGTH = int(os.getenv("MAX_MESSAGE_LENGTH", "4000"))
 INITIAL_ADMIN_USERNAME = os.getenv("INITIAL_ADMIN_USERNAME", "admin")
 INITIAL_ADMIN_PASSWORD = _ensure_local_secret("INITIAL_ADMIN_PASSWORD")
+if APP_PROFILE == "server" and len(INITIAL_ADMIN_PASSWORD) < 12:
+    raise ValueError("Server INITIAL_ADMIN_PASSWORD must contain at least 12 characters")
 JWT_COOKIE_NAME = "rag_auth_token"
+AUTH_LOGIN_MAX_ATTEMPTS = int(os.getenv("AUTH_LOGIN_MAX_ATTEMPTS", "5"))
+AUTH_LOGIN_IP_MAX_ATTEMPTS = int(os.getenv("AUTH_LOGIN_IP_MAX_ATTEMPTS", "120" if APP_PROFILE == "server" else str(AUTH_LOGIN_MAX_ATTEMPTS * 6)))
+AUTH_LOGIN_WINDOW_SECONDS = int(os.getenv("AUTH_LOGIN_WINDOW_SECONDS", "300"))
+if AUTH_LOGIN_MAX_ATTEMPTS < 1 or AUTH_LOGIN_IP_MAX_ATTEMPTS < 1 or AUTH_LOGIN_WINDOW_SECONDS < 1:
+    raise ValueError("Login limits must be positive")
+
+# Independent admission budgets for interactive and background work.
+UPLOAD_MAX_CONCURRENCY = int(os.getenv("UPLOAD_MAX_CONCURRENCY", "4"))
+MODEL_BUDGET_ENABLED = os.getenv("MODEL_BUDGET_ENABLED", "true" if APP_PROFILE == "server" else "false").lower() == "true"
+MODEL_MAX_CONCURRENCY = int(os.getenv("MODEL_MAX_CONCURRENCY", "8"))
+MODEL_BACKGROUND_CONCURRENCY = int(os.getenv("MODEL_BACKGROUND_CONCURRENCY", "2"))
+MODEL_QUEUE_TIMEOUT_SECONDS = float(os.getenv("MODEL_QUEUE_TIMEOUT_SECONDS", "30"))
+JOB_PARSE_CONCURRENCY = int(os.getenv("JOB_PARSE_CONCURRENCY", "2"))
+JOB_VECTOR_CONCURRENCY = int(os.getenv("JOB_VECTOR_CONCURRENCY", "2"))
+JOB_MODEL_CONCURRENCY = int(os.getenv("JOB_MODEL_CONCURRENCY", "2"))
+JOB_SHORT_CONCURRENCY = int(os.getenv("JOB_SHORT_CONCURRENCY", "2"))
+JOB_PRIORITY_AGING_SECONDS = int(os.getenv("JOB_PRIORITY_AGING_SECONDS", "900"))
+OPS_QUEUE_WARN_SECONDS = float(os.getenv("OPS_QUEUE_WARN_SECONDS", "300"))
+OPS_DISK_FREE_WARN_RATIO = float(os.getenv("OPS_DISK_FREE_WARN_RATIO", "0.1"))
+OPS_MEMORY_WARN_PERCENT = float(os.getenv("OPS_MEMORY_WARN_PERCENT", "90"))
+PGVECTOR_SEARCH_MODE = os.getenv("PGVECTOR_SEARCH_MODE", "exact").lower()
+PGVECTOR_ANN_MIN_ROWS = int(os.getenv("PGVECTOR_ANN_MIN_ROWS", "100000"))
+PGVECTOR_ANN_EF_SEARCH = int(os.getenv("PGVECTOR_ANN_EF_SEARCH", "400"))
+PGVECTOR_INDEX_MEMORY_MB = int(os.getenv("PGVECTOR_INDEX_MEMORY_MB", "256"))
+BM25_TOKEN_CACHE_DIR = Path(os.getenv("BM25_TOKEN_CACHE_DIR", str(DATA_DIR / "search-cache")))
+BM25_TOKEN_CACHE_ENABLED = os.getenv("BM25_TOKEN_CACHE_ENABLED", "false" if APP_PROFILE == "test" else "true").lower() == "true"
+if min(UPLOAD_MAX_CONCURRENCY, MODEL_MAX_CONCURRENCY, MODEL_BACKGROUND_CONCURRENCY,
+       JOB_PARSE_CONCURRENCY, JOB_VECTOR_CONCURRENCY, JOB_MODEL_CONCURRENCY, JOB_SHORT_CONCURRENCY,
+       JOB_PRIORITY_AGING_SECONDS, PGVECTOR_ANN_MIN_ROWS, PGVECTOR_ANN_EF_SEARCH) < 1:
+    raise ValueError("Admission, scheduling and search limits must be positive")
+if MODEL_BACKGROUND_CONCURRENCY > MODEL_MAX_CONCURRENCY or MODEL_QUEUE_TIMEOUT_SECONDS < 0:
+    raise ValueError("Background model budget must fit within the global budget")
+if PGVECTOR_SEARCH_MODE not in {"auto", "exact"}:
+    raise ValueError("PGVECTOR_SEARCH_MODE must be auto or exact")
+if not 32 <= PGVECTOR_INDEX_MEMORY_MB <= 1024:
+    raise ValueError("PGVECTOR_INDEX_MEMORY_MB must be between 32 and 1024")
+if not 0 < OPS_DISK_FREE_WARN_RATIO < 1 or not 0 < OPS_MEMORY_WARN_PERCENT <= 100 or OPS_QUEUE_WARN_SECONDS <= 0:
+    raise ValueError("Invalid operations warning thresholds")

@@ -65,7 +65,7 @@ class SqliteGraphStore:
                 )
         return overrides
 
-    def _merge_map(self) -> dict[str, str]:
+    def _merge_map(self, *, check_cancelled=None) -> dict[str, str]:
         direct = {
             item.merged_entity_id: item.canonical_entity_id
             for item in self.db.scalars(select(KgEntityMerge).where(
@@ -75,9 +75,13 @@ class SqliteGraphStore:
         }
         resolved: dict[str, str] = {}
         for source in direct:
+            if check_cancelled:
+                check_cancelled()
             current = source
             seen = {source}
             while current in direct and direct[current] not in seen:
+                if check_cancelled and len(seen) % 32 == 0:
+                    check_cancelled()
                 current = direct[current]
                 seen.add(current)
             resolved[source] = current
@@ -117,24 +121,45 @@ class SqliteGraphStore:
             }
         return vocabulary
 
-    def list_effective_entities(self) -> list[dict]:
+    def get_effective_entities(self, entity_ids, *, check_cancelled=None) -> list[dict]:
+        """Hydrate bounded semantic candidates and members merged into them."""
+        requested = set(entity_ids)
+        results = self.list_effective_entities(entity_ids=requested, check_cancelled=check_cancelled)
+        merge_map = self._merge_map(check_cancelled=check_cancelled)
+        for item in results:
+            item["matched_entity_ids"] = sorted(identifier for identifier in requested
+                                                if merge_map.get(identifier, identifier) == item["id"])
+        return results
+
+    def list_effective_entities(self, *, check_cancelled=None, entity_ids=None) -> list[dict]:
         """Return canonical entities after corrections and entity merges."""
-        entities = list(self.db.scalars(select(KgEntity).where(
+        merge_map = self._merge_map(check_cancelled=check_cancelled)
+        target_ids = None
+        if entity_ids is not None:
+            targets = {merge_map.get(str(item), str(item)) for item in entity_ids}
+            target_ids = targets | {member for member, target in merge_map.items() if target in targets}
+            if not target_ids:
+                return []
+        entity_query = select(KgEntity).where(
             KgEntity.knowledge_base_id == self.knowledge_base_id
-        ).order_by(KgEntity.id)))
+        )
+        alias_query = select(KgAlias).where(KgAlias.knowledge_base_id == self.knowledge_base_id)
+        if target_ids is not None:
+            entity_query = entity_query.where(KgEntity.id.in_(target_ids))
+            alias_query = alias_query.where(KgAlias.entity_id.in_(target_ids))
+        entities = list(self.db.scalars(entity_query.order_by(KgEntity.id)))
         aliases_by_entity: dict[str, list[str]] = {}
-        for alias in self.db.scalars(select(KgAlias).where(
-            KgAlias.knowledge_base_id == self.knowledge_base_id
-        )):
+        for alias in self.db.scalars(alias_query):
             aliases_by_entity.setdefault(alias.entity_id, []).append(alias.alias)
         overrides = self._entity_overrides()
-        merge_map = self._merge_map()
         entities_by_id = {entity.id: entity for entity in entities}
         grouped: dict[str, list[KgEntity]] = {}
         for entity in entities:
             grouped.setdefault(merge_map.get(entity.id, entity.id), []).append(entity)
         result: list[dict] = []
         for canonical_id, group in grouped.items():
+            if check_cancelled:
+                check_cancelled()
             canonical = entities_by_id.get(canonical_id)
             if canonical is None:
                 continue
@@ -160,7 +185,7 @@ class SqliteGraphStore:
             })
         return result
 
-    def list_effective_relations(self) -> list[dict]:
+    def list_effective_relations(self, *, check_cancelled=None) -> list[dict]:
         base_ids = list(self.db.scalars(select(KgRelation.id).where(
             KgRelation.knowledge_base_id == self.knowledge_base_id
         ).order_by(KgRelation.id)))
@@ -168,7 +193,7 @@ class SqliteGraphStore:
             f"manual:{item.id}" for item in self._active_corrections()
             if item.action == "add_relation"
         ]
-        return self.get_relations([*base_ids, *manual_ids])
+        return self.get_relations([*base_ids, *manual_ids], check_cancelled=check_cancelled)
 
     def upsert_extraction(
         self,
@@ -689,7 +714,7 @@ class SqliteGraphStore:
             ),
         )[:limit]
 
-    def get_relations(self, relation_ids: list[str]) -> list[dict]:
+    def get_relations(self, relation_ids: list[str], *, check_cancelled=None) -> list[dict]:
         """Hydrate base/manual relations and apply active governance overlays."""
         if not relation_ids:
             return []
@@ -702,15 +727,22 @@ class SqliteGraphStore:
         }
         subject = aliased(KgEntity)
         obj = aliased(KgEntity)
-        rows = self.db.execute(
-            select(KgRelation, subject, obj)
-            .join(subject, subject.id == KgRelation.subject_entity_id)
-            .join(obj, obj.id == KgRelation.object_entity_id)
-            .where(
-                KgRelation.knowledge_base_id == self.knowledge_base_id,
-                KgRelation.id.in_(base_ids),
-            )
-        ).all() if base_ids else []
+        # Full-KB views may contain more identifiers than a database driver's
+        # bind-parameter limit. Hydrate bounded batches, then apply governance
+        # and deduplicate across the complete result, never per batch.
+        rows = []
+        for start in range(0, len(base_ids), 500):
+            if check_cancelled:
+                check_cancelled()
+            rows.extend(self.db.execute(
+                select(KgRelation, subject, obj)
+                .join(subject, subject.id == KgRelation.subject_entity_id)
+                .join(obj, obj.id == KgRelation.object_entity_id)
+                .where(
+                    KgRelation.knowledge_base_id == self.knowledge_base_id,
+                    KgRelation.id.in_(base_ids[start:start + 500]),
+                )
+            ).all())
 
         corrections = self._active_corrections()
         hidden = {
@@ -725,7 +757,9 @@ class SqliteGraphStore:
         }
         entity_overrides = self._entity_overrides()
         items: list[dict] = []
-        for relation, subject_entity, object_entity in rows:
+        for position, (relation, subject_entity, object_entity) in enumerate(rows):
+            if check_cancelled and position % 32 == 0:
+                check_cancelled()
             if relation.id in hidden:
                 continue
             update = relation_updates.get(relation.id)
@@ -750,6 +784,8 @@ class SqliteGraphStore:
 
         if manual_ids:
             for correction in corrections:
+                if check_cancelled:
+                    check_cancelled()
                 if correction.id not in manual_ids or correction.action != "add_relation":
                     continue
                 payload = correction.payload_json or {}
@@ -781,9 +817,11 @@ class SqliteGraphStore:
                     "correction_id": update.id if update else correction.id,
                 })
 
-        merge_map = self._merge_map()
+        merge_map = self._merge_map(check_cancelled=check_cancelled)
         merged: dict[tuple[str, str, str], dict] = {}
-        for relation in items:
+        for position, relation in enumerate(items):
+            if check_cancelled and position % 32 == 0:
+                check_cancelled()
             item = dict(relation)
             item["subject_id"] = merge_map.get(item["subject_id"], item["subject_id"])
             item["object_id"] = merge_map.get(item["object_id"], item["object_id"])

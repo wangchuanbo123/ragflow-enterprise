@@ -1,32 +1,53 @@
 <script setup lang="ts">
-import { nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
+import { useScopedPageState } from '../composables/useScopedPageState'
+import { useAuth } from '../composables/useAuth'
 import * as api from '../api/client'
-import type { ChunkDetail, CodeSnippet, DocumentChunk, Folder, KnowledgeBase, KnowledgeDocument, Message, RetrievalScope, RetrievalStrategy, SourceImage, SourceItem, Tag } from '../types'
+import type { ChunkDetail, CodeSnippet, Folder, KnowledgeBase, KnowledgeDocument, Message, RetrievalScope, RetrievalStrategy, SourceImage, SourceItem, Tag } from '../types'
 import AnswerContent from './AnswerContent.vue'
+import { pageLabel } from '../documentPresentation'
+import { navigate } from '../composables/useNavigation'
 
 const props = defineProps<{
   messages: Message[]
   loading: boolean
   sending: boolean
+  conversationId?: string | null
   knowledgeBaseId: string
   knowledgeBases: KnowledgeBase[]
   documents: KnowledgeDocument[]
   folders: Folder[]
   tags: Tag[]
+  submitMessage: (payload: { content: string; strategy: RetrievalStrategy; scope?: Partial<RetrievalScope> }) => Promise<boolean>
 }>()
 
 const emit = defineEmits<{
-  (e: 'retry', payload: { content: string; strategy: RetrievalStrategy; scope?: Partial<RetrievalScope> }): void
   (e: 'stop'):void
   (e:'feedback', payload:{messageId:string;rating:'helpful'|'unhelpful'}):void
 }>()
 
-const draft = ref('')
-const strategy = ref<RetrievalStrategy>('standard')
-const scopeKind = ref<'all'|'knowledge_base'|'document'|'folder'|'tag'>('all')
-const scopeValue = ref('')
+type ComposerState = { draft: string; strategy: RetrievalStrategy; scopeKind: 'all'|'knowledge_base'|'document'|'folder'|'tag'; scopeValue: string }
+const composer = useScopedPageState<ComposerState>(() => ['chat',props.knowledgeBaseId,props.conversationId || 'new'],
+  () => ({draft:'',strategy:'standard',scopeKind:'knowledge_base',scopeValue:props.knowledgeBaseId}), value => {
+    const candidate = value as ComposerState | null
+    return candidate && typeof candidate.draft==='string' && candidate.draft.length<=100000 && ['fast','standard','deep'].includes(candidate.strategy) && ['all','knowledge_base','document','folder','tag'].includes(candidate.scopeKind) && typeof candidate.scopeValue==='string' ? candidate : null
+  })
+const draft = computed({get:()=>composer.value.draft,set:value=>composer.value.draft=value})
+const strategy = computed({get:()=>composer.value.strategy,set:value=>composer.value.strategy=value})
+const scopeKind = computed({get:()=>composer.value.scopeKind,set:value=>composer.value.scopeKind=value})
+const scopeValue = computed({get:()=>composer.value.scopeValue,set:value=>composer.value.scopeValue=value})
+const {user}=useAuth()
+let pendingComposer:{state:ComposerState;account:string;kb:string;conversation:string|null|undefined;target?:string}|null=null
+watch(()=>props.conversationId,(id,previous)=>{
+  const pending=pendingComposer
+  if(id&&!previous&&pending&&pending.account===(user.value?.id||'')&&pending.kb===props.knowledgeBaseId){
+    pending.target=id
+    composer.value={...pending.state,draft:''}
+  }
+},{flush:'sync'})
 const selectedSource = ref<SourceItem|null>(null)
-const sourceChunk = ref<DocumentChunk|null>(null)
+let sourceRequest = 0
+const sourceError = ref('')
 const sourceLoading = ref(false)
 const chunkDetail = ref<ChunkDetail | null>(null)
 const toast = ref('')
@@ -35,21 +56,35 @@ const followOutput = ref(true)
 let scrollFrame: number | null = null
 const channelNames: Record<string, string> = { text: '文档检索', graph: '知识图谱', code: '代码检索' }
 const strategyNames: Record<RetrievalStrategy, string> = { fast: '快速', standard: '标准', deep: '深度' }
+const scopeError = computed(() => {
+  if (scopeKind.value === 'all') return props.knowledgeBases.length ? '' : '没有可检索的知识库，请先创建或加入知识库。'
+  if (scopeValue.value.trim()) return ''
+  return `请先选择${({ knowledge_base: '知识库', document: '文档', folder: '文件夹', tag: '标签' } as const)[scopeKind.value]}，再发送问题。`
+})
 
-function submit(): void {
+async function submit(): Promise<void> {
   const text = draft.value.trim()
-  if (!text) return
-  emit('retry', { content: text, strategy: strategy.value, scope: retrievalScope() })
-  draft.value = ''
+  if (!text || props.sending || scopeError.value) return
+  const pending={state:{...composer.value},account:user.value?.id||'',kb:props.knowledgeBaseId,conversation:props.conversationId,target:undefined as string|undefined}
+  pendingComposer=pending
+  const payload={content:text,strategy:strategy.value,scope:retrievalScope()}
+  draft.value=''
+  try{
+    const accepted=await props.submitMessage(payload)
+    if(!accepted&&pending.account===(user.value?.id||'')&&pending.kb===props.knowledgeBaseId&&(props.conversationId===pending.conversation||props.conversationId===pending.target)&&!draft.value)draft.value=pending.state.draft
+  }catch{
+    if(pending.account===(user.value?.id||'')&&pending.kb===props.knowledgeBaseId&&(props.conversationId===pending.conversation||props.conversationId===pending.target)&&!draft.value)draft.value=pending.state.draft
+  }finally{if(pendingComposer===pending)pendingComposer=null}
 }
 
 function retrievalScope():Partial<RetrievalScope>|undefined{
-  if(scopeKind.value==='all')return {knowledge_base_ids:props.knowledgeBases.map(item=>item.id)}
-  if(scopeKind.value==='knowledge_base'&&scopeValue.value)return {knowledge_base_ids:[scopeValue.value]}
-  if(scopeKind.value==='document'&&scopeValue.value)return {knowledge_base_ids:[props.knowledgeBaseId],document_ids:[scopeValue.value]}
-  if(scopeKind.value==='folder'&&scopeValue.value)return {knowledge_base_ids:[props.knowledgeBaseId],folder_id:scopeValue.value}
-  if(scopeKind.value==='tag'&&scopeValue.value)return {knowledge_base_ids:[props.knowledgeBaseId],tag_ids:[scopeValue.value]}
-  return {knowledge_base_ids:[props.knowledgeBaseId]}
+  if(scopeError.value)return undefined
+  const selection_kind=scopeKind.value
+  if(selection_kind==='all')return {selection_kind,knowledge_base_ids:props.knowledgeBases.map(item=>item.id)}
+  if(selection_kind==='knowledge_base')return {selection_kind,knowledge_base_ids:[scopeValue.value]}
+  if(selection_kind==='document')return {selection_kind,knowledge_base_ids:[props.knowledgeBaseId],document_ids:[scopeValue.value]}
+  if(selection_kind==='folder')return {selection_kind,knowledge_base_ids:[props.knowledgeBaseId],folder_id:scopeValue.value}
+  return {selection_kind,knowledge_base_ids:[props.knowledgeBaseId],tag_ids:[scopeValue.value]}
 }
 
 function scopeName():string{
@@ -65,26 +100,26 @@ function onScopeKindChange():void{
 }
 
 async function openSource(source:SourceItem):Promise<void>{
-  selectedSource.value=source;sourceChunk.value=null;chunkDetail.value=null
+  const requested=++sourceRequest
+  selectedSource.value=source;chunkDetail.value=null;sourceError.value=''
   if(!source.document_id||!source.chunk_id)return
   sourceLoading.value=true
   try{
-    const [chunks,detail]=await Promise.all([
-      api.listDocumentChunks(source.knowledge_base_id||props.knowledgeBaseId,source.document_id),
-      api.getChunkDetail(source.knowledge_base_id||props.knowledgeBaseId,source.chunk_id,1).catch(()=>null),
-    ])
-    sourceChunk.value=chunks.find(item=>item.id===source.chunk_id)||null
-    chunkDetail.value=detail
-  }finally{sourceLoading.value=false}
+    const detail=await api.getChunkDetail(source.knowledge_base_id||props.knowledgeBaseId,source.chunk_id,1)
+    if(requested===sourceRequest)chunkDetail.value=detail
+  }catch(error){if(requested===sourceRequest&&(error as Error).name!=='AbortError')sourceError.value=(error as Error).message}
+  finally{if(requested===sourceRequest)sourceLoading.value=false}
 }
 
 /** 点击答案中的 [来源N] 引用 → 滚动到证据卡片并高亮。 */
-function scrollToSource(label:string):void{
-  const normalized=label.replace(/\s+/g,'')
+function scrollToSource(label:string, messageId:string):void{
+  const normalize=(value:string)=>value.replace(/[\s\[\]]/g,'').toLowerCase()
+  const normalized=normalize(label)
   const index=props.messages.reduce<number>((acc,message,mIdx)=>{
     if(acc>=0)return acc
     if(message.role!=='assistant')return acc
-    const found=(message.sources||[]).findIndex(item=>(item.citation_id||'').replace(/\s+/g,'')===normalized||item.citation_id===label)
+    if(message.id!==messageId)return acc
+    const found=(message.sources||[]).findIndex((item,index)=>normalize(item.citation_id||`来源${index+1}`)===normalized)
     return found>=0?mIdx*1000+found:acc
   },-1)
   if(index<0){toast.value='未找到对应证据卡片';window.setTimeout(()=>toast.value='',1500);return}
@@ -113,12 +148,12 @@ function exportAnswer(message:Message):void{
   const url=URL.createObjectURL(blob);const anchor=document.createElement('a');anchor.href=url;anchor.download=`知识库回答-${new Date().toISOString().slice(0,10)}.txt`;anchor.click();URL.revokeObjectURL(url)
 }
 
-function askSuggestion(content:string):void{emit('retry',{content,strategy:strategy.value,scope:retrievalScope()})}
+function askSuggestion(content:string):void{if(!props.sending&&!scopeError.value)void props.submitMessage({content,strategy:strategy.value,scope:retrievalScope()})}
 
 function onKeydown(e: KeyboardEvent): void {
-  if (e.key === 'Enter' && !e.shiftKey) {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault()
-    submit()
+    void submit()
   }
 }
 
@@ -127,8 +162,16 @@ function sourceLabel(source: SourceItem, index: number): string {
 }
 
 function sourceLocation(source: SourceItem): string {
-  return [source.section, source.page != null ? `第 ${source.page} 页` : ''].filter(Boolean).join(' · ')
+  return [source.section, pageLabel(source.page)].filter(Boolean).join(' · ')
 }
+
+function openSourceDocument(): void {
+  const source=selectedSource.value
+  if(source?.document_id)navigate({page:'documents',kb:source.knowledge_base_id||props.knowledgeBaseId,document:source.document_id,chunk:source.chunk_id||''})
+}
+
+const diagnosticNames: Record<string,string> = {vector:'向量检索',bm25:'关键词检索',reranker:'重排',embedding:'问题向量',graph:'知识图谱',code:'代码检索'}
+const diagnosticStatuses: Record<string,string> = {ok:'正常',degraded:'已降级',error:'不可用',skipped:'已跳过'}
 
 function sourceChannels(source: SourceItem): string[] {
   return [...new Set(source.retrieval_channels || [])].map((item) => channelNames[item] || item)
@@ -226,6 +269,7 @@ watch(() => {
 }, () => scheduleScroll())
 
 onBeforeUnmount(() => {
+  sourceRequest++
   if (scrollFrame != null) window.cancelAnimationFrame(scrollFrame)
 })
 </script>
@@ -250,21 +294,27 @@ onBeforeUnmount(() => {
           <template v-else>
             <header class="assistant-header">
               <span class="assistant-avatar">AI</span>
-              <div><strong>知识库助手</strong><small>基于当前知识库生成</small></div>
+              <div><strong>知识库助手</strong><small>基于本次选择的检索范围</small></div>
               <span v-if="m.status === 'completed'" class="answer-state">回答完成</span>
-              <span v-else-if="m.status === 'stopped'" class="answer-state stopped">已停止</span>
+              <span v-else-if="['stopped','interrupted'].includes(m.status)" class="answer-state stopped">已停止</span>
             </header>
 
             <div class="answer-body">
               <div v-if="m.status === 'streaming'" class="streaming-answer">{{ m.content }}</div>
-              <AnswerContent v-else :content="m.content" @citation="scrollToSource" />
+              <AnswerContent v-else :content="m.content" @citation="label => scrollToSource(label,m.id)" />
               <span v-if="m.status === 'streaming'" class="cursor">▍</span>
               <div v-if="m.status === 'failed'" class="failed">
                 <strong>回答生成失败</strong>
                 <span>{{ m.error_message || '请稍后重试' }}</span>
               </div>
               <div v-if="m.status==='completed'&&(!m.sources||!m.sources.length)" class="no-evidence"><b>未找到可核验来源</b><span>本次回答没有返回文档证据，建议缩小问题范围或切换为深度检索。</span></div>
-              <div v-if="['completed','stopped'].includes(m.status)" class="answer-actions">
+              <div v-if="m.route?.retrieval_diagnostics?.some(item=>['degraded','error'].includes(item.status))" class="quality-notice" role="status">部分检索服务已降级或不可用，结果可能不完整；请展开“检索状态”查看原因。</div>
+              <div v-if="m.route?.evidence_status==='unavailable'" class="quality-notice">检索服务不可用，本次未能核实资料。请稍后重试或联系管理员。</div>
+              <div v-else-if="m.route?.evidence_status==='insufficient'" class="quality-notice">本次证据不足，请补充资料或调整问题。</div>
+              <p v-if="m.status==='completed'&&m.route?.citation_validation?.status==='valid'" class="citation-validation">引用编号已校验；结论与原文是否一致仍需核对。</p>
+              <p v-else-if="m.route?.citation_validation?.status==='invalid'" class="quality-notice">回答含无效引用编号：{{m.route.citation_validation.invalid_ids?.join('、')}}。请核对来源后使用。</p>
+              <p v-else-if="m.status==='completed'&&m.sources?.length" class="citation-validation">引用支持关系未校验，请结合原文核对。</p>
+              <div v-if="['completed','stopped','interrupted'].includes(m.status)" class="answer-actions">
                 <button @click="copyAnswer(m.content)">复制</button><button @click="exportAnswer(m)">导出</button>
                 <span></span><button :class="{selected:m.feedback==='helpful'}" :disabled="!m.id" @click="emit('feedback',{messageId:m.id,rating:'helpful'})">有帮助</button><button :class="{selected:m.feedback==='unhelpful'}" :disabled="!m.id" @click="emit('feedback',{messageId:m.id,rating:'unhelpful'})">需改进</button>
               </div>
@@ -276,7 +326,7 @@ onBeforeUnmount(() => {
               <div class="artifact-images">
                 <figure v-for="(image,index) in messageImages(m)" :key="image.url">
                   <img :src="imageUrl(image)" :alt="image.caption||image.filename||`图片 ${index+1}`" loading="lazy" @click="openImagePreview(imageUrl(image),image.caption||image.filename||`图片 ${index+1}`)" />
-                  <figcaption><b>{{image.caption||image.filename||`图片 ${index+1}`}}</b><small>{{[image.knowledge_base_name,image.page!=null?`第 ${image.page} 页`:'',image.citation_id].filter(Boolean).join(' · ')}}</small></figcaption>
+                  <figcaption><b>{{image.caption||image.filename||`图片 ${index+1}`}}</b><small>{{[image.knowledge_base_name,pageLabel(image.page),image.citation_id].filter(Boolean).join(' · ')}}</small></figcaption>
                 </figure>
               </div>
             </section>
@@ -327,6 +377,7 @@ onBeforeUnmount(() => {
                     <b>{{ channelNames[name] || name }}</b><span>{{ result.count }} 条 · {{ result.elapsed_ms }} ms</span>
                   </div>
                 </div>
+                <div v-if="m.route.retrieval_diagnostics?.length" class="channel-results"><div v-for="(result,index) in m.route.retrieval_diagnostics" :key="index"><b>{{diagnosticNames[result.channel]||result.channel}} · {{diagnosticStatuses[result.status]||result.status}}</b><span>{{result.count}} 条 · {{result.elapsed_ms}} ms</span><small v-if="result.status!=='ok'">{{result.detail||result.code}}</small></div></div>
               </div>
             </details>
           </template>
@@ -344,6 +395,7 @@ onBeforeUnmount(() => {
       <select v-if="scopeKind==='tag'" v-model="scopeValue"><option value="">请选择标签</option><option v-for="item in tags" :key="item.id" :value="item.id">{{item.name}}</option></select>
       <small>当前：{{scopeName()}}</small>
     </div>
+    <p v-if="scopeError" class="scope-error" role="alert">{{scopeError}}</p>
     <div class="composer">
       <select v-model="strategy" class="strategy" aria-label="检索策略">
         <option value="fast">快速</option>
@@ -359,7 +411,7 @@ onBeforeUnmount(() => {
         @keydown="onKeydown"
       ></textarea>
       <button v-if="sending" class="send-btn stop" @click="emit('stop')"><span>停止生成</span></button>
-      <button v-else class="send-btn" :disabled="!draft.trim()" @click="submit">
+      <button v-else class="send-btn" :disabled="!draft.trim()||!!scopeError" @click="submit">
         <span>发送</span>
       </button>
     </div>
@@ -367,10 +419,12 @@ onBeforeUnmount(() => {
     <div v-if="drawerPreview" class="drawer-mask" @click.self="drawerPreview=null"><div class="image-preview-body"><img :src="drawerPreview.url" :alt="drawerPreview.alt" /><button class="preview-close" @click="drawerPreview=null">×</button></div></div>
     <div v-if="selectedSource" class="drawer-mask" @click.self="selectedSource=null"><aside class="source-drawer"><header><div><strong>{{selectedSource.source}}</strong><small>{{sourceLocation(selectedSource) || '来源证据'}}</small></div><button @click="selectedSource=null">×</button></header><div class="drawer-body">
       <div class="evidence-id">{{selectedSource.citation_id||'来源详情'}}</div>
+      <button v-if="selectedSource.document_id" class="open-document" @click="openSourceDocument">在文档中定位此片段</button>
       <p v-if="sourceLoading">正在读取原始片段…</p>
       <template v-else>
         <div v-if="chunkDetail?.previous?.length" class="context-block prev"><span class="context-label">前文 · #{{ chunkDetail.previous[chunkDetail.previous.length-1].chunk_index }}</span><p>{{ chunkDetail.previous[chunkDetail.previous.length-1].content }}</p></div>
-        <p class="full-evidence current">{{ chunkDetail?.content || sourceChunk?.content || selectedSource.preview || '暂无可显示的原始片段。' }}</p>
+        <p v-if="sourceError" class="failed">{{sourceError}}</p>
+        <p class="full-evidence current">{{ chunkDetail?.content || selectedSource.preview || '暂无可显示的原始片段。' }}</p>
         <div v-if="chunkDetail?.next?.length" class="context-block next"><span class="context-label">后文 · #{{ chunkDetail.next[0].chunk_index }}</span><p>{{ chunkDetail.next[0].content }}</p></div>
         <div v-if="chunkDetail?.images?.length" class="drawer-images">
           <img v-for="(image, index) in chunkDetail.images" :key="index" :src="imageUrl(image)" :alt="image.caption || image.filename" loading="lazy" @click="openImagePreview(imageUrl(image), image.caption || image.filename)" />
@@ -381,6 +435,7 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+.scope-error{margin:0;padding:6px 20px;color:#a45113;background:#fff7e8;font-size:12px}.quality-notice{margin:10px 0;padding:9px 12px;border-radius:8px;background:#fff4df;color:#875010;font-size:12px}.citation-validation{font-size:11px;color:#68788a}.channel-results small{display:block;color:#946418}.open-document{margin:8px 0;padding:7px 10px;border:1px solid #cbdaf1;border-radius:7px;background:#f4f8ff;color:#315ea4}
 .chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; overflow: hidden; background: #f7f9fc; }
 .messages { min-height: 0; flex: 1; display: flex; flex-direction: column; gap: 20px; overflow-y: auto; padding: 24px clamp(18px,3vw,42px) 18px; }
 .state-tip { display: flex; justify-content: center; align-items: center; gap: 8px; margin-top: 45px; color: #8c98a9; font-size: 13px; }

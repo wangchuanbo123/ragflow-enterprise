@@ -114,6 +114,7 @@ def build_context(
     *,
     max_chunks: int | None = None,
     max_tokens: int | None = None,
+    max_chunks_per_source: int | None = None,
 ) -> tuple[str, list[dict]]:
     """构建上下文文本和来源列表。
 
@@ -154,7 +155,7 @@ def build_context(
     for doc in deduped:
         source = _normalize_source(doc.metadata.get("source"))
         source_key = f"{doc.metadata.get('knowledge_base_id', '')}:{source}"
-        if source_counts.get(source_key, 0) >= MAX_CHUNKS_PER_SOURCE:
+        if source_counts.get(source_key, 0) >= (max_chunks_per_source or MAX_CHUNKS_PER_SOURCE):
             continue
         source_counts[source_key] = source_counts.get(source_key, 0) + 1
         quota_filtered.append(doc)
@@ -178,15 +179,11 @@ def build_context(
         if remaining <= 10:
             break
 
-        content = _truncate_at_boundary(content, remaining)
         images = decode_images(doc.metadata.get("images"))
         images = images[:IMAGE_CONTEXT_MAX_PER_CHUNK]
         code_snippets = _code_snippets(doc, source)
         if images or IMAGE_PLACEHOLDER_PATTERN.search(content):
             content = _render_image_references(content, images)
-        content_tokens = count_tokens(content)
-        used_tokens += content_tokens
-
         # Build context block
         lines = [f"[{citation_id}]"]
         if doc.metadata.get("knowledge_base_name"):
@@ -198,9 +195,16 @@ def build_context(
             lines.append(f"章节：{section}")
         graph_facts = doc.metadata.get("graph_facts")
         if graph_facts:
-            lines.append("图谱事实：" + "; ".join(graph_facts[:3]))
+            lines.append("图谱事实：" + _truncate_at_boundary("; ".join(graph_facts[:3]), min(200, max(10, remaining // 4))))
+        overhead = count_tokens("\n".join(lines) + "\n内容：")
+        if remaining <= overhead + 10:
+            break
+        content = _truncate_at_boundary(content, remaining - overhead)
         lines.append(f"内容：{content}")
-        context_parts.append("\n".join(lines))
+        block = "\n".join(lines)
+        # Count labels, graph facts and separators as part of the same budget.
+        used_tokens += count_tokens(block + "\n\n")
+        context_parts.append(block)
 
         sources.append({
             "citation_id": citation_id,
@@ -217,6 +221,8 @@ def build_context(
             "code_snippets": code_snippets,
             "fusion_score": doc.metadata.get("fusion_score", 0.0),
             "relevance_score": doc.metadata.get("relevance_score"),
+            "vector_score": doc.metadata.get("vector_score"),
+            "retrieval_diagnostics": doc.metadata.get("retrieval_diagnostics", []),
             "knowledge_base_id": doc.metadata.get("knowledge_base_id", ""),
             "knowledge_base_name": doc.metadata.get("knowledge_base_name", ""),
         })

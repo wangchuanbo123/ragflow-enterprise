@@ -7,6 +7,7 @@ import json
 import math
 import re
 from collections import defaultdict, deque
+from copy import deepcopy
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
@@ -45,16 +46,14 @@ from app.models.knowledge_base import KnowledgeBase
 from app.models.knowledge_chunk import KnowledgeChunk
 from app.models.knowledge_document import KnowledgeDocument
 from app.models.knowledge_graph import KgAlias, KgEntity, KgEntityMention, KgRelation, KgRelationEvidence
-from app.repositories.index_job_repository import IndexJobRepository
+from app.repositories.index_job_repository import IndexJobRepository, signal_persisted_job
+from app.services.knowledge_mutation import knowledge_mutation_lock, serialized_knowledge_mutation
 from rag.knowledge_graph.schemas import ChunkExtraction, VALID_ENTITY_TYPES, VALID_PREDICATES
 from rag.knowledge_graph.profiles import (
-    BUSINESS_GRAPH_PROFILE_ORDER,
-    get_graph_profile,
     profile_catalog,
-    profile_schema,
 )
 
-GRAPH_KIND_ORDER = ("general", *BUSINESS_GRAPH_PROFILE_ORDER)
+GRAPH_KIND_ORDER = ("general",)
 VALID_GRAPH_KINDS = set(GRAPH_KIND_ORDER)
 
 
@@ -121,15 +120,18 @@ class GraphGovernanceService:
                 max_attempts=INDEX_JOB_MAX_ATTEMPTS,
                 options_json={"trigger": "graph_governance_edit"},
             ))
-            self.task_queue.enqueue(job.id)
+            signal_persisted_job(self.task_queue, job.id)
 
-    def list_schemas(self, graph_kind: str | None = None) -> list[GraphSchemaDefinition]:
+    def list_schemas(self, graph_kind: str | None = None, *, include_legacy: bool = False) -> list[GraphSchemaDefinition]:
         stmt = select(GraphSchemaDefinition).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id
         )
         if graph_kind:
-            self._validate_graph_kind(graph_kind)
+            if graph_kind != "general" and not include_legacy:
+                self._validate_graph_kind(graph_kind)
             stmt = stmt.where(GraphSchemaDefinition.graph_kind == graph_kind)
+        elif not include_legacy:
+            stmt = stmt.where(GraphSchemaDefinition.graph_kind == "general")
         return list(self.db.scalars(stmt.order_by(GraphSchemaDefinition.version.desc())))
 
     def list_graph_profiles(self) -> list[dict]:
@@ -140,6 +142,10 @@ class GraphGovernanceService:
             active = self.active_schema(graph_kind=kind, create_default=False)
             active_entities = set(active.entity_types_json or []) if active else set()
             active_relations = set(active.relation_types_json or []) if active else set()
+            if active:
+                from rag.knowledge_graph.profiles import profiles_for_schema
+                summary = active.generation_summary_json or {}
+                profile = profiles_for_schema(active.entity_types_json, active.relation_types_json, summary.get("entity_type_details"), summary.get("relation_type_details"))["general"]
             entity_types = {item["name"] for item in profile["entity_types"]}
             relation_types = {item["name"] for item in profile["relation_types"]}
             entity_filters = [KgEntity.knowledge_base_id == self.knowledge_base_id]
@@ -165,7 +171,7 @@ class GraphGovernanceService:
     @staticmethod
     def _validate_graph_kind(graph_kind: str) -> str:
         if graph_kind not in VALID_GRAPH_KINDS:
-            raise ValueError("不支持的图谱类型")
+            raise ValueError("仅支持知识库总图谱 general，独立专业图谱已停用")
         return graph_kind
 
     def _next_schema_version(self) -> int:
@@ -184,87 +190,91 @@ class GraphGovernanceService:
         invalid = [item for item in [*entities, *relations] if not pattern.fullmatch(item)]
         if invalid:
             raise ValueError(f"Schema 类型必须是 1-32 位大写字母、数字或下划线：{invalid}")
-        if len(entities) > 100 or len(relations) > 100:
-            raise ValueError("实体类型和关系类型分别不能超过 100 个")
+        if len(entities) > 500 or len(relations) > 500:
+            raise ValueError("实体类型和关系类型分别不能超过 500 个")
         return entities, relations
 
     def active_schema(
         self, *, graph_kind: str = "general", create_default: bool = True
     ) -> GraphSchemaDefinition | None:
         self._validate_graph_kind(graph_kind)
-        schema = self.db.scalar(select(GraphSchemaDefinition).where(
+        schema = self._read_active_schema(graph_kind)
+        # MCP and startup must be able to read existing contracts while a
+        # worker owns this KB's write lock across its agent/tool round trips.
+        if schema is not None or not create_default:
+            return schema
+        with knowledge_mutation_lock(self.knowledge_base_id):
+            # Another API/startup may have initialized this kind while we
+            # waited. Allocate a version only after checking under the lock.
+            schema = self._read_active_schema(graph_kind)
+            if schema is not None:
+                return schema
+            return self._create_default_schema(graph_kind)
+
+    def _read_active_schema(self, graph_kind: str) -> GraphSchemaDefinition | None:
+        return self.db.scalar(select(GraphSchemaDefinition).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
             GraphSchemaDefinition.graph_kind == graph_kind,
             GraphSchemaDefinition.status == "active",
-        ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
-        if schema is None and create_default:
-            contract = profile_schema(graph_kind) if graph_kind != "general" else {
-                "entity_types": sorted(VALID_ENTITY_TYPES),
-                "relation_types": sorted(VALID_PREDICATES),
-                "graph_profiles": None,
-                "extraction_prompt": None,
-            }
-            schema = GraphSchemaDefinition(
-                knowledge_base_id=self.knowledge_base_id,
-                graph_kind=graph_kind,
-                version=self._next_schema_version(),
-                status="active",
-                entity_types_json=contract["entity_types"],
-                relation_types_json=contract["relation_types"],
-                graph_profiles_json=contract["graph_profiles"],
-                extraction_prompt=contract["extraction_prompt"],
-                generation_method="builtin" if graph_kind != "general" else "manual",
-                normalization_rules_json={
-                    "unicode": "NFKC", "case": "lower_ascii", "trim_punctuation": True,
-                },
-                activated_at=datetime.utcnow(),
-            )
-            self.db.add(schema)
-            try:
-                self.db.commit()
-            except IntegrityError:
-                self.db.rollback()
-                schema = self.db.scalar(select(GraphSchemaDefinition).where(
-                    GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
-                    GraphSchemaDefinition.graph_kind == graph_kind,
-                    GraphSchemaDefinition.status == "active",
-                ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
-                if schema is None:
-                    raise
-            self.db.refresh(schema)
+        ).order_by(GraphSchemaDefinition.version.desc()).limit(1).execution_options(populate_existing=True))
+
+    def _create_default_schema(self, graph_kind: str) -> GraphSchemaDefinition:
+        """Called only inside the KB write lock, after the second existence check."""
+        contract = {
+            "entity_types": sorted(VALID_ENTITY_TYPES),
+            "relation_types": sorted(VALID_PREDICATES),
+            "graph_profiles": None,
+            "extraction_prompt": None,
+        }
+        schema = GraphSchemaDefinition(
+            knowledge_base_id=self.knowledge_base_id,
+            graph_kind=graph_kind,
+            version=self._next_schema_version(),
+            status="active",
+            entity_types_json=contract["entity_types"],
+            relation_types_json=contract["relation_types"],
+            graph_profiles_json=contract["graph_profiles"],
+            extraction_prompt=contract["extraction_prompt"],
+            generation_method="manual",
+            normalization_rules_json={
+                "unicode": "NFKC", "case": "lower_ascii", "trim_punctuation": True,
+            },
+            activated_at=datetime.utcnow(),
+        )
+        self.db.add(schema)
+        try:
+            self.db.commit()
+        except IntegrityError:
+            self.db.rollback()
+            schema = self._read_active_schema(graph_kind)
+            if schema is None:
+                raise
+        self.db.refresh(schema)
         return schema
 
-    def extraction_schema(self) -> SimpleNamespace:
-        """Merge independent active contracts only for a single efficient LLM pass."""
-        schemas = [self.active_schema(graph_kind=kind) for kind in GRAPH_KIND_ORDER]
-        schemas = [schema for schema in schemas if schema is not None]
-        prompts = [
-            f"【{get_graph_profile(schema.graph_kind)['label']}】\n{schema.extraction_prompt}"
-            for schema in schemas if schema.extraction_prompt
-        ]
-        return SimpleNamespace(
-            id="effective:" + ":".join(str(schema.version) for schema in schemas),
-            version=max((schema.version for schema in schemas), default=GRAPH_SCHEMA_VERSION),
-            entity_types_json=sorted({item for schema in schemas for item in (schema.entity_types_json or [])}),
-            relation_types_json=sorted({item for schema in schemas for item in (schema.relation_types_json or [])}),
-            normalization_rules_json=(
-                self.active_schema(graph_kind="general").normalization_rules_json or {}
-            ),
-            extraction_prompt="\n\n".join(prompts) or None,
-            graph_profiles_json={
-                schema.graph_kind: get_graph_profile(schema.graph_kind)
-                for schema in schemas if schema.graph_kind != "general"
-            },
-            generation_summary_json={
-                "relation_type_details": [
-                    detail
-                    for schema in schemas
-                    for detail in ((schema.generation_summary_json or {}).get("relation_type_details") or [])
-                ],
-                "graph_kinds": [schema.graph_kind for schema in schemas],
-            },
-        )
+    def ensure_total_schema(self):
+        """Repair legacy seed/restore rows only when necessary, under the KB lock."""
+        rows = list(self.db.scalars(select(GraphSchemaDefinition).where(
+            GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
+            GraphSchemaDefinition.status == "active")))
+        if len(rows) == 1 and rows[0].graph_kind == "general" and not rows[0].graph_profiles_json:
+            return rows[0]
+        if rows:
+            from app.services.schema_consolidation import consolidate_connection
+            with knowledge_mutation_lock(self.knowledge_base_id):
+                consolidate_connection(self.db.connection(), self.knowledge_base_id)
+                self.db.commit()
+                self.db.expire_all()
+        return self.active_schema()
 
+    def extraction_schema(self) -> SimpleNamespace:
+        """Detached snapshot of the sole active total Schema, safe for worker threads."""
+        schema = self.active_schema()
+        return SimpleNamespace(**{name: deepcopy(getattr(schema, name)) for name in (
+            "id", "version", "entity_types_json", "relation_types_json", "normalization_rules_json",
+            "extraction_prompt", "graph_profiles_json", "generation_summary_json")})
+
+    @serialized_knowledge_mutation
     def create_schema(
         self, *, entity_types: list[str], relation_types: list[str],
         normalization_rules: dict, extraction_prompt: str | None, created_by: str | None,
@@ -275,6 +285,8 @@ class GraphGovernanceService:
         graph_kind: str = "general",
     ) -> GraphSchemaDefinition:
         self._validate_graph_kind(graph_kind)
+        if graph_profiles:
+            raise ValueError("独立专业图谱定义已停用，请在总Schema中定义类型与关系")
         entity_types, relation_types = self._validate_schema_types(
             entity_types, relation_types
         )
@@ -298,6 +310,7 @@ class GraphGovernanceService:
         self.db.refresh(schema)
         return schema
 
+    @serialized_knowledge_mutation
     def update_schema(
         self, schema_id: str, *, entity_types: list[str], relation_types: list[str],
         normalization_rules: dict, extraction_prompt: str | None,
@@ -306,9 +319,12 @@ class GraphGovernanceService:
         schema = self.db.scalar(select(GraphSchemaDefinition).where(
             GraphSchemaDefinition.id == schema_id,
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
-        ))
+        ).execution_options(populate_existing=True))
         if schema is None:
             return None
+        self._validate_graph_kind(schema.graph_kind)
+        if graph_profiles:
+            raise ValueError("独立专业图谱定义已停用")
         if schema.status != "draft":
             raise ValueError("仅草稿 Schema 可以直接修改；请复制活动版本创建新草稿")
         entities, relations = self._validate_schema_types(entity_types, relation_types)
@@ -397,47 +413,8 @@ class GraphGovernanceService:
             return "prompt_change"
         return "unchanged"
 
-    def create_profile_schema(
-        self,
-        *,
-        graph_kind: str,
-        created_by: str | None,
-    ) -> GraphSchemaDefinition:
-        """Create one reviewable Schema for exactly one business graph."""
-        contract = profile_schema(graph_kind)
-        profile = contract["graph_profiles"][graph_kind]
-        entity_details = []
-        relation_details = []
-        for item in profile["entity_types"]:
-            entity_details.append({
-                "name": item["name"], "description": item["label"],
-                "graph_kind": graph_kind, "aliases": [], "exclusions": [],
-            })
-        for item in profile["relation_types"]:
-            relation_details.append({
-                **item, "description": item["label"],
-                "direction": "directed", "graph_kind": graph_kind,
-            })
-        return self.create_schema(
-            graph_kind=graph_kind,
-            entity_types=contract["entity_types"],
-            relation_types=contract["relation_types"],
-            graph_profiles=contract["graph_profiles"],
-            normalization_rules={
-                "unicode": "NFKC",
-                "case": "lower_ascii",
-                "trim_punctuation": True,
-            },
-            extraction_prompt=contract["extraction_prompt"],
-            created_by=created_by,
-            generation_method="profile_template",
-            generation_summary={
-                "graph_kind": graph_kind,
-                "design": "independent_schema_shared_canonical_graph",
-                "entity_type_details": entity_details,
-                "relation_type_details": relation_details,
-            },
-        )
+    def create_profile_schema(self, *, graph_kind: str, created_by: str | None):
+        raise ValueError("独立专业图谱模板已停用，请生成或编辑知识库总Schema")
 
     def _new_type_tokens(self, schema: GraphSchemaDefinition) -> list[str]:
         previous = self.db.scalar(select(GraphSchemaDefinition).where(
@@ -582,6 +559,7 @@ class GraphGovernanceService:
                 pruned_entities += len(entity_ids)
         return {"pruned_entities": pruned_entities, "pruned_relations": pruned_relations}
 
+    @serialized_knowledge_mutation
     def activate_schema(
         self,
         schema_id: str,
@@ -593,14 +571,11 @@ class GraphGovernanceService:
         schema = self.db.scalar(select(GraphSchemaDefinition).where(
             GraphSchemaDefinition.id == schema_id,
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
-        ))
+        ).execution_options(populate_existing=True))
         if schema is None:
             return None
-        previous = self.db.scalar(select(GraphSchemaDefinition).where(
-            GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
-            GraphSchemaDefinition.graph_kind == schema.graph_kind,
-            GraphSchemaDefinition.status == "active",
-        ).order_by(GraphSchemaDefinition.version.desc()).limit(1))
+        self._validate_graph_kind(schema.graph_kind)
+        previous = self._read_active_schema(schema.graph_kind)
         kind = self.schema_change_kind(previous, schema)
         # 差异必须在切换 active 状态之前计算，否则会与新 Schema 自身求差。
         addition_tokens = (
@@ -614,19 +589,6 @@ class GraphGovernanceService:
         ).values(status="superseded"))
         schema.status = "active"
         schema.activated_at = datetime.utcnow()
-
-        if schema.graph_kind != "general":
-            # Professional schemas share the canonical store. Re-extract with
-            # the new effective contract instead of deleting facts that may
-            # still belong to the general or another professional schema.
-            if kind != "unchanged":
-                self.db.execute(update(KnowledgeChunk).where(
-                    KnowledgeChunk.knowledge_base_id == self.knowledge_base_id
-                ).values(graph_status="pending"))
-            self.db.commit()
-            self.db.refresh(schema)
-            self._after_schema_activation("domain_change" if kind != "unchanged" else kind)
-            return schema
 
         chunk_scope = update(KnowledgeChunk).where(
             KnowledgeChunk.knowledge_base_id == self.knowledge_base_id
@@ -707,7 +669,7 @@ class GraphGovernanceService:
             },
         )
         repository.create(job)
-        self.task_queue.enqueue(job.id)
+        signal_persisted_job(self.task_queue, job.id)
         return job
 
     def request_automatic_schema_generation(
@@ -721,7 +683,7 @@ class GraphGovernanceService:
         self.active_schema(graph_kind="general")
         existing_schema = self.db.scalar(select(GraphSchemaDefinition.id).where(
             GraphSchemaDefinition.knowledge_base_id == self.knowledge_base_id,
-            GraphSchemaDefinition.generation_method == "document_llm",
+            GraphSchemaDefinition.generation_method.in_(["document_llm", "document_agent"]),
             GraphSchemaDefinition.graph_kind == "general",
         ).limit(1))
         if existing_schema is not None:
@@ -764,7 +726,7 @@ class GraphGovernanceService:
             },
         )
         repository.create(job)
-        self.task_queue.enqueue(job.id)
+        signal_persisted_job(self.task_queue, job.id)
         return job
 
     def _after_schema_activation(self, kind: str) -> None:
@@ -845,7 +807,7 @@ class GraphGovernanceService:
             options_json={**resolved, **(options or {})},
         )
         repository.create(job)
-        self.task_queue.enqueue(job.id)
+        signal_persisted_job(self.task_queue, job.id)
         return job
 
     def _pending_chunk_count(self) -> int:
@@ -887,7 +849,7 @@ class GraphGovernanceService:
                 if threshold_met or max_wait_elapsed:
                     existing.visible_at = now
                     self.db.commit()
-                    self.task_queue.enqueue(existing.id)
+                    signal_persisted_job(self.task_queue, existing.id)
                 else:
                     # Sliding debounce: each new completed document postpones the
                     # build, but never beyond the hard deadline from job creation.

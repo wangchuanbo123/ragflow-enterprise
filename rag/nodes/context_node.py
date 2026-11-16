@@ -15,11 +15,14 @@ def context_node(state):
         docs,
         max_chunks=policy.context_chunks,
         max_tokens=policy.context_tokens,
+        max_chunks_per_source=policy.source_chunks,
     )
 
     result = {
         "context": context,
         "sources": sources,
+        "route": {**(state.get("route") or {}), "evidence_status": "sufficient" if sources else (
+            "unavailable" if any(item.get("status") == "error" for item in (state.get("route") or {}).get("retrieval_diagnostics", [])) else "insufficient")},
     }
     snapshot = export_context_snapshot({**state, **result})
     if snapshot is not None:

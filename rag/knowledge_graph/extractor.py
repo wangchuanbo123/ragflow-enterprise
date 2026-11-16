@@ -70,6 +70,7 @@ def parse_extraction_response(
     entity_types: set[str] | frozenset[str] | None = None,
     relation_types: set[str] | frozenset[str] | None = None,
     relation_constraints: dict[str, tuple[set[str], set[str]]] | None = None,
+    endpoint_variants: dict[str, list[tuple[set[str], set[str]]]] | None = None,
 ) -> ChunkExtraction:
     """解析 LLM 输出为校验后的 ChunkExtraction。
 
@@ -169,6 +170,12 @@ def parse_extraction_response(
         if rel.subject == rel.object:
             rejected_relations += 1
             continue
+        variants = (endpoint_variants or {}).get(rel.predicate)
+        if variants and not any((not sources or valid_entities[rel.subject].type in sources)
+                                and (not targets or valid_entities[rel.object].type in targets)
+                                for sources, targets in variants):
+            rejected_relations += 1
+            continue
         constraint = (relation_constraints or {}).get(rel.predicate)
         if constraint is not None:
             source_types, target_types = constraint
@@ -235,6 +242,7 @@ class GraphExtractor:
         self.entity_types = set(VALID_ENTITY_TYPES)
         self.relation_types = set(VALID_PREDICATES)
         self.relation_constraints: dict[str, tuple[set[str], set[str]]] = {}
+        self.relation_constraint_variants = {}
         self.prompt_prefix: str | None = None
 
     def configure_schema(
@@ -249,21 +257,25 @@ class GraphExtractor:
         self.entity_types = set(entity_types or VALID_ENTITY_TYPES)
         self.relation_types = set(relation_types or VALID_PREDICATES)
         self.relation_constraints = {}
+        self.relation_constraint_variants = {}
         for item in relation_constraints or []:
             predicate = str(item.get("name") or "").strip().upper()
             if predicate not in self.relation_types:
                 continue
+            variants = item.get("endpoint_variants")
+            if not isinstance(variants, list) or not variants:
+                variants = [item]
+            pairs = self.relation_constraint_variants.setdefault(predicate, [])
+            for variant in variants:
+                # Preserve explicit endpoints even if a later draft removed a
+                # type. An unavailable endpoint means no legal match, never an
+                # empty-set wildcard that broadens the relationship.
+                source = {str(value).strip().upper() for value in variant.get("source_types", []) if str(value).strip()}
+                target = {str(value).strip().upper() for value in variant.get("target_types", []) if str(value).strip()}
+                pairs.append((source, target))
             self.relation_constraints[predicate] = (
-                {
-                    str(value).strip().upper()
-                    for value in item.get("source_types", [])
-                    if str(value).strip().upper() in self.entity_types
-                },
-                {
-                    str(value).strip().upper()
-                    for value in item.get("target_types", [])
-                    if str(value).strip().upper() in self.entity_types
-                },
+                set().union(*(a for a, b in pairs)) if all(a for a, b in pairs) else set(),
+                set().union(*(b for a, b in pairs)) if all(b for a, b in pairs) else set(),
             )
         self.prompt_prefix = prompt_prefix
 
@@ -309,6 +321,7 @@ class GraphExtractor:
                     self.entity_types,
                     self.relation_types,
                     self.relation_constraints,
+                    self.relation_constraint_variants,
                 )
             except Exception as exc:
                 last_error = exc
@@ -402,6 +415,7 @@ class GraphExtractor:
                             self.entity_types,
                             self.relation_types,
                             self.relation_constraints,
+                            self.relation_constraint_variants,
                         )
                     except Exception as exc:
                         parse_errors.append(f"{chunk_id}: {exc}")

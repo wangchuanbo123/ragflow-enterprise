@@ -19,6 +19,14 @@ from app.schemas.conversation import (
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 
+def _ensure_access(db: Session, conv, current_user: User):
+    if not conv or not KnowledgeBaseRepository(db).can_read(
+        conv.knowledge_base_id, current_user.id, is_admin=current_user.role == "admin"
+    ):
+        raise not_found("会话不存在")
+    return conv
+
+
 def _repo(db: Session) -> ConversationRepository:
     return ConversationRepository(db)
 
@@ -48,12 +56,11 @@ def list_conversations(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    knowledge_base_ids = None
-    if current_user.role != "admin":
-        knowledge_base_ids = {
-            item.id
-            for item in KnowledgeBaseRepository(db).list_for_user(current_user.id)
-        }
+    knowledge_base_ids = {
+        item.id for item in KnowledgeBaseRepository(db).list_for_user(
+            current_user.id, is_admin=current_user.role == "admin"
+        )
+    }
     return _repo(db).list_by_user(current_user.id, knowledge_base_ids)
 
 
@@ -64,8 +71,7 @@ def get_conversation(
     current_user: User = Depends(get_current_user),
 ):
     conv = _repo(db).get_detail_for_user(conversation_id, current_user.id)
-    if not conv:
-        raise not_found("会话不存在")
+    _ensure_access(db, conv, current_user)
     return conv
 
 
@@ -77,8 +83,7 @@ def update_conversation(
     current_user: User = Depends(get_current_user),
 ):
     conv = _repo(db).get_for_user(conversation_id, current_user.id)
-    if not conv:
-        raise not_found("会话不存在")
+    _ensure_access(db, conv, current_user)
     return _repo(db).rename(conv, payload.title)
 
 
@@ -89,7 +94,6 @@ def delete_conversation(
     current_user: User = Depends(get_current_user),
 ):
     conv = _repo(db).get_for_user(conversation_id, current_user.id)
-    if not conv:
-        raise not_found("会话不存在")
+    _ensure_access(db, conv, current_user)
     _repo(db).delete(conv)
     return None

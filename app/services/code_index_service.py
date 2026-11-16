@@ -22,7 +22,7 @@ from app.core.config import INDEX_JOB_MAX_ATTEMPTS
 from app.models.code_graph import CodeFile, CodeRelation, CodeSnapshot, CodeSymbol
 from app.models.index_job import IndexJob
 from app.repositories.code_graph_repository import CodeGraphRepository
-from app.repositories.index_job_repository import IndexJobRepository
+from app.repositories.index_job_repository import IndexJobRepository, signal_persisted_job
 from app.repositories.knowledge_base_repository import KnowledgeBaseRepository
 from rag.code_graph.document_source import (
     document_code_parser_version,
@@ -62,6 +62,7 @@ class CodeIndexService:
         self.object_store = object_store
         self.task_queue = task_queue
         self.parser = CodeParser()
+        self._document_source_by_path: dict[str, dict] = {}
 
     def request_index(self, data_source_id: str, requested_by: str | None) -> IndexJob:
         source = KnowledgeBaseRepository(self.db).get_data_source(
@@ -84,9 +85,10 @@ class CodeIndexService:
             requested_by=requested_by,
             total_items=1,
             max_attempts=INDEX_JOB_MAX_ATTEMPTS,
-            options_json={"data_source_id": data_source_id},
+            options_json={"data_source_id": data_source_id,
+                          **({"prepare_archive": True} if (source.config_json or {}).get("archive_pending") else {})},
         ))
-        self.task_queue.enqueue(job.id)
+        signal_persisted_job(self.task_queue, job.id)
         return job
 
     def index_directory(
@@ -97,6 +99,7 @@ class CodeIndexService:
         revision: str = "working-tree",
         merge_document_code: bool = False,
     ) -> dict:
+        self._document_source_by_path.clear()
         root_path = Path(root).resolve()
         candidates = [
             path for path in sorted(root_path.rglob("*"))
@@ -122,6 +125,7 @@ class CodeIndexService:
             known_paths = {path for path, _ in manifest}
             for path, digest in doc_manifest:
                 if path in known_paths:
+                    self._document_source_by_path.pop(path, None)
                     continue
                 manifest.append((path, digest))
                 source_by_path[path] = doc_sources[path]
@@ -156,6 +160,12 @@ class CodeIndexService:
             max_blocks=DOCUMENT_CODE_MAX_BLOCKS,
             min_block_lines=DOCUMENT_CODE_MIN_BLOCK_LINES,
         )
+        self._document_source_by_path = {
+            parsed.path: dict(symbol.metadata["document_source"])
+            for parsed in parsed_files
+            for symbol in parsed.symbols[:1]
+            if symbol.metadata.get("document_source")
+        }
         manifest, source_by_path = manifest_for_document_chunks(parsed_files)
         stats = {
             "documents": len({doc_id for doc_id, _, _ in chunk_contents}),
@@ -176,9 +186,6 @@ class CodeIndexService:
             return {"status": "disabled"}
 
         doc_manifest, doc_sources, doc_stats = self._collect_document_code()
-        if not doc_manifest:
-            return {"status": "no_code_blocks", **doc_stats}
-
         return self._build_snapshot_from_manifest(
             doc_manifest,
             doc_sources,
@@ -423,7 +430,12 @@ class CodeIndexService:
             }
             for future in as_completed(futures):
                 path = futures[future]
-                results[path] = future.result()
+                parsed = future.result()
+                origin = self._document_source_by_path.get(path)
+                if origin:
+                    for symbol in parsed.symbols:
+                        symbol.metadata["document_source"] = dict(origin)
+                results[path] = parsed
         return results
 
     def _resolve_relations(self, snapshot_id: str, symbols_by_key: dict, pending_relations):

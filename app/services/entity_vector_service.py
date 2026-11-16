@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.core.config import INDEX_JOB_MAX_ATTEMPTS, INGEST_BATCH_SIZE
 from app.models.code_graph import EntityVectorIndexState
 from app.models.index_job import IndexJob
-from app.repositories.index_job_repository import IndexJobRepository
+from app.repositories.index_job_repository import IndexJobRepository, signal_persisted_job
 from app.repositories.knowledge_graph_repository import KnowledgeGraphRepository
 from rag.providers.interfaces import VectorIndexRef
 
@@ -48,7 +48,7 @@ class EntityVectorService:
             max_attempts=INDEX_JOB_MAX_ATTEMPTS,
         ))
         queue = task_queue or self.container.task_queue
-        queue.enqueue(job.id)
+        signal_persisted_job(queue, job.id)
         return job
 
     def _entity_document(self, entity, aliases: list[str]):
@@ -187,12 +187,13 @@ class EntityVectorService:
         self.db.commit()
 
         compact_kb = self.knowledge_base_id.replace("-", "")[:12]
-        index_name = f"kg_entities_{compact_kb}_{graph_fingerprint[:12]}"
+        embedding_hash = hashlib.sha256(embedding_fingerprint.encode()).hexdigest()[:12]
+        index_name = f"kg_entities_{compact_kb}_{embedding_hash}_{graph_fingerprint[:12]}"
         index_ref = VectorIndexRef(
             name=index_name,
             knowledge_base_id=self.knowledge_base_id,
             index_version=graph_fingerprint[:12],
-            embedding_profile_id=hashlib.sha256(embedding_fingerprint.encode()).hexdigest()[:12],
+            embedding_profile_id=embedding_hash,
         )
         # A deterministic name may remain after an interrupted build; recreate
         # the staging index so retries are idempotent.
