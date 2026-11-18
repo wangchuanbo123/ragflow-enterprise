@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="340" viewBox="0 0 1200 340" role="img" aria-labelledby="title desc">
+  <title id="title">RAG Enterprise</title>
+  <desc id="desc">Evidence-backed answers, graphs and team workflows</desc>
+  <defs>
+    <linearGradient id="background" x1="0" x2="1" y1="0" y2="1"><stop stop-color="#0b1227"/><stop offset="0.55" stop-color="#102545"/><stop offset="1" stop-color="#103b47"/></linearGradient>
+    <radialGradient id="glow"><stop stop-color="#38bdf8" stop-opacity=".20"/><stop offset="1" stop-color="#38bdf8" stop-opacity="0"/></radialGradient>
+    <linearGradient id="accent" x1="0" x2="1"><stop stop-color="#60a5fa"/><stop offset="1" stop-color="#5eead4"/></linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#94a3b8" stroke-opacity=".055"/></pattern>
+  </defs>
+  <rect width="1200" height="340" rx="22" fill="url(#background)"/>
+  <rect width="1200" height="340" rx="22" fill="url(#grid)"/>
+  <ellipse cx="971" cy="168" rx="260" ry="210" fill="url(#glow)"/>
+  <path d="M64 45h35" stroke="url(#accent)" stroke-width="4" stroke-linecap="round"/>
+  <g font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Microsoft YaHei', Arial, sans-serif">
+    <text x="112" y="50" fill="#8baccb" font-size="12" letter-spacing="2.5">KNOWLEDGE / CODE / EVIDENCE</text>
+    <text x="60" y="143" fill="#f8fafc" font-size="67" font-weight="750" letter-spacing="-2.4">RAG Enterprise</text>
+    <text x="64" y="191" fill="#c7e0f4" font-size="23">Your documents. Your code. Connected knowledge.</text>
+    <g font-family="Inter, 'Segoe UI', Arial, sans-serif" font-size="12" font-weight="600">
+      <rect x="64" y="245" width="66" height="30" rx="8" fill="#1c3557" stroke="#395576"/><text x="97" y="265" fill="#b9d8ff" text-anchor="middle">RAG</text>
+      <rect x="140" y="245" width="147" height="30" rx="8" fill="#1c3557" stroke="#395576"/><text x="213.5" y="265" fill="#b9d8ff" text-anchor="middle">Knowledge Graph</text>
+      <rect x="297" y="245" width="110" height="30" rx="8" fill="#133b46" stroke="#2b6270"/><text x="352" y="265" fill="#99f6e4" text-anchor="middle">Code Graph</text>
+      <rect x="417" y="245" width="96" height="30" rx="8" fill="#133b46" stroke="#2b6270"/><text x="465" y="265" fill="#99f6e4" text-anchor="middle">codecode</text>
+    </g>
+    <g stroke-width="1.5" fill="none">
+      <circle cx="970" cy="169" r="116" stroke="#60a5fa" stroke-opacity=".13" stroke-dasharray="5 9"/>
+      <path d="M970 169L852 95L1022 63L1105 179L1015 280L839 244L852 95M970 169L1022 63M970 169L1105 179M970 169L1015 280M970 169L839 244" stroke="#5b90b8" stroke-opacity=".55"/>
+      <path d="M852 95L1105 179M839 244L1015 280" stroke="#5eead4" stroke-opacity=".30" stroke-dasharray="4 6"/>
+    </g>
+    <g>
+      <circle cx="970" cy="169" r="49" fill="#1e4b69" fill-opacity=".35"/>
+      <circle cx="970" cy="169" r="37" fill="#112d47" stroke="#67e8f9" stroke-width="1.5"/>
+      <text x="970" y="180" text-anchor="middle" fill="#ecfeff" font-size="31" font-weight="700">R</text>
+      <text x="970" y="224" text-anchor="middle" fill="#88aebf" font-size="10" letter-spacing="1">KNOWLEDGE</text>
+      <circle cx="852" cy="95" r="18" fill="#152c47" stroke="#60a5fa"/><path d="M846 86h9l4 4v15h-13zM854 86v5h5M849 96h7M849 100h7" stroke="#93c5fd" stroke-width="1.2" fill="none"/>
+      <circle cx="1022" cy="63" r="12" fill="#173c49" stroke="#5eead4"/><circle cx="1022" cy="63" r="3" fill="#99f6e4"/>
+      <rect x="1084" y="158" width="42" height="42" rx="13" fill="#173c49" stroke="#5eead4"/><path d="M1099 172l-6 7 6 7M1111 172l6 7-6 7M1108 169l-6 20" stroke="#99f6e4" stroke-width="1.6" fill="none"/>
+      <circle cx="1015" cy="280" r="14" fill="#152c47" stroke="#60a5fa"/><path d="M1009 280l4 4 8-9" stroke="#93c5fd" stroke-width="1.5" fill="none"/>
+      <rect x="823" y="228" width="32" height="32" rx="10" fill="#152c47" stroke="#60a5fa"/><path d="M833 237h12M833 244h12M833 251h8" stroke="#93c5fd" stroke-width="1.4"/>
+      <circle cx="910" cy="55" r="3" fill="#60a5fa" fill-opacity=".5"/><circle cx="1132" cy="267" r="3" fill="#5eead4" fill-opacity=".5"/>
+    </g>
+  </g>
+</svg>
