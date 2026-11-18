@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_admin_user
 from app.core.database import get_db
 from app.models.user import User
-from app.schemas.auth import UserCreate, UserOut, UserUpdate
+from app.schemas.auth import RegistrationReviewRequest, UserCreate, UserOut, UserUpdate
 from app.services import user_service
 
 router = APIRouter(prefix="/users", tags=["users"], dependencies=[Depends(get_admin_user)])
@@ -26,3 +26,13 @@ def create_user(payload: UserCreate, db: Session = Depends(get_db)):
 @router.patch("/{user_id}", response_model=UserOut)
 def update_user(user_id: str, payload: UserUpdate, db: Session = Depends(get_db)):
     return user_service.update_user(db, user_id, payload)
+
+
+@router.post("/{user_id}/registration-review", response_model=UserOut)
+def review_registration(
+    user_id: str,
+    payload: RegistrationReviewRequest,
+    current_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+):
+    return user_service.review_registration(db, user_id, payload, current_user.id)

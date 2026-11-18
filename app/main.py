@@ -84,8 +84,8 @@ async def lifespan(app: FastAPI):
         stop_graph_maintenance_scheduler()
         stop_connector_scheduler()
         stop_worker()
-        from app.agents.runtime import stop_managed_opencode
-        stop_managed_opencode()
+        from app.agents.runtime import stop_managed_codecode
+        stop_managed_codecode()
         stop_metrics()
 
 

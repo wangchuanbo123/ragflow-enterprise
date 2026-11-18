@@ -420,8 +420,8 @@ def test_worker_entry_initializes_without_embedded_services_and_owns_runtime(mon
     monkeypatch.setattr(run_worker.signal, "signal", lambda *args: None)
     monkeypatch.setattr("app.core.logger.setup_logging", lambda: None)
     monkeypatch.setattr("app.core.init_db.init_app", lambda **kwargs: calls.append(("initialize", kwargs)))
-    monkeypatch.setattr(runtime, "start_managed_opencode", lambda: calls.append("start-runtime") or {"status": "ok"})
-    monkeypatch.setattr(runtime, "stop_managed_opencode", lambda: calls.append("stop-runtime"))
+    monkeypatch.setattr(runtime, "start_managed_codecode", lambda: calls.append("start-runtime") or {"status": "ok"})
+    monkeypatch.setattr(runtime, "stop_managed_codecode", lambda: calls.append("stop-runtime"))
     monkeypatch.setattr(index_worker, "run_worker_forever", lambda: calls.append("run-worker"))
     monkeypatch.setattr(index_worker, "stop_worker", lambda: calls.append("stop-worker"))
     assert run_worker.main([]) == 0

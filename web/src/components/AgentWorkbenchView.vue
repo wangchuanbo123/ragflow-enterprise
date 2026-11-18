@@ -7,6 +7,8 @@ import { usePermissions } from '../composables/usePermissions'
 import { navigate, navigationState } from '../composables/useNavigation'
 import AnswerContent from './AnswerContent.vue'
 import StructuredResult from './StructuredResult.vue'
+import { codecodeText } from '../systemPresentation'
+import { agentRunPresentation } from '../agents'
 
 const props=defineProps<{knowledgeBaseId:string}>()
 const {canEdit}=usePermissions()
@@ -109,13 +111,13 @@ function actionLabel(action:string):string {
 }
 function timeLabel(value?:string|null):string {return value?new Date(parseAgentTime(value)).toLocaleString():'—'}
 function eventLabel(event:AgentRunEvent):string {
-  if(event.message)return event.message
+  if(event.message)return codecodeText(event.message)
   const data=asRecord(event.data)
   const status=String(data?.status||'')
   const state=({completed:'已完成',running:'执行中',pending:'等待执行',error:'失败',failed:'失败'} as Record<string,string>)[status]||status
-  if(data?.tool)return `工具步骤：${data.tool}${state?` · ${state}`:''}`
+  if(data?.tool)return codecodeText(`工具步骤：${data.tool}${state?` · ${state}`:''}`)
   const kind=String(data?.event||event.type)
-  return ({step:'推理步骤完成',session:'执行会话已创建',tool:'知识工具调用',agent_event:'智能体执行事件'} as Record<string,string>)[kind]||kind
+  return ({step:'推理步骤完成',session:'执行会话已创建',tool:'知识工具调用',agent_event:'智能体执行事件'} as Record<string,string>)[kind]||codecodeText(kind)
 }
 function updateRun(run:AgentRun):void {
   const index=runs.value.findIndex(item=>item.id===run.id)
@@ -238,7 +240,7 @@ async function downloadResult(format:'json'|'markdown'='json'):Promise<void> {
   if(!selected.value||exporting.value)return
   const id=selected.value.id;exporting.value=true
   try{
-    const artifact=await api.getAgentRunArtifact(props.knowledgeBaseId,id)
+    const artifact=agentRunPresentation(await api.getAgentRunArtifact(props.knowledgeBaseId,id))
     if(disposed)return
     const blob=new Blob([format==='json'?JSON.stringify(artifact,null,2):agentRunMarkdown(artifact)],{type:format==='json'?'application/json;charset=utf-8':'text/markdown;charset=utf-8'})
     const url=URL.createObjectURL(blob);const anchor=document.createElement('a');anchor.href=url;anchor.download=`知识智能体-${artifact.task}-${artifact.id}.${format==='json'?'json':'md'}`;anchor.click();window.setTimeout(()=>URL.revokeObjectURL(url),1000)
@@ -274,7 +276,7 @@ onBeforeUnmount(()=>{disposed=true;listRequest++;detailRequest++;evidenceRequest
 <template>
   <div class="agent-page">
     <header class="agent-intro"><div><h2>知识智能体工作台</h2><p>从接入、抽取到知识治理与业务分析，保留任务范围、执行记录、结果和证据。</p></div><button :disabled="loading" @click="loadRuns()">刷新任务</button></header>
-    <p v-if="error" class="agent-error" role="alert">{{error}}</p><p v-if="notice" class="agent-notice" role="status">{{notice}}</p>
+    <p v-if="error" class="agent-error" role="alert">{{codecodeText(error)}}</p><p v-if="notice" class="agent-notice" role="status">{{codecodeText(notice)}}</p>
     <details v-if="canEdit" ref="createPanel" class="create-panel" open><summary>发起知识任务 <small>默认预览，只有明确授权的动作才会应用到知识库</small></summary>
       <form @submit.prevent="submit">
         <div class="form-columns"><label>任务类型<select v-model="form.task" aria-label="智能体任务类型"><option v-for="task in agentTasks" :key="task.id" :value="task.id">{{task.label}}</option></select><small>{{taskCatalog?.description||taskInfo.description}}</small></label>
@@ -310,8 +312,8 @@ onBeforeUnmount(()=>{disposed=true;listRequest++;detailRequest++;evidenceRequest
           <header class="run-header"><div><h3>{{agentTaskLabel(selected.task)}}</h3><small>{{selected.id}}</small></div><span :class="['run-status',selected.status]">{{selected.cancel_requested?'正在取消':agentStatusLabels[selected.status]||selected.status}}</span><button :disabled="exporting" @click="downloadResult('markdown')">导出报告</button><button :disabled="exporting" @click="downloadResult('json')">导出 JSON</button><button v-if="canEdit&&isActiveAgentRun(selected)" :disabled="actionPending||selected.cancel_requested" @click="control('cancel')">取消任务</button><button v-if="canEdit&&['failed','cancelled'].includes(selected.status)" :disabled="actionPending" @click="control('retry')">重试任务</button></header>
           <p class="run-goal">{{selected.instructions}}</p>
           <div class="run-metadata"><span>{{selected.options?.apply?'已授权应用':'分析预览'}}</span><span>{{selected.document_ids?.length?`限定 ${selected.document_ids.length} 份文档`:'整个当前知识库'}}</span><span>开始 {{timeLabel(selected.started_at)}}</span><span>耗时 {{agentElapsed(selected)}}</span><span v-if="selected.attempt">第 {{selected.attempt}} 次执行</span></div>
-          <div class="run-progress" role="progressbar" aria-label="智能体任务进度" :aria-valuenow="agentProgress(selected)" aria-valuemin="0" aria-valuemax="100"><i :style="{width:`${agentProgress(selected)}%`}"></i></div><p v-if="progressMessage" class="progress-message">{{progressMessage}}</p>
-          <p v-if="selected.error_message" class="agent-error" role="alert">{{selected.error_message}}</p>
+          <div class="run-progress" role="progressbar" aria-label="智能体任务进度" :aria-valuenow="agentProgress(selected)" aria-valuemin="0" aria-valuemax="100"><i :style="{width:`${agentProgress(selected)}%`}"></i></div><p v-if="progressMessage" class="progress-message">{{codecodeText(progressMessage)}}</p>
+          <p v-if="selected.error_message" class="agent-error" role="alert">{{codecodeText(selected.error_message)}}</p>
           <div class="usage-grid"><article><small>输入 Token</small><b>{{usage.input_tokens??'—'}}</b></article><article><small>输出 Token</small><b>{{usage.output_tokens??'—'}}</b></article><article><small>总 Token</small><b>{{tokenTotal??'—'}}</b></article><article><small>报告费用</small><b>{{costSummary.label}}</b></article></div>
           <p v-if="tokenTotal===null&&(usage.input_tokens!==undefined||usage.output_tokens!==undefined)" class="hint">服务未提供总 Token；输入、输出、推理和缓存按原始分类保留，可在用量详情查看。</p>
           <p class="progress-message cost-note">{{costSummary.note}}</p>
@@ -322,10 +324,10 @@ onBeforeUnmount(()=>{disposed=true;listRequest++;detailRequest++;evidenceRequest
           <p v-if="selected.status==='succeeded'&&!summary&&!hasOtherOutput" class="agent-error">任务标记为完成，但没有返回可展示的结果，请查看执行事件与诊断。</p>
           <section v-if="evidenceItems.length" class="output-section"><h4>原文证据 <small>{{evidenceItems.length}} 条</small></h4><button v-for="(item,index) in evidenceItems" :key="`${item.chunk_id||index}-${index}`" class="evidence-card" @click="openEvidence(item)"><b>{{item.citation_id||`来源${index+1}`}} · {{item.title||item.source||documents.find(document=>document.id===item.document_id)?.original_filename||item.document_id||'文档证据'}}</b><p>{{item.quote||item.preview||item.content||'查看原始片段'}}</p><small v-if="item.chunk_id">片段 {{item.chunk_id}}</small></button></section>
           <section v-if="actions.length" class="output-section"><h4>动作与应用记录</h4><StructuredResult :value="actions" /></section>
-          <section v-if="selected.followup_jobs?.length" class="output-section"><h4>关联业务任务</h4><p class="progress-message">任务在这些后续处理完成后才会结束。</p><StructuredResult :value="selected.followup_jobs" /><button @click="navigate({page:'jobs',kb:knowledgeBaseId})">查看索引任务</button></section>
-          <details v-if="diagnostics" class="output-section diagnostics"><summary>后端诊断</summary><StructuredResult :value="diagnostics" /></details>
-          <details class="output-section backend-details"><summary>执行后端与用量详情</summary><StructuredResult :value="{backend:selected.backend||'未报告',model:selected.model||'未报告',session_id:selected.session_id||'未报告',job_id:selected.job_id||'未报告',usage:selected.usage||{},options:selected.options}" /></details>
-          <section class="output-section event-section"><h4>执行事件 <small>{{selected.events?.length||0}} 条</small></h4><ol v-if="selected.events?.length" class="events"><li v-for="(event,index) in selected.events" :key="event.id||event.sequence||index"><header><b>{{eventLabel(event)}}</b><time>{{timeLabel(event.created_at)}}</time></header><small>{{event.type}}</small><details v-if="event.data&&Object.keys(asRecord(event.data)||{}).length"><summary>查看事件详情</summary><StructuredResult :value="event.data" /></details></li></ol><p v-else class="empty">尚无执行事件；等待任务开始或刷新记录。</p></section>
+          <section v-if="selected.followup_jobs?.length" class="output-section"><h4>关联业务任务</h4><p class="progress-message">任务在这些后续处理完成后才会结束。</p><StructuredResult :value="selected.followup_jobs" system /><button @click="navigate({page:'jobs',kb:knowledgeBaseId})">查看索引任务</button></section>
+          <details v-if="diagnostics" class="output-section diagnostics"><summary>后端诊断</summary><StructuredResult :value="diagnostics" system /></details>
+          <details class="output-section backend-details"><summary>执行后端与用量详情</summary><StructuredResult :value="{backend:selected.backend||'未报告',model:selected.model||'未报告',session_id:selected.session_id||'未报告',job_id:selected.job_id||'未报告',usage:selected.usage||{},options:selected.options}" system /></details>
+          <section class="output-section event-section"><h4>执行事件 <small>{{selected.events?.length||0}} 条</small></h4><ol v-if="selected.events?.length" class="events"><li v-for="(event,index) in selected.events" :key="event.id||event.sequence||index"><header><b>{{eventLabel(event)}}</b><time>{{timeLabel(event.created_at)}}</time></header><small>{{codecodeText(event.type)}}</small><details v-if="event.data&&Object.keys(asRecord(event.data)||{}).length"><summary>查看事件详情</summary><StructuredResult :value="event.data" system /></details></li></ol><p v-else class="empty">尚无执行事件；等待任务开始或刷新记录。</p></section>
         </template>
       </section>
     </div>

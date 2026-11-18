@@ -21,7 +21,7 @@ jobs:
           node-version: '24'
       - run: python -m pip install -r requirements.txt
       - run: python -m pip check
-      - run: python -m scripts.prepare_opencode --install-runtime
+      - run: python -m scripts.prepare_codecode --install-runtime
       - run: python -m pytest -q --disable-warnings
       - run: python web/tests/contracts/verify_api_contracts.py
       - run: python web/tests/contracts/verify_agent_contracts.py

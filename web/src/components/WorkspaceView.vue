@@ -123,8 +123,8 @@ const navigation: Array<{ id: Page; label: string; icon: string }> = [
   { id: 'sources', label: '数据源与成员', icon: '◇' },
   { id: 'jobs', label: '索引任务', icon: '◷' },
   { id: 'graph', label: '知识图谱', icon: '⌘' },
-  { id: 'graph-management', label: '图谱治理', icon: '◎' },
   { id: 'code-graph', label: '代码图谱', icon: '⌗' },
+  { id: 'graph-management', label: '图谱治理', icon: '◎' },
   { id: 'backups', label: '备份与恢复', icon: '↶' },
   { id: 'debug', label: '检索调试', icon: '⌕' },
   { id: 'readiness', label: '运行状态', icon: '●' },
@@ -132,8 +132,8 @@ const navigation: Array<{ id: Page; label: string; icon: string }> = [
   { id: 'account', label: '账号设置', icon: '⚙' },
 ]
 const navigationGroups = computed(() => [
-  {label:'日常使用', ids:['chat','search','documents','graph']},
-  {label:'知识维护', ids:['agents','sources','jobs','graph-management','code-graph']},
+  {label:'日常使用', ids:['chat','search','documents','graph','code-graph']},
+  {label:'知识维护', ids:['agents','sources','jobs','graph-management']},
   {label:'系统管理', ids:['backups','debug','readiness','users','account']},
 ].map(group=>({...group,items:group.ids.map(id=>visibleNavigation.value.find(item=>item.id===id)).filter((item):item is typeof navigation[number]=>Boolean(item))})))
 </script>

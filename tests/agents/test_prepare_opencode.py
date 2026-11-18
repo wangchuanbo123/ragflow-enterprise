@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from scripts import prepare_opencode as prepare
+from scripts import prepare_codecode as prepare
 
 
 def project(tmp_path, monkeypatch):
@@ -19,7 +19,7 @@ def project(tmp_path, monkeypatch):
         "tag": "v2.2.5",
         "commit": "9bbb8ce18c80f099e0e448775f59d965ead40a21",
         "bun_version": "1.4.4",
-        "runtime_directory": "integrations/opencode/runtime",
+        "runtime_directory": "integrations/codecode/runtime",
     }
     return root, manifest
 
@@ -63,12 +63,12 @@ def test_project_boundary_rejects_resolved_link_escape(tmp_path, monkeypatch):
         prepare.inside_project(candidate)
 
 
-@pytest.mark.parametrize("target", ["build-home/config", "build-tools/node_modules/bun/bin/bun.exe", "runtime/opencode", "runtime/build.json"])
+@pytest.mark.parametrize("target", ["build-home/config", "build-tools/node_modules/bun/bin/bun.exe", "runtime/codecode", "runtime/build.json"])
 def test_specific_configuration_and_executable_links_are_checked_before_use(tmp_path, monkeypatch, target):
     root, manifest = project(tmp_path, monkeypatch)
     if target.startswith("runtime/"):
         suffix = target.split("/", 1)[1]
-        if suffix == "opencode" and prepare.os.name == "nt":
+        if suffix == "codecode" and prepare.os.name == "nt":
             suffix += ".exe"
         candidate = root / manifest["runtime_directory"] / suffix
     else:
@@ -113,7 +113,7 @@ def test_cached_runtime_is_never_executed_when_content_does_not_match_build_proo
     root, manifest = project(tmp_path, monkeypatch)
     output = root / manifest["runtime_directory"]
     output.mkdir(parents=True)
-    executable = output / ("opencode.exe" if prepare.os.name == "nt" else "opencode")
+    executable = output / ("codecode.exe" if prepare.os.name == "nt" else "codecode")
     executable.write_bytes(b"changed artifact")
     (output / "build.json").write_text(json.dumps({
         "method": "source", "source_commit": manifest["commit"], "source_tag": manifest["tag"],

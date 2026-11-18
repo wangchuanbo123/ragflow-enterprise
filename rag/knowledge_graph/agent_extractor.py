@@ -1,6 +1,6 @@
 """Strict graph extraction through the application-owned agent boundary.
 
-The backend owns agent execution (OpenCode in production). This adapter owns
+The backend owns agent execution (codecode in production). This adapter owns
 domain constraints and bounded extract/verify/repair rounds; it never falls back
 to a raw LLM when the configured agent is unavailable or produces invalid facts.
 """

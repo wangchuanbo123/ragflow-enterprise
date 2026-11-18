@@ -8,7 +8,7 @@ import { navigate } from '../../src/composables/useNavigation'
 import * as api from '../../src/api/client'
 vi.mock('../../src/api/client',()=>({listAgentTaskCatalog:vi.fn(),listAgentRunPage:vi.fn(),getAgentRun:vi.fn(),getAgentRunArtifact:vi.fn(),createAgentRun:vi.fn(),cancelAgentRun:vi.fn(),retryAgentRun:vi.fn(),listDocuments:vi.fn(),listFolders:vi.fn(),listTags:vi.fn(),getDocumentTagMap:vi.fn(),listDataSources:vi.fn(),listIndexJobs:vi.fn(),getChunkDetail:vi.fn()}))
 
-const result:AgentRun={id:'run',knowledge_base_id:'kb',task:'business_analysis',status:'succeeded',instructions:'分析供应链风险',document_ids:['doc'],options:{apply:false},created_at:'2026-11-05T02:00:00Z',started_at:'2026-11-05T02:00:00',finished_at:'2026-11-05T02:00:02',progress:{stage:'completed',current:3,total:3},backend:'opencode',model:'vendor/model',session_id:'session',usage:{input_tokens:120,output_tokens:45,total_tokens:165,cost:0.002},output:{summary:'供应链存在单一来源风险。见[来源1]',items:[{title:'供应风险',recommendations:['增加替代供应商']}],metrics:{coverage:0.9},evidence:[{document_id:'doc',chunk_id:'chunk',quote:'关键器件由单一供应商提供。'}],actions:[{kind:'analysis',reason:'仅产生报告'}],diagnostics:[{status:'ok',message:'OpenCode执行完成'}]},events:[{id:'event',sequence:1,type:'result',message:'分析已完成',created_at:'2026-11-05T02:00:02Z',data:{evidence_count:1}}]}
+const result:AgentRun={id:'run',knowledge_base_id:'kb',task:'business_analysis',status:'succeeded',instructions:'分析供应链风险',document_ids:['doc'],options:{apply:false},created_at:'2026-11-05T02:00:00Z',started_at:'2026-11-05T02:00:00',finished_at:'2026-11-05T02:00:02',progress:{stage:'completed',current:3,total:3},backend:'codecode',model:'vendor/model',session_id:'session',usage:{input_tokens:120,output_tokens:45,total_tokens:165,cost:0.002},output:{summary:'供应链存在单一来源风险。见[来源1]',items:[{title:'供应风险',recommendations:['增加替代供应商']}],metrics:{coverage:0.9},evidence:[{document_id:'doc',chunk_id:'chunk',quote:'关键器件由单一供应商提供。'}],actions:[{kind:'analysis',reason:'仅产生报告'}],diagnostics:[{status:'ok',message:'codecode执行完成'}]},events:[{id:'event',sequence:1,type:'result',message:'分析已完成',created_at:'2026-11-05T02:00:02Z',data:{evidence_count:1}}]}
 const queued:AgentRun={...result,id:'new',task:'extraction',status:'queued',output:{},events:[],progress:{stage:'queued',current:0,total:3}}
 function render(edit=true){return mount(AgentWorkbenchView,{props:{knowledgeBaseId:'kb'},global:{provide:{[knowledgeBaseKey as symbol]:computed(()=>({capabilities:{can_edit:edit}}))}}})}
 beforeEach(()=>{
@@ -29,6 +29,16 @@ beforeEach(()=>{
 afterEach(()=>vi.useRealTimers())
 
 describe('knowledge agent workbench',()=>{
+  it('brands historical system events and errors without changing backend references',async()=>{
+    vi.mocked(api.getAgentRun).mockResolvedValueOnce({...result,status:'failed',backend:'opencode',session_id:'legacy-session',error_message:'OpenCode执行失败',progress:{message:'OpenCode正在整理诊断'},output:{diagnostics:[{message:'OPENCODE_MODEL配置无效'}]},events:[{type:'session',message:'OpenCode会话已创建',data:{backend:'opencode'}}]})
+    const wrapper=render(false);await flushPromises()
+    expect(wrapper.text()).toContain('codecode执行失败')
+    expect(wrapper.text()).toContain('codecode正在整理诊断')
+    expect(wrapper.text()).toContain('codecode会话已创建')
+    expect(wrapper.text()).toContain('CODECODE_MODEL配置无效')
+    expect(wrapper.text()).not.toMatch(/opencode/i)
+    expect(wrapper.text()).toContain('legacy-session')
+  })
   it('filters the complete server-side run history and resets pagination',async()=>{
     vi.mocked(api.listAgentRunPage).mockResolvedValue({items:[result],total:125,offset:0,limit:50})
     const wrapper=render(false);await flushPromises()
@@ -81,7 +91,7 @@ describe('knowledge agent workbench',()=>{
     expect(wrapper.find('form').exists()).toBe(false)
     expect(wrapper.text()).toContain('供应链存在单一来源风险')
     expect(wrapper.text()).toContain('增加替代供应商')
-    expect(wrapper.text()).toContain('0.9');expect(wrapper.text()).toContain('165');expect(wrapper.text()).toContain('OpenCode执行完成');expect(wrapper.text()).toContain('分析已完成')
+    expect(wrapper.text()).toContain('0.9');expect(wrapper.text()).toContain('165');expect(wrapper.text()).toContain('codecode执行完成');expect(wrapper.text()).toContain('分析已完成')
     expect(wrapper.findAll('button').some(button=>['取消任务','重试任务'].includes(button.text()))).toBe(false)
     await wrapper.find('.evidence-card').trigger('click');await flushPromises()
     expect(api.getChunkDetail).toHaveBeenCalledWith('kb','chunk')

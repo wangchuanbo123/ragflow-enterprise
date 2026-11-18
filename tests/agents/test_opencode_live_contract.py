@@ -1,4 +1,4 @@
-"""Real pinned OpenCode binary + local synthetic model/MCP, no cloud calls."""
+"""Real pinned codecode binary + local synthetic model/MCP, no cloud calls."""
 
 import json
 import os
@@ -13,7 +13,7 @@ import httpx
 import pytest
 
 from app.agents.contracts import AgentRequest, AgentCancelledError, AgentError
-from app.agents.opencode import OpenCodeAgentBackend
+from app.agents.codecode import CodeCodeAgentBackend
 from app.agents.runtime import project_runtime_executable, runtime_environment
 from app.agents.settings import AgentSettings
 
@@ -23,7 +23,7 @@ def test_real_opencode_structured_output_and_mcp(tmp_path, api, monkeypatch):
     try:
         executable = project_runtime_executable()
     except FileNotFoundError:
-        pytest.skip("Project source-built OpenCode runtime is not prepared")
+        pytest.skip("Project source-built codecode runtime is not prepared")
     tool_calls = []
     model_calls = []
     message_snapshots = []
@@ -143,7 +143,7 @@ def test_real_opencode_structured_output_and_mcp(tmp_path, api, monkeypatch):
     monkeypatch.setattr(config, "ANSWER_LLM_BASE_URL", f"http://127.0.0.1:{server.server_port}/v1")
     monkeypatch.setattr(config, "ANSWER_LLM_API_KEY", "synthetic")
     monkeypatch.setattr(config, "ANSWER_LLM_MODEL", "test")
-    monkeypatch.setenv("OPENCODE_MODEL", "rag/test")
+    monkeypatch.setenv("CODECODE_MODEL", "rag/test")
     monkeypatch.setenv("AGENT_MAX_STEPS", "6")
     monkeypatch.setenv("AGENT_BACKEND_PROFILES_JSON", "{}")
     env = runtime_environment(tmp_path / "runtime", "synthetic-server-password")
@@ -155,7 +155,7 @@ def test_real_opencode_structured_output_and_mcp(tmp_path, api, monkeypatch):
         "permissions": [{"action": "*", "resource": "*", "effect": "allow"}]}), encoding="utf-8")
     with (tmp_path / "opencode.log").open("wb") as log:
         process = subprocess.Popen([executable, "serve", "--port", str(port), "--hostname", "127.0.0.1"], cwd=home, env=env, stdout=log, stderr=log, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    backend = OpenCodeAgentBackend(AgentSettings(base_url=f"http://127.0.0.1:{port}", password="synthetic-server-password", model="rag/test", callback_url=f"http://127.0.0.1:{server.server_port}/mcp", workspace_root=workspace, timeout_seconds=40))
+    backend = CodeCodeAgentBackend(AgentSettings(base_url=f"http://127.0.0.1:{port}", password="synthetic-server-password", model="rag/test", callback_url=f"http://127.0.0.1:{server.server_port}/mcp", workspace_root=workspace, timeout_seconds=40))
     native_messages = backend._messages
     def messages(send, path):
         rows = native_messages(send, path)

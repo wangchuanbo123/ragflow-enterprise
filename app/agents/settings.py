@@ -8,8 +8,22 @@ from urllib.parse import urlsplit
 
 from app.core.config import DATA_DIR
 
-OPENCODE_VERSION = "2.2.5"
-OPENCODE_COMMIT = "9bbb8ce18c80f099e0e448775f59d965ead40a21"
+CODECODE_VERSION = "2.2.5"
+CODECODE_COMMIT = "9bbb8ce18c80f099e0e448775f59d965ead40a21"
+
+
+# Compatibility constants for integrations written before the public rename.
+OPENCODE_VERSION = CODECODE_VERSION
+OPENCODE_COMMIT = CODECODE_COMMIT
+
+
+def codecode_env(name: str, default: str = "") -> str:
+    """Public configuration takes precedence, including an explicitly empty value."""
+    return os.environ.get("CODECODE_" + name, os.environ.get("OPENCODE_" + name, default))
+
+
+def normalized_backend(value: str) -> str:
+    return "codecode" if value == "opencode" else value
 
 
 def managed_endpoint(value: str) -> bool:
@@ -40,9 +54,9 @@ def safe_service_url(value: str, *, allow_internal_callback: bool = False) -> st
 
 @dataclass(frozen=True)
 class AgentSettings:
-    backend: str = "opencode"
+    backend: str = "codecode"
     base_url: str = "http://127.0.0.1:4096"
-    username: str = "opencode"
+    username: str = "codecode"
     password: str = field(default="", repr=False)
     model: str = ""
     timeout_seconds: float = 180
@@ -50,20 +64,23 @@ class AgentSettings:
     max_steps: int = 12
     callback_url: str = "http://127.0.0.1:8080/api/v1/agent-tools"
     workspace_root: Path = field(default_factory=lambda: DATA_DIR / "agents" / "workspaces")
-    expected_version: str = OPENCODE_VERSION
+    expected_version: str = CODECODE_VERSION
     cleanup_sessions: bool = True
 
     def __post_init__(self):
+        object.__setattr__(self, "backend", normalized_backend(self.backend))
+        if self.backend == "codecode" and self.username == "opencode":
+            object.__setattr__(self, "username", "codecode")
         safe_service_url(self.base_url)
         safe_service_url(self.callback_url, allow_internal_callback=True)
         if not 1 <= self.max_steps <= 64 or not 1 <= self.timeout_seconds <= 1800:
             raise ValueError("Invalid agent step/time budget")
         if not 0.01 <= self.poll_seconds <= 10:
             raise ValueError("Invalid agent polling interval")
-        if self.backend == "opencode" and self.username != "opencode":
-            raise ValueError("OpenCode V2 fixes the authentication username to opencode")
-        if self.backend == "opencode" and urlsplit(self.base_url).hostname not in {"localhost", "127.0.0.1", "::1"} and not self.password:
-            raise ValueError("Remote OpenCode requires authentication")
+        if self.backend == "codecode" and self.username != "codecode":
+            raise ValueError("codecode V2 uses a fixed authentication username")
+        if self.backend == "codecode" and urlsplit(self.base_url).hostname not in {"localhost", "127.0.0.1", "::1"} and not self.password:
+            raise ValueError("Remote codecode requires authentication")
 
 
 def default_settings() -> AgentSettings:
@@ -71,11 +88,11 @@ def default_settings() -> AgentSettings:
     model = ANSWER_LLM_MODEL if ANSWER_LLM_API_KEY and ANSWER_LLM_BASE_URL else OLLAMA_LLM_MODEL
 
     return AgentSettings(
-        backend=os.getenv("AGENT_BACKEND", "opencode"),
-        base_url=os.getenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096"),
-        username=os.getenv("OPENCODE_SERVER_USERNAME", "opencode"),
-        password=os.getenv("OPENCODE_PASSWORD") or os.getenv("OPENCODE_SERVER_PASSWORD", ""),
-        model=os.getenv("OPENCODE_MODEL") or f"rag/{model}",
+        backend=os.getenv("AGENT_BACKEND", "codecode"),
+        base_url=codecode_env("BASE_URL", "http://127.0.0.1:4096"),
+        username=codecode_env("SERVER_USERNAME", "codecode"),
+        password=codecode_env("PASSWORD") or codecode_env("SERVER_PASSWORD"),
+        model=codecode_env("MODEL") or f"rag/{model}",
         timeout_seconds=float(os.getenv("AGENT_TIMEOUT_SECONDS", "180")),
         max_steps=int(os.getenv("AGENT_MAX_STEPS", "12")),
         callback_url=os.getenv("AGENT_TOOL_URL") or f"http://127.0.0.1:{os.getenv('APP_PORT', '8080')}/api/v1/agent-tools",

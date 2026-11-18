@@ -134,7 +134,7 @@ services:
       <<: *environment
       APP_ROLE: scheduler
       SERVER_BACKUP_STATUS_PATH: /app/operations/backup-status.json
-      OPENCODE_AUTO_START: "false"
+      CODECODE_AUTO_START: "false"
     volumes:
       - documents:/app/data/docs
       - ../data/operations:/app/operations:ro

@@ -77,25 +77,25 @@ def test_invalid_ports_fail_before_socket_operations(monkeypatch, port):
         start._pick_port()
 
 
-@pytest.mark.parametrize("prefix", ["", "opencode v"])
+@pytest.mark.parametrize("prefix", ["", "codecode v"])
 def test_startup_agent_runtime_uses_shared_project_resolver_without_path_lookup(tmp_path, monkeypatch, prefix):
     from app.agents import runtime
-    from app.agents.settings import OPENCODE_VERSION
+    from app.agents.settings import CODECODE_VERSION
     executable = tmp_path / "project-runtime.exe"
     calls = []
-    monkeypatch.setenv("AGENT_BACKEND", "opencode")
-    monkeypatch.setenv("OPENCODE_AUTO_START", "true")
+    monkeypatch.setenv("AGENT_BACKEND", "codecode")
+    monkeypatch.setenv("CODECODE_AUTO_START", "true")
     monkeypatch.setattr(runtime, "ensure_project_runtime", lambda: str(executable))
     monkeypatch.setattr(start.shutil, "which", lambda *args: pytest.fail("Agent startup must not look up a global CLI"))
-    monkeypatch.setattr(start.subprocess, "run", lambda command, **kwargs: calls.append(command) or SimpleNamespace(returncode=0, stdout=prefix + OPENCODE_VERSION))
+    monkeypatch.setattr(start.subprocess, "run", lambda command, **kwargs: calls.append(command) or SimpleNamespace(returncode=0, stdout=prefix + CODECODE_VERSION))
     assert start._ensure_agent_runtime()
     assert calls == [[str(executable), "--version"]]
 
 
 def test_startup_external_executable_never_falls_back_to_global_or_npm(monkeypatch):
     from app.agents import runtime
-    monkeypatch.setenv("AGENT_BACKEND", "opencode")
-    monkeypatch.setenv("OPENCODE_AUTO_START", "true")
+    monkeypatch.setenv("AGENT_BACKEND", "codecode")
+    monkeypatch.setenv("CODECODE_AUTO_START", "true")
     def reject():
         raise ValueError("external executable")
     monkeypatch.setattr(runtime, "ensure_project_runtime", reject)
@@ -105,9 +105,9 @@ def test_startup_external_executable_never_falls_back_to_global_or_npm(monkeypat
 
 def test_remote_agent_startup_does_not_prepare_local_runtime(monkeypatch):
     from app.agents import runtime
-    monkeypatch.setenv("AGENT_BACKEND", "opencode")
-    monkeypatch.setenv("OPENCODE_AUTO_START", "true")
-    monkeypatch.setenv("OPENCODE_BASE_URL", "https://synthetic.example")
-    monkeypatch.setenv("OPENCODE_PASSWORD", "synthetic-password")
-    monkeypatch.setattr(runtime, "ensure_project_runtime", lambda: pytest.fail("Remote OpenCode has no local runtime dependency"))
+    monkeypatch.setenv("AGENT_BACKEND", "codecode")
+    monkeypatch.setenv("CODECODE_AUTO_START", "true")
+    monkeypatch.setenv("CODECODE_BASE_URL", "https://synthetic.example")
+    monkeypatch.setenv("CODECODE_PASSWORD", "synthetic-password")
+    monkeypatch.setattr(runtime, "ensure_project_runtime", lambda: pytest.fail("Remote codecode has no local runtime dependency"))
     assert start._ensure_agent_runtime()

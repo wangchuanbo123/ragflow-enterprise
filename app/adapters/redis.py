@@ -223,3 +223,10 @@ def login_attempt_allowed(keys: tuple[str, str], limit: int, window_seconds: int
 def clear_login_account(key: str):
     client = get_redis_client()
     redis_call(client.delete, key_prefix() + ":{login}:" + key)
+
+
+def registration_attempt_allowed(keys: tuple[str, str], limit: int, window_seconds: int, ip_limit: int) -> bool:
+    client = get_redis_client()
+    names = [key_prefix() + ":{registration}:" + key for key in keys]
+    return bool(redis_call(client.eval, _LOGIN, 2, *names, window_seconds * 1000,
+                           limit, ip_limit, uuid.uuid4().hex))

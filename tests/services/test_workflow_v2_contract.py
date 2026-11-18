@@ -6,8 +6,8 @@ import json
 import httpx
 import pytest
 
-from app.agents.opencode import OpenCodeAgentBackend
-from app.agents.settings import AgentSettings, OPENCODE_VERSION
+from app.agents.codecode import CodeCodeAgentBackend
+from app.agents.settings import AgentSettings, CODECODE_VERSION
 from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID as KB
 from app.schemas.agent_run import AgentRunCreate
 from app.services.agent_workflow_service import AgentWorkflowService
@@ -26,7 +26,7 @@ def test_workflow_reaches_native_v2_with_parent_deadline_and_unknown_totals(db_e
         body = json.loads(request.content) if request.content else {}
         calls.append((request.method, request.url.path))
         if request.url.path == "/api/info":
-            return httpx.Response(200, json={"version": OPENCODE_VERSION})
+            return httpx.Response(200, json={"version": CODECODE_VERSION})
         if request.url.path == "/api/session":
             identifier = f"session-{len(sessions)}"
             sessions[identifier] = None
@@ -51,7 +51,7 @@ def test_workflow_reaches_native_v2_with_parent_deadline_and_unknown_totals(db_e
                 {"id": "idle", "type": "idle", "outcome": "succeeded"}], "cursor": {}})
         return httpx.Response(200, json=True)
 
-    backend = OpenCodeAgentBackend(AgentSettings(workspace_root=tmp_path, model="rag/test", poll_seconds=0.01),
+    backend = CodeCodeAgentBackend(AgentSettings(workspace_root=tmp_path, model="rag/test", poll_seconds=0.01),
                                    transport=httpx.MockTransport(handler))
     monkeypatch.setattr("app.agents.factory.get_agent_backend", lambda profile_name=None: backend)
     monkeypatch.setattr("app.agents.factory.list_backend_profiles", lambda: ["default"])
@@ -66,7 +66,7 @@ def test_workflow_reaches_native_v2_with_parent_deadline_and_unknown_totals(db_e
         run = service.create(AgentRunCreate(task=task, document_ids=["doc-workflow"], options=options), "workflow-user")
         assert service.execute_for_job(run.job_id)["status"] == "completed", service.serialize(run)
         detail = service.serialize(run)
-        assert detail["status"] == "succeeded" and detail["backend"] == "opencode"
+        assert detail["status"] == "succeeded" and detail["backend"] == "codecode"
         assert detail["usage"]["total_tokens"] is None and detail["usage"]["total_tokens_coverage"] == "unknown"
         assert detail["usage"]["cost"] is None and detail["usage"]["cost_coverage"] == "unknown"
         assert detail["usage"]["reasoning_tokens"] == (4 if task == "evaluation" else 2)

@@ -44,6 +44,9 @@ web/dist/
 # Local shell scripts
 *.sh
 
-# Official OpenCode checkout is reproducible via its pinned source manifest.
+# Official codecode checkout is reproducible via its pinned source manifest.
 vendor/opencode/
+integrations/codecode/runtime/
+
+# Previous runtime build output remains private during migration.
 integrations/opencode/runtime/

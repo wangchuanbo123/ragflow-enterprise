@@ -1,4 +1,4 @@
-"""Application-owned agent contracts, independent of OpenCode or model SDKs."""
+"""Application-owned agent contracts, independent of codecode or model SDKs."""
 
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol

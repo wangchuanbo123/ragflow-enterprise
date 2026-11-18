@@ -29,7 +29,7 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
         raise unauthorized("无效的令牌")
 
     user = db.get(User, user_id)
-    if not user or not user.is_active:
+    if not user or not user.is_active or user.registration_status != "approved":
         from app.api.errors import unauthorized
 
         raise unauthorized("用户不存在或已禁用")

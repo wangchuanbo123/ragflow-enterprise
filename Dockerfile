@@ -7,7 +7,7 @@ RUN npm ci
 COPY web/ ./
 RUN npm run build
 
-FROM ${PYTHON_IMAGE} AS opencode
+FROM ${PYTHON_IMAGE} AS codecode
 COPY --from=web /usr/local/bin/node /usr/local/bin/node
 COPY --from=web /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
@@ -17,9 +17,9 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && apt-get -o Acquire::Retries=3 install -y --no-install-recommends git ca-certificates unzip \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY scripts/prepare_opencode.py scripts/prepare_opencode.py
-COPY integrations/opencode/source.json integrations/opencode/source.json
-RUN python -m scripts.prepare_opencode --install-runtime
+COPY scripts/prepare_codecode.py scripts/prepare_codecode.py
+COPY integrations/codecode/source.json integrations/codecode/source.json
+RUN python -m scripts.prepare_codecode --install-runtime
 
 FROM ${PYTHON_IMAGE} AS application
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 ANONYMIZED_TELEMETRY=False
@@ -47,7 +47,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')"
 COPY . .
 COPY --from=web /web/dist /app/web/dist
-COPY --from=opencode /app/integrations/opencode/runtime /app/integrations/opencode/runtime
+COPY --from=codecode /app/integrations/codecode/runtime /app/integrations/codecode/runtime
 RUN groupadd --gid 10001 rag && useradd --uid 10001 --gid rag --create-home rag \
     && mkdir -p /app/data/docs /app/data/agents /app/data/search-cache && chown -R rag:rag /app/data /home/rag
 USER rag

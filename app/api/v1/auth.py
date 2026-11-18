@@ -6,10 +6,23 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user
 from app.core.database import get_db
 from app.models.user import User
-from app.schemas.auth import LoginRequest, LoginResponse, PasswordChange, UserOut
-from app.services import auth_service
+from app.schemas.auth import (
+    LoginRequest, LoginResponse, PasswordChange,
+    RegistrationRequest, RegistrationResponse, UserOut,
+)
+from app.services import auth_service, user_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post("/register", response_model=RegistrationResponse, status_code=202)
+def register(payload: RegistrationRequest, request: Request, db: Session = Depends(get_db)):
+    from app.services.registration_throttle import check_registration_attempt
+
+    address = request.client.host if request.client else "unknown"
+    check_registration_attempt(payload.username, address)
+    user_service.register_user(db, payload)
+    return RegistrationResponse(message="注册申请已提交，请等待管理员审核；审核通过后即可登录。")
 
 
 @router.post("/login", response_model=LoginResponse)

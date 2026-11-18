@@ -10,8 +10,8 @@ import httpx
 import pytest
 
 from app.agents.contracts import AgentCancelledError, AgentOutputError, AgentRequest, AgentUnavailableError
-from app.agents.opencode import OpenCodeAgentBackend
-from app.agents.settings import AgentSettings, OPENCODE_VERSION
+from app.agents.codecode import CodeCodeAgentBackend
+from app.agents.settings import AgentSettings, CODECODE_VERSION
 
 
 SCHEMA = {"type": "object", "properties": {"verified": {"type": "boolean"}}, "required": ["verified"], "additionalProperties": False}
@@ -46,7 +46,7 @@ def native_backend(tmp_path, snapshots, *, max_steps=12, intercept=None):
             if response is not None:
                 return response
         if req.url.path == "/api/info":
-            return httpx.Response(200, json={"version": OPENCODE_VERSION})
+            return httpx.Response(200, json={"version": CODECODE_VERSION})
         if req.method == "POST" and req.url.path == "/api/session":
             return httpx.Response(200, json={"data": {"id": "ses_native"}})
         if req.method == "GET" and req.url.path == "/api/mcp":
@@ -57,7 +57,7 @@ def native_backend(tmp_path, snapshots, *, max_steps=12, intercept=None):
             return httpx.Response(200, json={"data": data, "cursor": {}})
         return httpx.Response(204)
 
-    backend = OpenCodeAgentBackend(AgentSettings(workspace_root=tmp_path, model="rag/test", poll_seconds=0.01,
+    backend = CodeCodeAgentBackend(AgentSettings(workspace_root=tmp_path, model="rag/test", poll_seconds=0.01,
                                                 max_steps=max_steps), transport=httpx.MockTransport(handler))
     return backend, calls
 
@@ -196,7 +196,7 @@ def test_native_message_pagination_uses_cursor_without_order_and_deduplicates_me
         queries.append(kwargs["params"])
         return {"data": [assistant(1)], "cursor": {"next": "next-page"}} if len(queries) == 1 else {"data": [assistant(1), IDLE], "cursor": {}}
 
-    messages = OpenCodeAgentBackend._messages(send, "/api/session/ses_native")
+    messages = CodeCodeAgentBackend._messages(send, "/api/session/ses_native")
     assert len(messages) == 2
     assert queries == [{"limit": 200, "order": "asc"}, {"limit": 200, "cursor": "next-page"}]
 
@@ -230,7 +230,7 @@ def test_budget_is_checked_between_http_response_chunks_and_stream_is_closed():
 
     with httpx.Client(transport=httpx.MockTransport(lambda req: httpx.Response(200, stream=Stream()))) as client:
         with pytest.raises(AgentCancelledError):
-            OpenCodeAgentBackend._request(client, "GET", "http://localhost/api/info", _budget=check)
+            CodeCodeAgentBackend._request(client, "GET", "http://localhost/api/info", _budget=check)
     assert state == {"chunks": 2, "checks": 2, "closed": True}
 
 
@@ -259,7 +259,7 @@ def test_concurrent_runs_never_share_mcp_locations_or_credentials(tmp_path):
     def handler(req):
         body = json.loads(req.content) if req.content else None
         if req.url.path == "/api/info":
-            return httpx.Response(200, json={"version": OPENCODE_VERSION})
+            return httpx.Response(200, json={"version": CODECODE_VERSION})
         if req.method == "POST" and req.url.path == "/api/session":
             with lock:
                 sid = f"ses_{len(sessions)}"
@@ -281,7 +281,7 @@ def test_concurrent_runs_never_share_mcp_locations_or_credentials(tmp_path):
                 evicted.append(req.url.params["location[directory]"])
         return httpx.Response(204)
 
-    backend = OpenCodeAgentBackend(AgentSettings(workspace_root=tmp_path, model="rag/test"), transport=httpx.MockTransport(handler))
+    backend = CodeCodeAgentBackend(AgentSettings(workspace_root=tmp_path, model="rag/test"), transport=httpx.MockTransport(handler))
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = list(pool.map(lambda token: backend.run(task(tool_token=token)), ["first-token", "second-token"]))
     assert len({result.session_id for result in results}) == 2

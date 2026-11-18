@@ -1,3 +1,5 @@
+import { codecodeSystemData, codecodeText } from './systemPresentation'
+
 export const agentTasks = [
   { id: 'extraction', label: '知识抽取', description: '抽取实体、关系和原文证据，检查哪些事实可以进入图谱。', changes: '按授权保存经过校验的抽取结果，并记录文档与片段证据。' },
   { id: 'ingestion', label: '接入与索引编排', description: '检查数据来源，规划文档解析、切片、索引与后续抽取。', changes: '按授权提交来源同步和索引任务；可在索引任务页继续查看。' },
@@ -96,10 +98,26 @@ export function agentCostSummary(usage:Record<string,unknown>):{label:string;not
   const label=numeric&&status!=='unknown'?`${cost} ${usage.currency||''}${status==='partial'?'（已知部分）':''}`.trim():'未知'
   let note=status==='partial'?'仅汇总已报告的费用，仍有执行会话费用未知。':status==='complete'?'已汇总全部执行会话报告的费用。':status==='unknown'?'缺少完整计价信息，费用未知不代表免费。':'服务已报告费用，统计完整性尚未确认。'
   if(usage.incomplete)note+=' 本次执行尚未完整结束。'
-  if(typeof usage.cost_note==='string')note+=` ${usage.cost_note}`
+  if(typeof usage.cost_note==='string')note+=` ${codecodeText(usage.cost_note)}`
   return {label,note}
 }
-export function agentRunMarkdown(run:AgentRun):string {
+/** Normalize only system records; keep source evidence and request references intact. */
+export function agentRunPresentation(run:AgentRun):AgentRun {
+  const output=asRecord(run.output)
+  return {
+    ...run,
+    backend:run.backend?codecodeText(run.backend):run.backend,
+    error_message:run.error_message?codecodeText(run.error_message):run.error_message,
+    diagnostics:codecodeSystemData(run.diagnostics),
+    usage:codecodeSystemData(run.usage),
+    progress:codecodeSystemData(run.progress),
+    events:codecodeSystemData(run.events),
+    followup_jobs:codecodeSystemData(run.followup_jobs),
+    output:output&&'diagnostics' in output?{...output,diagnostics:codecodeSystemData(output.diagnostics)}:run.output,
+  }
+}
+export function agentRunMarkdown(original:AgentRun):string {
+  const run=agentRunPresentation(original)
   const output=asRecord(run.output)
   const json=(value:unknown)=>{
     const content=JSON.stringify(value,null,2)||'null'

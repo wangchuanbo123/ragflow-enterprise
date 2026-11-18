@@ -5,6 +5,7 @@ import type { ModelProbe, Readiness } from '../types'
 import { useAuth } from '../composables/useAuth'
 import { useOperationsOverview } from '../composables/useOperationsOverview'
 import type { OperationAlert } from '../types/operations'
+import { codecodeSystemData, codecodeText } from '../systemPresentation'
 const { user } = useAuth()
 const { isAdmin, overview, loading: operationsLoading, error: operationsError, refresh: refreshOperations } = useOperationsOverview(user)
 const probe = ref<ModelProbe|null>(null)
@@ -32,7 +33,7 @@ const alertLabels: Record<string, string> = {
 }
 function alertText(alert: OperationAlert): string {
   const detail = alert.count !== undefined ? `（${alert.count} 项）` : alert.seconds !== undefined ? `（已等待 ${duration(alert.seconds)}）` : ''
-  return (alertLabels[alert.code] || alert.message || '运行状态需要检查') + detail
+  return codecodeText(alertLabels[alert.code] || alert.message || '运行状态需要检查') + detail
 }
 function duration(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return '暂无数据'
@@ -80,21 +81,21 @@ onMounted(load)
 <template>
   <div class="ready-page">
     <div class="ready-head"><div><h2>运行状态</h2><p>检查数据库、存储与任务执行器。模型配置检查不代表真实推理可用；管理员可发送短请求验证模型连接。</p></div><button v-if="user?.role==='admin'" :disabled="probing" @click="verifyModels">{{probing?'正在验证模型…':'验证模型连接'}}</button><button @click="refreshAll">重新检查</button></div>
-    <p v-if="error" class="error">{{ error }}</p>
+    <p v-if="error" class="error">{{ codecodeText(error) }}</p>
     <div v-if="loading" class="loading">正在检查各组件…</div>
     <template v-else-if="readiness">
       <section :class="['summary', readiness.status]"><div class="pulse"></div><div><strong>{{ readiness.status === 'ready' ? '基础服务检查通过' : '系统尚未完全就绪' }}</strong><p>检查时间：{{ new Date(readiness.checked_at).toLocaleString() }} · {{readiness.model_inference_verified?'模型推理已验证':'模型推理尚未验证'}}</p></div></section>
       <div class="component-grid">
         <article v-for="[name, component] in entries" :key="name">
           <header><span>{{ labels[name] || name }}</span><b :class="component.status">{{ component.status }}</b></header>
-          <p>{{ component.detail || (component.status === 'ok' ? '连接与配置正常' : '需要检查配置或服务状态') }}</p>
-          <details v-if="name === 'model_profiles' && component.profiles"><summary>查看模型角色</summary><pre>{{ JSON.stringify(component.profiles, null, 2) }}</pre></details>
+          <p>{{ codecodeText(component.detail || (component.status === 'ok' ? '连接与配置正常' : '需要检查配置或服务状态')) }}</p>
+          <details v-if="name === 'model_profiles' && component.profiles"><summary>查看模型角色</summary><pre>{{ JSON.stringify(codecodeSystemData(component.profiles), null, 2) }}</pre></details>
         </article>
       </div>
     </template>
     <section v-if="isAdmin" class="operations-overview" aria-labelledby="operations-heading">
       <header class="operations-head"><div><h3 id="operations-heading">运行概览</h3><p>任务与资源为检查时的快照；模型耗时为已记录调用的算术均值。</p></div><button :disabled="operationsLoading" @click="refreshOperations">{{ operationsLoading ? '正在刷新…' : '刷新概览' }}</button></header>
-      <p v-if="operationsError" class="error" role="alert">运行指标加载失败：{{ operationsError }}。可点击“刷新概览”重试。</p>
+      <p v-if="operationsError" class="error" role="alert">运行指标加载失败：{{ codecodeText(operationsError) }}。可点击“刷新概览”重试。</p>
       <p v-if="operationsLoading && !overview" class="operations-empty" role="status">正在加载运行指标…</p>
       <template v-if="overview">
         <p class="operations-timestamp">检查时间：{{ dateTime(overview.checked_at) }}<span v-if="operationsError"> · 以下为上次成功获取的数据</span></p>
@@ -109,7 +110,7 @@ onMounted(load)
         <p v-else class="operations-clear">当前未触发运行告警。</p>
       </template>
     </section>
-    <section v-if="probe" class="probe-results"><h3>{{probe.status==='verified'?'模型连接验证通过':'模型连接验证失败'}}</h3><p>验证时间：{{new Date(probe.checked_at).toLocaleString()}}</p><article v-for="(profile,name) in probe.profiles" :key="name"><b>{{profileLabels[name]||name}}</b><span>{{profile.status==='ok'?'可用':'失败'}} · {{profile.elapsed_ms}} ms</span><small v-if="profile.error_type">{{profile.error_type}}<template v-if="profile.http_status"> · HTTP {{profile.http_status}}</template></small><span v-if="profile.detail">{{profile.detail}}</span></article></section>
+    <section v-if="probe" class="probe-results"><h3>{{probe.status==='verified'?'模型连接验证通过':'模型连接验证失败'}}</h3><p>验证时间：{{new Date(probe.checked_at).toLocaleString()}}</p><article v-for="(profile,name) in probe.profiles" :key="name"><b>{{profileLabels[name]||name}}</b><span>{{profile.status==='ok'?'可用':'失败'}} · {{profile.elapsed_ms}} ms</span><small v-if="profile.error_type">{{codecodeText(profile.error_type)}}<template v-if="profile.http_status"> · HTTP {{profile.http_status}}</template></small><span v-if="profile.detail">{{codecodeText(profile.detail)}}</span></article></section>
   </div>
 </template>
 

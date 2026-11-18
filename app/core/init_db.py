@@ -144,8 +144,8 @@ def init_app(start_services: bool = True) -> None:
 
     # Start index worker
     if role in {"all", "api", "worker"}:
-        from app.agents.runtime import start_managed_opencode
-        start_managed_opencode()
+        from app.agents.runtime import start_managed_codecode
+        start_managed_codecode()
     if role in {"all", "worker"}:
         from app.services.index_worker import start_worker
         start_worker()

@@ -44,10 +44,16 @@ def configure_server(root: Path = ROOT) -> Path:
         _restrict_private(target)
         return target
     old = read_env(root / ".env")
+    # Import previous private settings into the canonical public namespace.
+    for key, value in list(old.items()):
+        if key.startswith("OPENCODE_"):
+            old.setdefault("CODECODE_" + key.removeprefix("OPENCODE_"), value)
+    if old.get("AGENT_BACKEND") == "opencode":
+        old["AGENT_BACKEND"] = "codecode"
     settings = read_env(root / "deploy/server.env.example")
     prefixes = ("LLM_", "ANSWER_LLM_", "REWRITE_LLM_", "ROUTER_LLM_", "EMBEDDING_", "RERANKER_", "OLLAMA_", "GRAPH_", "BACKUP_", "CONNECTOR_")
     for key, value in old.items():
-        if (key.startswith(prefixes) and key != "GRAPH_STORE_PROVIDER") or key in {"OPENCODE_MODEL", "AGENT_TIMEOUT_SECONDS", "AGENT_MAX_STEPS", "AGENT_BACKEND_PROFILES_JSON", "INITIAL_ADMIN_USERNAME"}:
+        if (key.startswith(prefixes) and key != "GRAPH_STORE_PROVIDER") or key in {"CODECODE_MODEL", "AGENT_TIMEOUT_SECONDS", "AGENT_MAX_STEPS", "AGENT_BACKEND_PROFILES_JSON", "INITIAL_ADMIN_USERNAME"}:
             settings[key] = value
     registry = json.loads(old.get("CONNECTOR_CREDENTIALS_JSON") or "{}")
     for entry in registry.values():

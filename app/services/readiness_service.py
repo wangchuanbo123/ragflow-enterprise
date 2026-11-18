@@ -8,6 +8,7 @@ import threading
 from datetime import datetime, timezone
 
 from app.core.config import READINESS_CACHE_SECONDS, READINESS_TIMEOUT_SECONDS
+from app.core.branding import public_metadata
 from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID
 
 logger = logging.getLogger(__name__)
@@ -255,7 +256,7 @@ def _check_model_profiles(container) -> dict:
 def check_readiness(force: bool = False) -> dict:
     """检查所有组件就绪状态。结果缓存 READINESS_CACHE_SECONDS 秒。"""
     with _cache_lock:
-        return _check_readiness(force)
+        return public_metadata(_check_readiness(force))
 
 
 def _check_readiness(force: bool = False) -> dict:

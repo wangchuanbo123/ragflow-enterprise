@@ -31,10 +31,13 @@ from sqlalchemy.pool import StaticPool
 @pytest.fixture(autouse=True)
 def isolated_login_throttle():
     from app.services.login_throttle import reset_login_limits
+    from app.services.registration_throttle import reset_registration_limits
 
     reset_login_limits()
+    reset_registration_limits()
     yield
     reset_login_limits()
+    reset_registration_limits()
 
 
 @pytest.fixture

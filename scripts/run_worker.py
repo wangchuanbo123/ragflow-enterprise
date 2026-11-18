@@ -11,7 +11,7 @@ def main(argv=None) -> int:
     os.environ["APP_ROLE"] = "worker"
     from app.core.init_db import init_app
     from app.core.logger import setup_logging
-    from app.agents.runtime import start_managed_opencode, stop_managed_opencode
+    from app.agents.runtime import start_managed_codecode, stop_managed_codecode
     from app.services.index_worker import run_worker_forever, stop_worker, _worker_stop
 
     setup_logging()
@@ -22,13 +22,13 @@ def main(argv=None) -> int:
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: stop_worker())
     try:
-        health = start_managed_opencode()
+        health = start_managed_codecode()
         if health.get("status") == "fail":
-            raise RuntimeError("Worker OpenCode runtime did not become ready")
+            raise RuntimeError("Worker codecode runtime did not become ready")
         run_worker_forever()
     finally:
         stop_worker()
-        stop_managed_opencode()
+        stop_managed_codecode()
         stop_metrics()
     return 0
 

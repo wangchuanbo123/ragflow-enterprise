@@ -111,7 +111,7 @@ def test_agent_unavailability_never_uses_a_legacy_llm(monkeypatch):
     def forbidden():
         raise AssertionError("legacy LLM fallback was called")
     monkeypatch.setattr("rag.providers.factory.get_graph_extraction_llm_provider", forbidden)
-    backend = Backend(AgentUnavailableError("OpenCode offline"))
+    backend = Backend(AgentUnavailableError("codecode offline"))
     with pytest.raises(AgentUnavailableError, match="offline"):
         AgentGraphExtractor("kb", backend=backend).extract_from_chunk("c1", TEXT)
     assert len(backend.requests) == 1

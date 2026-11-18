@@ -5,10 +5,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from rag.errors import RAGError
+from app.core.branding import public_metadata, public_text
 
 
 def _error(code: str, message: str) -> dict:
-    return {"error": {"code": code, "message": message}}
+    return {"error": {"code": public_text(code), "message": public_text(message)}}
 
 
 def error_response(
@@ -46,7 +47,7 @@ async def api_error_handler(request: Request, exc: APIError) -> JSONResponse:  #
 
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:  # noqa: ARG001
     if isinstance(exc.detail, dict) and exc.detail.get("error"):
-        return JSONResponse(status_code=exc.status_code, content=exc.detail)
+        return JSONResponse(status_code=exc.status_code, content=public_metadata(exc.detail))
     return error_response("HTTP_ERROR", str(exc.detail), status_code=exc.status_code)
 
 

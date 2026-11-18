@@ -15,9 +15,9 @@ import httpx
 import pytest
 from sqlalchemy import select
 
-from app.agents.opencode import OpenCodeAgentBackend
+from app.agents.codecode import CodeCodeAgentBackend
 from app.agents.runtime import project_runtime_executable, runtime_environment
-from app.agents.settings import AgentSettings, OPENCODE_VERSION
+from app.agents.settings import AgentSettings, CODECODE_VERSION
 from app.core.knowledge_bases import DEFAULT_KNOWLEDGE_BASE_ID as KB
 from app.models.document_management import DocumentTag, DocumentTagLink
 from app.models.knowledge_chunk import KnowledgeChunk
@@ -29,7 +29,7 @@ def test_real_v2_workflow_uses_scoped_gateway_and_applies_verified_tag(client, t
     try:
         executable = project_runtime_executable()
     except FileNotFoundError:
-        pytest.skip("Project source-built OpenCode runtime is not prepared")
+        pytest.skip("Project source-built codecode runtime is not prepared")
     from app.core import config
     from app.core.database import SessionLocal
 
@@ -140,13 +140,13 @@ def test_real_v2_workflow_uses_scoped_gateway_and_applies_verified_tag(client, t
     monkeypatch.setattr(config, "ANSWER_LLM_BASE_URL", f"http://127.0.0.1:{server.server_port}/v1")
     monkeypatch.setattr(config, "ANSWER_LLM_API_KEY", "synthetic")
     monkeypatch.setattr(config, "ANSWER_LLM_MODEL", "test")
-    monkeypatch.setenv("OPENCODE_MODEL", "rag/test")
+    monkeypatch.setenv("CODECODE_MODEL", "rag/test")
     monkeypatch.setenv("AGENT_MAX_STEPS", "6")
     monkeypatch.setenv("AGENT_BACKEND_PROFILES_JSON", "{}")
     env = runtime_environment(tmp_path / "runtime", "synthetic-server-password")
     workspace = tmp_path / "workspaces"
     workspace.mkdir()
-    backend = OpenCodeAgentBackend(AgentSettings(base_url=f"http://127.0.0.1:{port}", password="synthetic-server-password",
+    backend = CodeCodeAgentBackend(AgentSettings(base_url=f"http://127.0.0.1:{port}", password="synthetic-server-password",
         model="rag/test", callback_url=f"http://127.0.0.1:{server.server_port}/mcp", workspace_root=workspace, timeout_seconds=45))
     monkeypatch.setattr("app.agents.factory.get_agent_backend", lambda profile_name=None: backend)
     process = None
@@ -161,7 +161,7 @@ def test_real_v2_workflow_uses_scoped_gateway_and_applies_verified_tag(client, t
                 break
             time.sleep(0.2)
         assert backend.health()["status"] == "ok", (tmp_path / "opencode.log").read_text(encoding="utf-8", errors="replace")[-5000:]
-        assert backend.identity()["version"] == OPENCODE_VERSION == "2.2.5"
+        assert backend.identity()["version"] == CODECODE_VERSION == "2.2.5"
         assert client.post("/api/v1/auth/login", json={"username": config.INITIAL_ADMIN_USERNAME,
             "password": config.INITIAL_ADMIN_PASSWORD}).status_code == 200
         base = f"/api/v1/knowledge-bases/{KB}/agent-runs"
@@ -178,7 +178,7 @@ def test_real_v2_workflow_uses_scoped_gateway_and_applies_verified_tag(client, t
             assert tag is not None
             assert list(db.scalars(select(DocumentTagLink.document_id).where(DocumentTagLink.tag_id == tag.id))) == [document_id]
         detail = client.get(base + "/" + created["id"]).json()
-        assert detail["status"] == "succeeded" and detail["backend"] == "opencode"
+        assert detail["status"] == "succeeded" and detail["backend"] == "codecode"
         assert detail["output"]["actions"][0]["status"] == "applied"
         assert detail["output"]["evidence"][0]["quote"] == quote
         assert detail["usage"]["input_tokens"] == 30 and detail["usage"]["output_tokens"] == 12

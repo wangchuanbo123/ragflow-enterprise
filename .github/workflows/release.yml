@@ -66,7 +66,7 @@ jobs:
             -e LLM_API_KEY=unused -e LLM_BASE_URL=http://127.0.0.1:9/v1 \
             -e EMBEDDING_PROVIDER=openai_compatible -e EMBEDDING_MODEL=image-test \
             -e EMBEDDING_API_KEY=unused -e EMBEDDING_BASE_URL=http://127.0.0.1:9/v1 \
-            -e RERANKER_PROVIDER=none -e OPENCODE_AUTO_START=false \
+            -e RERANKER_PROVIDER=none -e CODECODE_AUTO_START=false \
             -e INDEX_WORKER_ENABLED=false -e CONNECTOR_SCHEDULER_ENABLED=false \
             -e GRAPH_COMMUNITY_MAINTENANCE_ENABLED=false -e BACKUP_MONTHLY_ENABLED=false \
             rag-enterprise:verified python -m scripts.smoke_image

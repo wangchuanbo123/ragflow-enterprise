@@ -56,7 +56,7 @@ def verify(postgres_url, redis_url, *, members=50, concurrency=10):
             "TASK_QUEUE_PROVIDER": "redis", "GRAPH_STORE_PROVIDER": "sqlalchemy", "RERANKER_PROVIDER": "none",
             "INITIAL_ADMIN_USERNAME": "verify-admin", "INITIAL_ADMIN_PASSWORD": "Synthetic-Admin-123!",
             "JWT_SECRET_KEY": "synthetic-verification-" + uuid.uuid4().hex,
-            "LOCAL_OBJECT_STORE_DIR": str(Path(workspace) / "docs"), "OPENCODE_AUTO_START": "false",
+            "LOCAL_OBJECT_STORE_DIR": str(Path(workspace) / "docs"), "CODECODE_AUTO_START": "false",
             "INDEX_WORKER_ENABLED": "false", "CONNECTOR_SCHEDULER_ENABLED": "false", "BACKUP_MONTHLY_ENABLED": "false",
             "GRAPH_COMMUNITY_MAINTENANCE_ENABLED": "false", "CONTEXT_JSON_EXPORT_ENABLED": "false",
             "AGENT_WORKSPACE_DIR": str(Path(workspace) / "agents"), "RAG_MAX_CONCURRENCY": "8", "RAG_QUEUE_TIMEOUT_SECONDS": "30"})

@@ -10,6 +10,7 @@ import type {
   CodeSnapshotDiff,
   CodeSubgraph,
   CodeSymbol,
+  CodeVectorState,
   DataSource,
   DocumentChunk,
   DocumentSubgraph,
@@ -34,6 +35,8 @@ import type {
   KnowledgeDocument,
   Message,
   Readiness,
+  RegistrationRequest,
+  RegistrationResponse,
   RetrievalDebugResult,
   RouteDecision,
   SearchHit,
@@ -44,11 +47,12 @@ import type {
 } from '../types'
 import { notifyUnauthorized, sessionRequest } from './session'
 import type { AgentRun, AgentRunCreate, AgentTaskCatalog } from '../agents'
+import { codecodeText } from '../systemPresentation'
 
 const BASE = '/api/v1'
 
 export class ApiRequestError extends Error {
-  constructor(message:string,readonly status:number,readonly code?:string,readonly details?:unknown){super(message);this.name='ApiRequestError'}
+  constructor(message:string,readonly status:number,readonly code?:string,readonly details?:unknown){super(codecodeText(message));this.name='ApiRequestError'}
 }
 
 async function parseError(res: Response): Promise<ApiRequestError> {
@@ -94,6 +98,10 @@ export async function login(username: string, password: string): Promise<User> {
     body: JSON.stringify({ username, password }),
   })
   return body.user
+}
+
+export function registerUser(payload: RegistrationRequest): Promise<RegistrationResponse> {
+  return request('/auth/register', { method: 'POST', body: JSON.stringify(payload) })
 }
 
 export function logout(): Promise<void> {
@@ -188,6 +196,9 @@ export function cancelAgentRun(kb: string, id: string): Promise<AgentRun> { retu
 export function retryAgentRun(kb: string, id: string): Promise<AgentRun> { return request(`/knowledge-bases/${kb}/agent-runs/${id}/retry`, {method:'POST'}) }
 
 export function listUsers(): Promise<User[]> { return request('/users') }
+export function reviewUserRegistration(id: string, payload: { decision: 'approved' | 'rejected'; note?: string }): Promise<User> {
+  return request(`/users/${encodeURIComponent(id)}/registration-review`, { method: 'POST', body: JSON.stringify(payload) })
+}
 export function createUser(payload: { username: string; password: string; display_name?: string; role: 'admin' | 'user'; is_active: boolean }): Promise<User> {
   return request('/users', { method: 'POST', body: JSON.stringify(payload) })
 }
@@ -456,6 +467,10 @@ export function listIndexJobs(knowledgeBaseId: string): Promise<IndexJob[]> {
   return request(`/knowledge-bases/${knowledgeBaseId}/index-jobs`)
 }
 
+export function getIndexJob(knowledgeBaseId: string, jobId: string): Promise<IndexJob> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/index-jobs/${encodeURIComponent(jobId)}`)
+}
+
 export function listIndexJobPage(kb:string,filters:{offset?:number;limit?:number;status?:string;query?:string}={}):Promise<PageResult<IndexJob>>{
   const params=new URLSearchParams()
   Object.entries(filters).forEach(([key,value])=>{if(value!==undefined&&value!=='')params.set(key,String(value))})
@@ -550,6 +565,14 @@ export function getCodeGraphStats(knowledgeBaseId: string): Promise<CodeGraphSta
 
 export function listCodeSnapshots(knowledgeBaseId: string): Promise<CodeSnapshot[]> {
   return request(`/knowledge-bases/${knowledgeBaseId}/code-graph/snapshots`)
+}
+
+export function getCodeVectorState(knowledgeBaseId: string): Promise<CodeVectorState> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/code-graph/vector`)
+}
+
+export function rebuildCodeVectors(knowledgeBaseId: string): Promise<IndexJob> {
+  return request(`/knowledge-bases/${knowledgeBaseId}/code-graph/vector/rebuild`, { method: 'POST' })
 }
 
 export async function uploadCodeArchive(knowledgeBaseId: string, file: File): Promise<DataSource> {
@@ -829,5 +852,5 @@ function parseEvent(block: string, handlers: StreamHandlers): void {
     payload.sources ?? [], payload.images ?? [], payload.code_snippets ?? [],
   )
   else if (event === 'done') handlers.onDone?.(payload.status)
-  else if (event === 'error') handlers.onError?.(payload.code ?? 'UNKNOWN', payload.message ?? '未知错误')
+  else if (event === 'error') handlers.onError?.(payload.code ?? 'UNKNOWN', codecodeText(payload.message ?? '未知错误'))
 }

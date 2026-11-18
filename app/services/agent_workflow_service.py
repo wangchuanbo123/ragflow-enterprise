@@ -13,6 +13,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Session
 
 from app.api.errors import bad_request, forbidden, not_found
+from app.core.branding import public_metadata, public_text
 from app.models.agent_run import AgentRun, AgentRunEvent
 from app.models.index_job import IndexJob
 from app.models.knowledge_base import KnowledgeBase
@@ -207,11 +208,11 @@ class AgentWorkflowService:
             if sequence > 500:
                 self.db.commit()
                 return
-            cleaned = safe_payload(data or {})
+            cleaned = public_metadata(safe_payload(data or {}))
             if len(json.dumps(cleaned, ensure_ascii=False)) > 30000:
                 cleaned = {"truncated": True}
             self.db.add(AgentRunEvent(run_id=run.id, knowledge_base_id=self.knowledge_base_id, sequence=sequence,
-                                      type=str(kind)[:60], message=str(safe_payload(message))[:2000], data_json=cleaned))
+                                      type=public_text(str(kind))[:60], message=public_text(str(safe_payload(message)))[:2000], data_json=cleaned))
             self.db.commit()
 
     def serialize(self, run, *, events=True):
@@ -228,7 +229,7 @@ class AgentWorkflowService:
             for event in self.db.scalars(select(AgentRunEvent).where(AgentRunEvent.run_id == run.id,
                 AgentRunEvent.knowledge_base_id == self.knowledge_base_id).order_by(AgentRunEvent.sequence))] if events else []
         result["followup_jobs"] = self._followup_status(run)
-        return result
+        return public_metadata(result)
 
     def _cancelled(self, run):
         identifier = sa_inspect(run).identity[0]

@@ -401,7 +401,7 @@ class GraphBuildService:
         """Legacy overrides are allowed only for explicitly injected extractors.
 
         Production agents perform their own bounded verify/repair rounds. A
-        failed OpenCode backend must never silently select an old LLM provider.
+        failed codecode backend must never silently select an old LLM provider.
         """
         return self._escalation_provider if self._extractor_injected else None
 

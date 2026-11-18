@@ -22,6 +22,14 @@ class User(Base):
     display_name: Mapped[str] = mapped_column(String(64), nullable=False, default="")
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    registration_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="approved", server_default="approved"
+    )
+    registration_reviewed_by: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    registration_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    registration_review_note: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="", server_default=""
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, server_default=func.now(), onupdate=func.now()

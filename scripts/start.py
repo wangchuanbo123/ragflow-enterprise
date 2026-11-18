@@ -255,21 +255,22 @@ def _check_ollama() -> None:
 
 
 def _ensure_agent_runtime() -> bool:
-    if os.getenv("AGENT_BACKEND", "opencode") != "opencode" or os.getenv("OPENCODE_AUTO_START", "true").lower() not in {"1", "true", "yes"}:
+    from app.agents.settings import codecode_env, normalized_backend
+    if normalized_backend(os.getenv("AGENT_BACKEND", "codecode")) != "codecode" or codecode_env("AUTO_START", "true").lower() not in {"1", "true", "yes"}:
         return True
     from app.agents.runtime import ensure_project_runtime, runtime_version
-    from app.agents.settings import OPENCODE_VERSION, default_settings, managed_endpoint
+    from app.agents.settings import CODECODE_VERSION, default_settings, managed_endpoint
 
     try:
         if not managed_endpoint(default_settings().base_url):
             return True
         executable = ensure_project_runtime()
         result = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=15)
-        if result.returncode == 0 and runtime_version(result.stdout) == OPENCODE_VERSION:
+        if result.returncode == 0 and runtime_version(result.stdout) == CODECODE_VERSION:
             return True
-        _warn(f"项目 OpenCode 版本校验未通过，要求 {OPENCODE_VERSION}。")
+        _warn(f"项目 codecode 版本校验未通过，要求 {CODECODE_VERSION}。")
     except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
-        _warn(f"项目源码运行时尚未准备好（{type(exc).__name__}）；不会调用本机已有 OpenCode。请运行 python -m scripts.prepare_opencode --install-runtime。")
+        _warn(f"项目源码运行时尚未准备好（{type(exc).__name__}）；不会调用本机已有 codecode。请运行 python -m scripts.prepare_codecode --install-runtime。")
     return False
 
 

@@ -17,5 +17,7 @@ web/coverage
 .workbuddy
 eval/data
 eval/results
-integrations/opencode/runtime
+integrations/codecode/runtime
 *.log
+
+integrations/opencode/runtime

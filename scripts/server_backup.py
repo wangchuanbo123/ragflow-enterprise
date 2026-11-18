@@ -453,7 +453,7 @@ class ServerBackup:
                              if recreate else ["start"])
                 if "api" in previous:
                     # Compose waits for api's configured HTTP healthcheck. Do
-                    # not let workers claim MCP jobs while API/OpenCode boots.
+                    # not let workers claim MCP jobs while API/codecode boots.
                     self._run([*arguments, "--wait", "--wait-timeout", "180", "api"])
                 consumers = [name for name in previous if name != "api"]
                 if consumers:

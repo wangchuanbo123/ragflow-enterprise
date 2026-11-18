@@ -42,7 +42,7 @@ def test_model_file_whitelist_ignores_app_agent_database_and_ambient_variables(t
     path.write_text("LLM_PROVIDER=openai_compatible\nLLM_API_KEY=synthetic-key\n"
         "LLM_MODEL=test-model\nLLM_BASE_URL=http://127.0.0.1:9/v2\n"
         "DATABASE_URL=postgresql://production\nREDIS_URL=redis://production\n"
-        "JWT_SECRET_KEY=production-secret\nOPENCODE_BASE_URL=https://production-agent\n"
+        "JWT_SECRET_KEY=production-secret\nCODECODE_BASE_URL=https://production-agent\n"
         "AGENT_BACKEND_PROFILES_JSON={}\nUNKNOWN=${DO_NOT_IMPORT}\n"
         "REWRITE_LLM_API_KEY=${DO_NOT_IMPORT}\n", encoding="utf-8")
     values = load_model_settings(path)
@@ -66,21 +66,21 @@ def test_model_profiles_follow_application_fallbacks_and_secrets_are_not_in_repr
 
 
 def test_child_process_environments_use_private_state_and_proxy_credentials(tmp_path, monkeypatch):
-    for key in ("DATABASE_URL", "REDIS_URL", "OPENCODE_EXECUTABLE", "AGENT_BACKEND_PROFILES_JSON", "ANSWER_LLM_API_KEY"):
+    for key in ("DATABASE_URL", "REDIS_URL", "CODECODE_EXECUTABLE", "AGENT_BACKEND_PROFILES_JSON", "ANSWER_LLM_API_KEY"):
         monkeypatch.setenv(key, "must-not-inherit")
     with ModelProxy(endpoints()) as proxy:
         common = dict(workspace=tmp_path, database_url="postgresql://test/schema", redis_url="redis://test/3",
             prefix="verify-real:" + "a" * 32, api_port=12345, proxy=proxy, admin_password="synthetic-admin-password")
-        api = isolated_environment(role="api", opencode_port=12346, **common)
-        worker = isolated_environment(role="worker", opencode_port=12347, **common)
+        api = isolated_environment(role="api", codecode_port=12346, **common)
+        worker = isolated_environment(role="worker", codecode_port=12347, **common)
         assert api["DATA_DIR"] != worker["DATA_DIR"]
         assert api["AGENT_WORKSPACE_DIR"] != worker["AGENT_WORKSPACE_DIR"]
-        assert api["OPENCODE_BASE_URL"] != worker["OPENCODE_BASE_URL"]
+        assert api["CODECODE_BASE_URL"] != worker["CODECODE_BASE_URL"]
         assert api["LOCAL_OBJECT_STORE_DIR"] == worker["LOCAL_OBJECT_STORE_DIR"]
         assert api["ANSWER_LLM_API_KEY"] == proxy.token
         assert "synthetic-upstream-secret" not in repr(api)
         assert "must-not-inherit" not in repr(api)
-        assert "OPENCODE_EXECUTABLE" not in api
+        assert "CODECODE_EXECUTABLE" not in api
         assert api["AGENT_BACKEND_PROFILES_JSON"] == "{}"
         assert api["GRAPH_AUTO_BUILD_ENABLED"] == api["GRAPH_SCHEMA_AUTO_GENERATE_ENABLED"] == "false"
         assert "dotenv.load_dotenv=lambda" in child_command("scripts.run_worker")[2]

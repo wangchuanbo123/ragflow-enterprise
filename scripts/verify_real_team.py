@@ -254,7 +254,7 @@ class ModelProxy:
             return
         base = endpoint.base_url
         if endpoint.provider in {"anthropic", "anthropic_compatible"}:
-            # Application accepts host, /v1 or /v1/messages; OpenCode adds its
+            # Application accepts host, /v1 or /v1/messages; codecode adds its
             # own /v1/messages suffix to our isolated proxy base URL.
             base = base.removesuffix("/messages") if base.endswith("/v1/messages") else base
             url = base + ("/messages" if base.endswith("/v1") else "/v1/messages")
@@ -304,7 +304,7 @@ def free_ports(number):
 
 
 def isolated_environment(*, workspace: Path, role: str, database_url: str, redis_url: str,
-        prefix: str, api_port: int, opencode_port: int, proxy: ModelProxy, admin_password: str):
+        prefix: str, api_port: int, codecode_port: int, proxy: ModelProxy, admin_password: str):
     env = {key: value for key, value in os.environ.items() if key.upper() in OS_KEYS}
     env.update({"PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1",
         "APP_PROFILE": "server", "APP_ROLE": role, "APP_PORT": str(api_port), "DATA_DIR": str(workspace / role),
@@ -326,9 +326,9 @@ def isolated_environment(*, workspace: Path, role: str, database_url: str, redis
         "CHUNK_STRATEGY": "recursive", "MIN_CHUNK_SIZE": "40", "CHUNK_SIZE": "700", "CHUNK_OVERLAP": "30",
         "MAX_CONTEXT_CHUNKS": "8", "MAX_CHUNKS_PER_SOURCE": "4", "RAG_MAX_CONCURRENCY": "4",
         "MODEL_MAX_CONCURRENCY": "4", "MODEL_BACKGROUND_CONCURRENCY": "1", "MODEL_QUEUE_TIMEOUT_SECONDS": "60",
-        "PROVIDER_TIMEOUT_SECONDS": "180", "AGENT_BACKEND": "opencode", "OPENCODE_AUTO_START": "true",
-        "OPENCODE_BASE_URL": f"http://127.0.0.1:{opencode_port}", "OPENCODE_MODEL": "rag/" + proxy.endpoints["answer"].model,
-        "OPENCODE_PASSWORD": secrets.token_urlsafe(32), "AGENT_WORKSPACE_DIR": str(workspace / role / "agents" / "workspaces"),
+        "PROVIDER_TIMEOUT_SECONDS": "180", "AGENT_BACKEND": "codecode", "CODECODE_AUTO_START": "true",
+        "CODECODE_BASE_URL": f"http://127.0.0.1:{codecode_port}", "CODECODE_MODEL": "rag/" + proxy.endpoints["answer"].model,
+        "CODECODE_PASSWORD": secrets.token_urlsafe(32), "AGENT_WORKSPACE_DIR": str(workspace / role / "agents" / "workspaces"),
         "AGENT_TOOL_URL": f"http://127.0.0.1:{api_port}/api/v1/agent-tools", "AGENT_TIMEOUT_SECONDS": "180",
         "AGENT_MAX_STEPS": "3", "AGENT_BACKEND_PROFILES_JSON": "{}", "ANONYMIZED_TELEMETRY": "false"})
     for purpose in ("answer", "rewrite", "router"):
@@ -549,9 +549,9 @@ def require_prepared_runtime():
     # Missing binaries would make application startup build into the checkout.
     # Acceptance requires a prepared project artifact; the application then
     # verifies its pinned commit, native format and SHA-256 before execution.
-    runtime = ROOT / "integrations" / "opencode" / "runtime"
-    require((runtime / ("opencode.exe" if os.name == "nt" else "opencode")).is_file()
-        and (runtime / "build.json").is_file(), "project_opencode_runtime_must_be_prepared")
+    runtime = ROOT / "integrations" / "codecode" / "runtime"
+    require((runtime / ("codecode.exe" if os.name == "nt" else "codecode")).is_file()
+        and (runtime / "build.json").is_file(), "project_codecode_runtime_must_be_prepared")
 
 
 def cleanup_redis(client, prefix):
@@ -616,8 +616,8 @@ def verify(postgres_url, redis_url, model_env, *, with_ocr=False, startup_timeou
                 admin_password = secrets.token_urlsafe(24)
                 common = dict(workspace=workspace, database_url=target.render_as_string(hide_password=False), redis_url=redis_url,
                     prefix=prefix, api_port=api_port, proxy=proxy, admin_password=admin_password)
-                api_env = isolated_environment(role="api", opencode_port=api_agent_port, **common)
-                worker_env = isolated_environment(role="worker", opencode_port=worker_agent_port, **common)
+                api_env = isolated_environment(role="api", codecode_port=api_agent_port, **common)
+                worker_env = isolated_environment(role="worker", codecode_port=worker_agent_port, **common)
                 # All replicas must share the synthetic authentication secret.
                 worker_env["JWT_SECRET_KEY"] = api_env["JWT_SECRET_KEY"]
                 stage = "process_startup"
@@ -685,7 +685,7 @@ def verify(postgres_url, redis_url, model_env, *, with_ocr=False, startup_timeou
                         futures = [pool.submit(stream_case, client, case, kb, ids, query, barrier)
                             for client, (case, ids, query) in zip(members, cases)]
                         report["chat_cases"] = [future.result() for future in futures]
-                    stage = "real_opencode_graph_extraction"
+                    stage = "real_codecode_graph_extraction"
                     build = request_json(admin, "POST", kb_path + "/knowledge-graph/build", expected=202, json={"mode": "pending", "graph_kind": "general",
                         "rebuild_entity_vectors": False, "rebuild_relation_vectors": False, "rebuild_communities": False})
                     report["graph_job"] = wait_job(admin, kb, build["id"], processes, timeout=job_timeout)

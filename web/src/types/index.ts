@@ -4,6 +4,22 @@ export interface User {
   display_name: string
   role: string
   is_active: boolean
+  registration_status?: 'approved' | 'pending' | 'rejected'
+  created_at?: string
+  registration_reviewed_by?: string | null
+  registration_reviewed_at?: string | null
+  registration_review_note?: string
+}
+
+export interface RegistrationRequest {
+  username: string
+  password: string
+  display_name?: string
+}
+
+export interface RegistrationResponse {
+  message: string
+  registration_status: 'pending'
 }
 
 export interface KnowledgeBase {
@@ -431,6 +447,7 @@ export interface CodeGraphStats {
 
 export interface CodeSnapshot {
   id: string
+  data_source_id: string | null
   revision: string
   parser_version: string
   status: string
@@ -438,6 +455,16 @@ export interface CodeSnapshot {
   error_message: string | null
   created_at: string
   activated_at: string | null
+}
+
+export interface CodeVectorState {
+  snapshot_id: string | null
+  index_name: string | null
+  embedding_fingerprint: string
+  symbol_fingerprint: string
+  symbol_count: number
+  status: string
+  updated_at: string | null
 }
 
 export interface CodeSnapshotDiff {
